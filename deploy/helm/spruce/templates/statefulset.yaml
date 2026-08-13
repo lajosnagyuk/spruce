@@ -1,3 +1,4 @@
+{{- include "spruce.validate" . }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -18,10 +19,16 @@ spec:
         {{- include "spruce.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: broker
         {{- with .Values.podLabels }}{{ toYaml . | nindent 8 }}{{- end }}
-      {{- with .Values.podAnnotations }}
-      annotations: {{ toYaml . | nindent 8 }}
-      {{- end }}
+      annotations:
+        checksum/auth: {{ include "spruce.authChecksum" . }}
+        {{- if .Values.tls.enabled }}
+        checksum/tls: {{ include "spruce.tlsChecksum" . }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext: {{ toYaml .Values.podSecurityContext | nindent 8 }}
       {{- with .Values.imagePullSecrets }}
@@ -48,7 +55,7 @@ spec:
       {{- end }}
       containers:
         - name: spruce
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}{{ if .Values.image.digest }}@{{ .Values.image.digest }}{{ else }}:{{ .Values.image.tag }}{{ end }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext: {{ toYaml .Values.securityContext | nindent 12 }}
           ports:
@@ -60,21 +67,34 @@ spec:
                 fieldRef:
                   fieldPath: metadata.name
             - name: SPRUCE_SELF_URL
-              value: {{ include "spruce.scheme" . }}://$(POD_NAME).{{ include "spruce.fullname" . }}-headless:{{ .Values.service.port }}
+              value: {{ include "spruce.scheme" . }}://$(POD_NAME).{{ include "spruce.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
             - name: SPRUCE_PEERS
-              value: {{ range $i := until (int .Values.replicaCount) }}{{ if $i }},{{ end }}{{ include "spruce.scheme" $ }}://{{ include "spruce.fullname" $ }}-{{ $i }}.{{ include "spruce.fullname" $ }}-headless:{{ $.Values.service.port }}{{- end }}
+              value: {{ range $i := until (int .Values.replicaCount) }}{{ if $i }},{{ end }}{{ include "spruce.scheme" $ }}://{{ include "spruce.fullname" $ }}-{{ $i }}.{{ include "spruce.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local:{{ $.Values.service.port }}{{- end }}
             - name: SPRUCE_PEER_TOKEN
               valueFrom:
                 secretKeyRef: {name: {{ include "spruce.secretName" . }}, key: peer-token}
+            - name: SPRUCE_PREVIOUS_PEER_TOKEN
+              valueFrom:
+                secretKeyRef: {name: {{ include "spruce.secretName" . }}, key: previous-peer-token, optional: true}
             - name: SPRUCE_CLUSTER_ID
               valueFrom:
                 secretKeyRef: {name: {{ include "spruce.secretName" . }}, key: cluster-id}
             - name: SPRUCE_CLIENT_TOKEN
               valueFrom:
-                secretKeyRef: {name: {{ include "spruce.secretName" . }}, key: client-token, optional: true}
+                secretKeyRef: {name: {{ include "spruce.secretName" . }}, key: client-token, optional: {{ .Values.auth.allowAnonymous }}}
+            - name: SPRUCE_PREVIOUS_CLIENT_TOKEN
+              valueFrom:
+                secretKeyRef: {name: {{ include "spruce.secretName" . }}, key: previous-client-token, optional: true}
             - name: SPRUCE_ADMIN_TOKEN
               valueFrom:
-                secretKeyRef: {name: {{ include "spruce.secretName" . }}, key: admin-token, optional: true}
+                secretKeyRef: {name: {{ include "spruce.secretName" . }}, key: admin-token, optional: false}
+            - name: SPRUCE_PREVIOUS_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef: {name: {{ include "spruce.secretName" . }}, key: previous-admin-token, optional: true}
+            - {name: SPRUCE_REQUIRE_CLIENT_AUTH, value: {{ not .Values.auth.allowAnonymous | quote }}}
+            - {name: SPRUCE_REQUIRE_ADMIN_AUTH, value: "true"}
+            - {name: SPRUCE_ALLOW_ANONYMOUS, value: {{ .Values.auth.allowAnonymous | quote }}}
+            - {name: SPRUCE_ALLOW_INSECURE_TRANSPORT, value: {{ .Values.tls.allowInsecureTransport | quote }}}
             {{- if .Values.tls.enabled }}
             - {name: SPRUCE_TLS_CERT_FILE, value: /tls/tls.crt}
             - {name: SPRUCE_TLS_KEY_FILE, value: /tls/tls.key}
@@ -86,6 +106,7 @@ spec:
             - {name: SPRUCE_DEFAULT_TTL, value: {{ .Values.config.defaultTTL | quote }}}
             - {name: SPRUCE_MAX_TTL, value: {{ .Values.config.maxTTL | quote }}}
             - {name: SPRUCE_ACK_DEADLINE, value: {{ .Values.config.ackDeadline | quote }}}
+            - {name: SPRUCE_DRAIN_DELAY, value: {{ .Values.config.drainDelay | quote }}}
             - {name: SPRUCE_REPLICATION_QUEUE_BYTES, value: {{ .Values.config.replicationQueueBytes | quote }}}
             - {name: SPRUCE_ACTION_QUEUE_BYTES, value: {{ .Values.config.actionQueueBytes | quote }}}
             - {name: SPRUCE_MAX_INFLIGHT_BYTES, value: {{ .Values.config.maxInflightBytes | quote }}}
@@ -113,4 +134,5 @@ spec:
         - name: tls
           secret:
             secretName: {{ required "tls.existingSecret is required when TLS is enabled" .Values.tls.existingSecret }}
+            defaultMode: 0440
       {{- end }}

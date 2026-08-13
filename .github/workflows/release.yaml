@@ -1,0 +1,82 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with: {registry: ghcr.io, username: '${{ github.actor }}', password: '${{ secrets.GITHUB_TOKEN }}'}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        id: build
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          outputs: type=oci,dest=/tmp/spruce.oci.tar
+          provenance: mode=max
+          sbom: true
+      - uses: aquasecurity/trivy-action@2736533278103862a861f4a35ebac3e97854d956
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          input: /tmp/spruce.oci.tar
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+      - uses: aquasecurity/trivy-action@2736533278103862a861f4a35ebac3e97854d956
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        with:
+          input: /tmp/spruce.oci.tar
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+      - run: sudo apt-get update && sudo apt-get install -y skopeo
+      - run: |
+          version="${GITHUB_REF_NAME#v}"
+          skopeo copy --all oci-archive:/tmp/spruce.oci.tar "docker://ghcr.io/${GITHUB_REPOSITORY}:$version"
+          digest=$(skopeo inspect --format '{{.Digest}}' "docker://ghcr.io/${GITHUB_REPOSITORY}:$version")
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+        id: digest
+      - uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: true
+      - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: ghcr.io/${{ github.repository }}@${{ steps.digest.outputs.digest }}
+          format: spdx-json
+          output-file: spruce.spdx.json
+      - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+      - run: cosign sign --yes ghcr.io/${{ github.repository }}@${{ steps.digest.outputs.digest }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: supply-chain
+          path: |
+            spruce.spdx.json
+  csharp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with: {dotnet-version: '8.0.x'}
+      - run: dotnet run --project clients/csharp/Spruce.Conformance/Spruce.Conformance.csproj
+      - run: dotnet run --project clients/csharp/Spruce.BatcherConformance/Spruce.BatcherConformance.csproj
+      - run: |
+          version="${GITHUB_REF_NAME#v}"
+          dotnet pack clients/csharp/Spruce/Spruce.csproj -c Release -p:PackageVersion="$version" -o artifacts
+          dotnet nuget push 'artifacts/*.nupkg' --source "https://nuget.pkg.github.com/${GITHUB_REPOSITORY_OWNER}/index.json" --api-key "$GITHUB_TOKEN" --skip-duplicate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with: {name: csharp-client, path: 'artifacts/*.nupkg'}

@@ -109,7 +109,8 @@ At that cache occupancy, broker RSS was 79-88 MiB and each gateway used 3 MiB. T
 are regression baselines, not portable capacity claims; port forwarding and VM network
 placement materially affect latency.
 
-The mixed correctness matrix also passed without missing or duplicate delivery:
+The steady-state mixed correctness matrix passed without missing deliveries. Raw
+at-least-once duplicates were observed and are removed when the SDK deduper is enabled:
 
 | Brokers | Topics | Messages | Producers | Broadcast/topic | Group members/topic |
 |---:|---:|---:|---:|---:|---:|
@@ -124,3 +125,11 @@ Reproduce a scenario after port-forwarding the Helm Service:
   -topics 6 -messages 500 -producers 10 \
   -broadcast-consumers 3 -group-consumers 5
 ```
+
+The hardened K3s failure matrix used six topics, 10 producers, three broadcast
+consumers/topic, five group members/topic, and SDK deduplication. Abrupt broker deletion
+and node drain each had zero missing logical deliveries at one aggregate message/second.
+Full three-broker rolling replacements lost 24-62 of 480 expected logical deliveries
+(5-12.9%) while publishes continued across repeated runs. This is an explicit
+non-durable maintenance observation, not a portable SLA; pause publishers when
+maintenance loss is unacceptable.

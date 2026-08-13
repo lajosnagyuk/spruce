@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/lajosnagyuk/spruce/pkg/spruce"
 	"log"
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -14,13 +15,20 @@ import (
 
 func main() {
 	server := flag.String("server", "http://localhost:8080", "Spruce URL")
+	token := flag.String("token", os.Getenv("SPRUCE_TOKEN"), "bearer token")
+	allowInsecure := flag.Bool("allow-insecure-credentials", false, "allow credentials over HTTP for isolated tests")
 	topic := flag.String("topic", "bench", "topic")
 	n := flag.Int("n", 10000, "messages")
 	size := flag.Int("size", 256, "payload bytes")
 	workers := flag.Int("workers", 8, "publishers")
 	batch := flag.Int("batch", 1, "messages per HTTP request")
 	flag.Parse()
+	if *n <= 0 || *size < 0 || *size > 1<<20 || *workers <= 0 || *batch <= 0 || *batch > 4096 {
+		log.Fatal("n, workers, and batch must be positive; size must be 0..1MiB; batch must not exceed 4096")
+	}
 	c := spruce.New(*server)
+	c.Token = *token
+	c.AllowInsecureCredentials = *allowInsecure
 	payload := make([]byte, *size)
 	lat := make([]int64, *n)
 	var next atomic.Int64

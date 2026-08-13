@@ -35,16 +35,27 @@ func main() {
 	cfg.MaxStreams = int(envInt64("SPRUCE_MAX_STREAMS", int64(cfg.MaxStreams)))
 	cfg.MaxInternalRequests = int(envInt64("SPRUCE_MAX_INTERNAL_REQUESTS", int64(cfg.MaxInternalRequests)))
 	cfg.PeerToken = os.Getenv("SPRUCE_PEER_TOKEN")
+	cfg.PreviousPeerToken = os.Getenv("SPRUCE_PREVIOUS_PEER_TOKEN")
 	cfg.ClusterID = os.Getenv("SPRUCE_CLUSTER_ID")
 	cfg.PeerCAFile = os.Getenv("SPRUCE_PEER_CA_FILE")
 	cfg.ClientToken = os.Getenv("SPRUCE_CLIENT_TOKEN")
+	cfg.PreviousClientToken = os.Getenv("SPRUCE_PREVIOUS_CLIENT_TOKEN")
 	cfg.AdminToken = os.Getenv("SPRUCE_ADMIN_TOKEN")
+	cfg.PreviousAdminToken = os.Getenv("SPRUCE_PREVIOUS_ADMIN_TOKEN")
 	cfg.BasicUsername = os.Getenv("SPRUCE_BASIC_USERNAME")
 	cfg.BasicPassword = os.Getenv("SPRUCE_BASIC_PASSWORD")
 	cfg.AdminBasicUsername = os.Getenv("SPRUCE_ADMIN_BASIC_USERNAME")
 	cfg.AdminBasicPassword = os.Getenv("SPRUCE_ADMIN_BASIC_PASSWORD")
+	cfg.RequireClientAuth = envBool("SPRUCE_REQUIRE_CLIENT_AUTH", false)
+	cfg.RequireAdminAuth = envBool("SPRUCE_REQUIRE_ADMIN_AUTH", false)
+	allowAnonymous := envBool("SPRUCE_ALLOW_ANONYMOUS", false)
+	allowInsecureTransport := envBool("SPRUCE_ALLOW_INSECURE_TRANSPORT", false)
 	if (cfg.BasicUsername == "") != (cfg.BasicPassword == "") || (cfg.AdminBasicUsername == "") != (cfg.AdminBasicPassword == "") {
 		fmt.Fprintln(os.Stderr, "basic authentication username and password must be configured together")
+		os.Exit(2)
+	}
+	if !allowAnonymous && (!cfg.RequireClientAuth || !cfg.RequireAdminAuth) {
+		fmt.Fprintln(os.Stderr, "anonymous access requires SPRUCE_ALLOW_ANONYMOUS=true")
 		os.Exit(2)
 	}
 	if peers := os.Getenv("SPRUCE_PEERS"); peers != "" {
@@ -69,6 +80,10 @@ func main() {
 	go func() {
 		log.Info("spruce listening", "address", addr, "peers", len(cfg.Peers))
 		certFile, keyFile := os.Getenv("SPRUCE_TLS_CERT_FILE"), os.Getenv("SPRUCE_TLS_KEY_FILE")
+		if certFile == "" && keyFile == "" && !allowInsecureTransport {
+			serverErr <- errors.New("plaintext transport requires SPRUCE_ALLOW_INSECURE_TRANSPORT=true")
+			return
+		}
 		var err error
 		if certFile != "" || keyFile != "" {
 			if certFile == "" || keyFile == "" {
@@ -83,10 +98,26 @@ func main() {
 			serverErr <- err
 		}
 	}()
+	syncCtx, syncCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	if err := b.SyncFromPeers(syncCtx); err != nil && len(cfg.Peers) > 0 {
+		if !errors.Is(err, broker.ErrNoPeerSnapshot) {
+			log.Error("peer cache bootstrap failed", "error", err)
+			os.Exit(1)
+		}
+		log.Warn("no peer cache available; starting with an empty cache", "error", err)
+	}
+	syncCancel()
+	b.Ready()
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	select {
 	case <-ch:
+		b.BeginDrain()
+		drainDelay := envDuration("SPRUCE_DRAIN_DELAY", 30*time.Second)
+		if drainDelay > 0 {
+			log.Info("spruce draining", "delay", drainDelay)
+			time.Sleep(drainDelay)
+		}
 	case err := <-serverErr:
 		log.Error("server stopped", "error", err)
 		os.Exit(1)
@@ -129,6 +160,18 @@ func envDuration(k string, d time.Duration) time.Duration {
 	v, err := time.ParseDuration(raw)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s must be a duration, got %q\n", k, raw)
+		os.Exit(2)
+	}
+	return v
+}
+func envBool(k string, d bool) bool {
+	raw := os.Getenv(k)
+	if raw == "" {
+		return d
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s must be a boolean, got %q\n", k, raw)
 		os.Exit(2)
 	}
 	return v

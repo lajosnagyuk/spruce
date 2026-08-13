@@ -91,3 +91,17 @@ a non-root numeric user with no writable filesystem requirement.
 **Why:** This minimizes image size and attack surface.
 
 **Consequence:** Certificates and trust roots must be mounted explicitly.
+
+## ADR-009: Drain and peer bootstrap instead of persistence
+
+**Decision:** A terminating broker withdraws readiness and drains for a bounded period.
+A joining broker merges live cache pages from every reachable authenticated peer before
+advertising readiness. Snapshot transfer uses the existing bounded binary peer protocol
+and never re-fans out copied messages.
+
+**Why:** This reduces rolling-maintenance loss without adding disk state, consensus, or
+a special leader.
+
+**Consequence:** Bootstrap is anti-entropy, not durability. A simultaneous cluster loss,
+TTL expiry, eviction, or a full rolling replacement under traffic can still lose
+messages. Operators that require zero-loss maintenance must pause publishers.

@@ -41,7 +41,7 @@ public sealed class SpruceException(int statusCode, string status, string? code,
 public sealed class Deduper(int maxEntries = 65536, TimeSpan? ttl = null)
 {
     private readonly int _max = maxEntries > 0 ? maxEntries : throw new ArgumentOutOfRangeException(nameof(maxEntries));
-    private readonly TimeSpan _ttl = ttl ?? TimeSpan.FromMinutes(5);
+    private readonly TimeSpan _ttl = ttl is null || ttl <= TimeSpan.Zero ? TimeSpan.FromMinutes(5) : ttl.Value;
     private readonly Dictionary<string, DateTimeOffset> _seen = [];
     private readonly Queue<(string Id, DateTimeOffset Until)> _order = [];
     private readonly object _lock = new();
@@ -72,6 +72,7 @@ public sealed partial class SpruceClient
 
     public async IAsyncEnumerable<ConsumableDelivery> ReadAllAsync(SubscribeOptions options, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
+        using var ownedCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var channel = Channel.CreateBounded<ConsumableDelivery>(Math.Max(1, options.Concurrency * 2));
         var subscription = SubscribeAsync(options, async (delivery, token) =>
         {
@@ -79,10 +80,18 @@ public sealed partial class SpruceClient
             await channel.Writer.WriteAsync(item, token);
             var failure = await item.WaitAsync(token);
             if (failure is not null) throw failure;
-        }, cancellationToken);
+        }, ownedCancellation.Token);
         _ = subscription.ContinueWith(task => channel.Writer.TryComplete(task.Exception?.InnerException), TaskScheduler.Default);
-        await foreach (var delivery in channel.Reader.ReadAllAsync(cancellationToken)) yield return delivery;
-        await subscription;
+        try
+        {
+            await foreach (var delivery in channel.Reader.ReadAllAsync(cancellationToken)) yield return delivery;
+            await subscription;
+        }
+        finally
+        {
+            await ownedCancellation.CancelAsync();
+            try { await subscription; } catch (OperationCanceledException) when (ownedCancellation.IsCancellationRequested) { }
+        }
     }
 
     public async Task<PublishResult> PublishWithRetryAsync(string topic, ReadOnlyMemory<byte> payload, PublishOptions options, RetryOptions? retry = null, CancellationToken cancellationToken = default)
@@ -127,8 +136,10 @@ public sealed partial class SpruceClient
     private async Task GetAsync(string path, CancellationToken cancellationToken) { using var response = await SendGetAsync(path, cancellationToken); }
     private async Task<HttpResponseMessage> SendGetAsync(string path, CancellationToken cancellationToken)
     {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(_requestTimeout);
         using var request = new HttpRequestMessage(HttpMethod.Get, _baseUrl + path); Authorize(request);
-        var response = await SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken, "get");
-        try { await EnsureSuccessAsync(response, cancellationToken); return response; } catch { response.Dispose(); throw; }
+        var response = await SendAsync(request, HttpCompletionOption.ResponseContentRead, timeout.Token, "get");
+        try { await EnsureSuccessAsync(response, timeout.Token); return response; } catch { response.Dispose(); throw; }
     }
 }

@@ -7,6 +7,7 @@ var failures = new List<string>();
 await Run("invalid batch", RejectsInvalidBatch, failures);
 await Run("bearer token", SendsBearerToken, failures);
 await Run("permanent subscription error", SurfacesPermanentSubscriptionErrors, failures);
+await Run("transient subscription retry", RetriesTransientSubscriptionErrors, failures);
 await Run("ack failure cancellation", AckFailureCancellation, failures);
 await Run("terminal drain timeout", TerminalDrainTimeout, failures);
 await Run("basic auth and structured error", BasicAuthAndStructuredError, failures);
@@ -39,7 +40,7 @@ static async Task SendsBearerToken()
         authorization = request.Headers.Authorization?.ToString();
         return Accepted();
     });
-    var client = new SpruceClient("http://spruce.invalid", new HttpClient(handler), "secret");
+    var client = new SpruceClient("http://spruce.invalid", new HttpClient(handler), "secret", allowInsecureCredentials: true);
     await client.PublishAsync("t", Encoding.UTF8.GetBytes("payload"));
     Assert(authorization == "Bearer secret", $"unexpected authorization header: {authorization}");
 }
@@ -48,6 +49,21 @@ static async Task SurfacesPermanentSubscriptionErrors()
 {
     var client = new SpruceClient("http://spruce.invalid", new HttpClient(new StubHandler(_ => new(HttpStatusCode.Unauthorized))));
     await Expect<SpruceException>(() => client.SubscribeAsync("t", null, (_, _) => Task.CompletedTask));
+}
+
+static async Task RetriesTransientSubscriptionErrors()
+{
+    using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+    var calls = 0;
+    var client = new SpruceClient("https://spruce.invalid", new HttpClient(new StubHandler(_ =>
+    {
+        if (Interlocked.Increment(ref calls) == 1) return new(HttpStatusCode.ServiceUnavailable) { Content = new StringContent("{\"error\":\"unavailable\"}") };
+        cancellation.Cancel();
+        return new(HttpStatusCode.OK) { Content = new StreamContent(Stream.Null) };
+    })));
+    try { await client.SubscribeAsync("t", null, (_, _) => Task.CompletedTask, cancellation.Token); }
+    catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+    Assert(calls >= 2, $"transient subscription response was not retried: {calls}");
 }
 
 static async Task AckFailureCancellation()
@@ -113,7 +129,7 @@ static Task DeduperBehavior()
 static async Task RetryDiagnosticsTelemetry()
 {
     var publishes = 0;
-    var events = 0;
+    var events = new List<ClientEvent>();
     var client = new SpruceClient("https://spruce.invalid", new HttpClient(new StubHandler(request =>
     {
         if (request.RequestUri!.AbsolutePath == "/v1/status")
@@ -122,10 +138,12 @@ static async Task RetryDiagnosticsTelemetry()
             return new(HttpStatusCode.ServiceUnavailable) { Content = new StringContent("{\"error\":\"peer_ack_unavailable\"}") };
         return Accepted();
     })))
-    { OnEvent = _ => Interlocked.Increment(ref events) };
+    { OnEvent = value => events.Add(value) };
     var result = await client.PublishWithRetryAsync("t", new byte[] { 1 }, new(ProducerId: "p", IdempotencyKey: "1"), new(2, TimeSpan.FromMilliseconds(1)));
     var status = await client.GetStatusAsync();
-    Assert(result.Id == "id" && publishes == 2 && status.Messages == 3 && events == 3, $"retry/status/events mismatch: {publishes}/{status.Messages}/{events}");
+    Assert(result.Id == "id" && publishes == 2 && status.Messages == 3 && events.Count == 3, $"retry/status/events mismatch: {publishes}/{status.Messages}/{events.Count}");
+    Assert(events[0].StatusCode == 503 && events[0].Error is SpruceException, "failed attempt telemetry omitted its HTTP error");
+    Assert(events[1].StatusCode == 202 && events[1].Error is null && events[2].StatusCode == 200 && events[2].Error is null, "successful telemetry was marked failed");
 }
 
 static async Task ExplicitStreamCompletion()

@@ -26,6 +26,10 @@ product definition and architecture decisions.
 - Retry only the original broadcast subscriber or consumer group.
 - Preserve the original message expiry across retries.
 - Never weaken TLS verification or accept an empty peer credential.
+- Keep `/internal/*` authenticated and unreachable through the public gateway.
+- A joining broker remains unready until bounded peer-cache bootstrap completes or its
+  bootstrap deadline proves that no peer is available.
+- Draining must withdraw readiness before its bounded grace interval begins.
 - Basic auth must be documented and deployed only with TLS.
 - A retrying publish requires both producer ID and idempotency key.
 - Explicit-completion client APIs ACK only after the caller completes the envelope.
@@ -39,14 +43,18 @@ make test
 make test-race
 make csharp
 make csharp-pack
-helm lint deploy/helm/spruce
-helm template spruce deploy/helm/spruce >/dev/null
+make helm-lint
+make helm-render >/dev/null
 docker compose config --quiet
 ```
 
 Run `make validate-local` when Docker is available. Add correctness tests for every
 state-machine or resource-accounting change and benchmark hot-path changes rather than
 assuming an optimization helps.
+
+For Kubernetes changes, also run `scripts/k3s-hardening.sh`. It separately tests burst
+throughput, rolling replacement, abrupt broker loss, scale-down, node drain, and final
+recovery. Do not turn Spruce's documented loss envelope into a zero-loss claim.
 
 ## Security and repository hygiene
 

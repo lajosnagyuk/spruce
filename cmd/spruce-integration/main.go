@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,14 +24,23 @@ type deliveryCounts struct {
 
 func main() {
 	server := flag.String("server", "http://localhost:8080", "Spruce URL")
+	token := flag.String("token", os.Getenv("SPRUCE_TOKEN"), "bearer token")
+	allowInsecure := flag.Bool("allow-insecure-credentials", false, "allow credentials over HTTP for isolated tests")
 	topics := flag.Int("topics", 3, "number of topics")
 	messages := flag.Int("messages", 1000, "messages per topic")
 	producers := flag.Int("producers", 4, "concurrent producers")
 	broadcastConsumers := flag.Int("broadcast-consumers", 2, "broadcast consumers per topic")
 	groupConsumers := flag.Int("group-consumers", 3, "members in one group per topic")
 	timeout := flag.Duration("timeout", 30*time.Second, "scenario timeout")
+	maxMissing := flag.Int("max-missing", 0, "maximum accepted missing deliveries")
+	maxDuplicates := flag.Int("max-duplicates", 0, "maximum accepted duplicate deliveries")
+	publishRate := flag.Int("publish-rate", 0, "maximum aggregate publishes per second; zero is unlimited")
+	ttl := flag.Duration("ttl", time.Minute, "published message TTL")
+	dedupe := flag.Bool("dedupe", false, "debounce repeated delivery IDs before invoking logical handlers")
+	pauseAfter := flag.Int("pause-after", 0, "pause after this many queued publishes; zero disables")
+	pauseFor := flag.Duration("pause-for", 0, "duration of the one-time publisher pause")
 	flag.Parse()
-	if *topics <= 0 || *messages <= 0 || *producers <= 0 || *broadcastConsumers < 0 || *groupConsumers < 0 {
+	if *topics <= 0 || *messages <= 0 || *producers <= 0 || *broadcastConsumers < 0 || *groupConsumers < 0 || *publishRate < 0 {
 		log.Fatal("counts must be positive; consumer counts may be zero")
 	}
 
@@ -52,11 +62,17 @@ func main() {
 		topicName := fmt.Sprintf("integration-%s-%d", run, topic)
 		for consumer := range *broadcastConsumers {
 			topic, consumer := topic, consumer
+			deduper := spruce.NewDeduper(*messages*2, *ttl)
 			subscribers.Add(1)
 			go func() {
 				defer subscribers.Done()
 				client := spruce.New(*server)
+				client.Token = *token
+				client.AllowInsecureCredentials = *allowInsecure
 				err := client.Subscribe(ctx, spruce.SubscribeOptions{Topic: topicName, Concurrency: 32}, func(_ context.Context, d spruce.Delivery) error {
+					if *dedupe && deduper.Seen(d.MessageID) {
+						return nil
+					}
 					index, ok := decode(run, topic, d.Payload, *messages)
 					counts.mu.Lock()
 					if ok {
@@ -72,13 +88,19 @@ func main() {
 				}
 			}()
 		}
+		groupDeduper := spruce.NewDeduper(*messages*2, *ttl)
 		for range *groupConsumers {
 			topic := topic
 			subscribers.Add(1)
 			go func() {
 				defer subscribers.Done()
 				client := spruce.New(*server)
+				client.Token = *token
+				client.AllowInsecureCredentials = *allowInsecure
 				err := client.Subscribe(ctx, spruce.SubscribeOptions{Topic: topicName, Group: "workers", Concurrency: 32}, func(_ context.Context, d spruce.Delivery) error {
+					if *dedupe && groupDeduper.Seen(d.MessageID) {
+						return nil
+					}
 					index, ok := decode(run, topic, d.Payload, *messages)
 					counts.mu.Lock()
 					if ok {
@@ -109,18 +131,48 @@ func main() {
 		go func() {
 			defer publishers.Done()
 			client := spruce.New(*server)
+			client.Token = *token
+			client.AllowInsecureCredentials = *allowInsecure
 			for item := range jobs {
 				payload := []byte(fmt.Sprintf("%s/%d/%d", run, item.topic, item.message))
 				topicName := fmt.Sprintf("integration-%s-%d", run, item.topic)
-				if _, err := client.Publish(ctx, topicName, payload, spruce.PublishOptions{TTL: time.Minute}); err != nil {
+				if _, err := client.Publish(ctx, topicName, payload, spruce.PublishOptions{TTL: *ttl}); err != nil {
 					publishErrors.Add(1)
 				}
 			}
 		}()
 	}
+	var pace <-chan time.Time
+	var ticker *time.Ticker
+	if *publishRate > 0 {
+		ticker = time.NewTicker(time.Second / time.Duration(*publishRate))
+		pace = ticker.C
+		defer ticker.Stop()
+	}
+	queued := 0
+produce:
 	for topic := range *topics {
 		for message := range *messages {
-			jobs <- job{topic: topic, message: message}
+			if *pauseAfter > 0 && queued == *pauseAfter && *pauseFor > 0 {
+				select {
+				case <-time.After(*pauseFor):
+				case <-ctx.Done():
+					break produce
+				}
+			}
+			if pace != nil {
+				select {
+				case <-pace:
+				case <-ctx.Done():
+					break produce
+				}
+			}
+			select {
+			case jobs <- job{topic: topic, message: message}:
+				queued++
+			case <-ctx.Done():
+				break produce
+			}
 		}
 	}
 	close(jobs)
@@ -169,7 +221,7 @@ func main() {
 	fmt.Printf("topics=%d messages=%d producers=%d broadcast_consumers=%d group_consumers=%d publish_elapsed=%s publish_msg_s=%.0f missing=%d duplicates=%d invalid=%d publish_errors=%d subscription_errors=%d\n",
 		*topics, total, *producers, *broadcastConsumers, *groupConsumers, publishElapsed,
 		float64(total)/publishElapsed.Seconds(), missing, duplicates, invalid, publishErrors.Load(), subscriptionErrors.Load())
-	if missing != 0 || duplicates != 0 || invalid != 0 || publishErrors.Load() != 0 || subscriptionErrors.Load() != 0 {
+	if missing > *maxMissing || duplicates > *maxDuplicates || invalid != 0 || publishErrors.Load() != 0 || subscriptionErrors.Load() != 0 {
 		log.Fatal("integration scenario failed")
 	}
 }

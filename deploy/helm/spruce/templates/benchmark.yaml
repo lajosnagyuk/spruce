@@ -1,0 +1,37 @@
+{{- if .Values.benchmark.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "spruce.fullname" . }}-benchmark
+  labels: {{ include "spruce.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        {{- include "spruce.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: benchmark
+        spruce.io/client-access: "true"
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      initContainers:
+        - name: wait-ready
+          image: "{{ .Values.tests.image.repository }}{{ if .Values.tests.image.digest }}@{{ .Values.tests.image.digest }}{{ else }}:{{ .Values.tests.image.tag }}{{ end }}"
+          imagePullPolicy: {{ .Values.tests.image.pullPolicy }}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, runAsNonRoot: true, runAsUser: 100, runAsGroup: 101, capabilities: {drop: [ALL]}, seccompProfile: {type: RuntimeDefault}}
+          command: [sh, -ec]
+          args:
+            - curl --retry 60 --retry-all-errors --retry-delay 1 -fsS http://{{ include "spruce.fullname" . }}:{{ .Values.gateway.service.port }}/health/ready -o /dev/null
+      containers:
+        - name: benchmark
+          image: "{{ .Values.benchmark.image.repository }}{{ if .Values.benchmark.image.digest }}@{{ .Values.benchmark.image.digest }}{{ else }}:{{ .Values.benchmark.image.tag }}{{ end }}"
+          imagePullPolicy: {{ .Values.benchmark.image.pullPolicy }}
+          securityContext: {{ toYaml .Values.securityContext | nindent 12 }}
+          command: [/spruce-bench]
+          args: [-server, http://{{ include "spruce.fullname" . }}:{{ .Values.gateway.service.port }}, -allow-insecure-credentials, -n, {{ .Values.benchmark.messages | quote }}, -size, {{ .Values.benchmark.messageBytes | quote }}, -workers, {{ .Values.benchmark.producers | quote }}, -batch, {{ .Values.benchmark.batchSize | quote }}]
+          env:
+            - name: SPRUCE_TOKEN
+              valueFrom:
+                secretKeyRef: {name: {{ include "spruce.secretName" . }}, key: client-token, optional: {{ .Values.auth.allowAnonymous }}}
+{{- end }}

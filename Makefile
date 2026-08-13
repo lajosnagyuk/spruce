@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := build
-.PHONY: build test test-race benchmark csharp csharp-pack image compose-up compose-down smoke validate-local helm-lint helm-render helm-install clean
+.PHONY: build test test-race benchmark csharp csharp-pack image image-tools compose-up compose-down smoke validate-local helm-lint helm-render helm-install clean
 
 BIN := bin
 GOCACHE ?= $(CURDIR)/.cache/go-build
@@ -28,13 +28,17 @@ benchmark:
 csharp:
 	dotnet build clients/csharp/Spruce.Example/Spruce.Example.csproj --ignore-failed-sources
 	dotnet build clients/csharp/Spruce.Conformance/Spruce.Conformance.csproj --ignore-failed-sources
-	dotnet run --project clients/csharp/Spruce.Conformance/Spruce.Conformance.csproj --no-build
+	DOTNET_ROLL_FORWARD=Major dotnet run --project clients/csharp/Spruce.Conformance/Spruce.Conformance.csproj --no-build
+	DOTNET_ROLL_FORWARD=Major dotnet run --project clients/csharp/Spruce.BatcherConformance/Spruce.BatcherConformance.csproj
 
 csharp-pack:
 	dotnet pack clients/csharp/Spruce/Spruce.csproj -c Release -o $(BIN)
 
 image:
 	docker build -t spruce:dev .
+
+image-tools:
+	docker build --target tools -t spruce:tools .
 
 compose-up:
 	docker compose up -d --build
@@ -49,13 +53,13 @@ validate-local: build csharp
 	sh scripts/validate-local.sh
 
 helm-lint:
-	helm lint deploy/helm/spruce
+	helm lint deploy/helm/spruce --set image.repository=spruce --set image.tag=dev --set image.pullPolicy=Never --set tls.allowInsecureTransport=true --set gateway.allowInsecureClientTransport=true
 
 helm-render:
-	helm template spruce deploy/helm/spruce
+	helm template spruce deploy/helm/spruce --set image.repository=spruce --set image.tag=dev --set image.pullPolicy=Never --set tls.allowInsecureTransport=true --set gateway.allowInsecureClientTransport=true
 
 helm-install:
-	helm upgrade --install spruce deploy/helm/spruce --namespace spruce --create-namespace
+	helm upgrade --install spruce deploy/helm/spruce --namespace spruce --create-namespace --set image.repository=spruce --set image.tag=dev --set image.pullPolicy=Never --set tls.allowInsecureTransport=true --set gateway.allowInsecureClientTransport=true
 
 clean:
 	rm -rf $(BIN) .cache clients/csharp/*/bin clients/csharp/*/obj

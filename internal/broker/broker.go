@@ -18,7 +18,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -47,14 +49,19 @@ type Config struct {
 	MaxAttempts                int
 	Peers                      []string
 	PeerToken                  string
+	PreviousPeerToken          string
 	ClusterID                  string
 	PeerCAFile                 string
 	ClientToken                string
+	PreviousClientToken        string
 	AdminToken                 string
+	PreviousAdminToken         string
 	BasicUsername              string
 	BasicPassword              string
 	AdminBasicUsername         string
 	AdminBasicPassword         string
+	RequireClientAuth          bool
+	RequireAdminAuth           bool
 	IdempotencyEntries         int
 	MaxConcurrentRequests      int
 	MaxStreams                 int
@@ -185,10 +192,13 @@ func (c *cache) putLocked(m *Message, now int64) (bool, error) {
 func (c *cache) putBatch(messages []*Message, now int64) ([]bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	var total int64
 	for _, m := range messages {
-		if messageSize(m) > c.maxBytes {
+		sz := messageSize(m)
+		if sz > c.maxBytes || total > c.maxBytes-sz {
 			return nil, errors.New("message exceeds cache capacity")
 		}
+		total += sz
 	}
 	inserted := make([]bool, len(messages))
 	for i, m := range messages {
@@ -311,6 +321,38 @@ func (c *cache) snapshot(topic string, since int64) []*Message {
 	return out
 }
 
+func (c *cache) page(after string, maxBytes int64) ([]*Message, string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.expireLocked(time.Now().UnixMilli())
+	start := c.orderHead
+	if after != "" {
+		found := false
+		for i := c.orderHead; i < len(c.order); i++ {
+			if c.order[i] != nil && c.order[i].ID == after {
+				start, found = i+1, true
+				break
+			}
+		}
+		if !found {
+			return nil, "", false
+		}
+	}
+	out := make([]*Message, 0, 256)
+	var bytes int64
+	next := after
+	for i := start; i < len(c.order) && len(out) < maxBatchMessages; i++ {
+		if m := c.order[i]; m != nil {
+			sz := messageSize(m)
+			if bytes+sz > maxBytes {
+				break
+			}
+			out, bytes, next = append(out, m), bytes+sz, m.ID
+		}
+	}
+	return out, next, true
+}
+
 func (c *cache) has(id string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -349,6 +391,26 @@ type pending struct {
 	bytes        int64
 	next         time.Time
 	deadline     pendingDeadline
+	deliveredAt  time.Time
+}
+
+var latencyBoundsUS = [...]uint64{100, 250, 500, 1000, 2500, 5000, 10000, 50000}
+
+type durationHistogram struct {
+	buckets [len(latencyBoundsUS)]atomic.Uint64
+	count   atomic.Uint64
+	sumUS   atomic.Uint64
+}
+
+func (h *durationHistogram) observe(elapsed time.Duration) {
+	us := uint64(max(0, elapsed.Microseconds()))
+	for i, bound := range latencyBoundsUS {
+		if us <= bound {
+			h.buckets[i].Add(1)
+		}
+	}
+	h.count.Add(1)
+	h.sumUS.Add(us)
 }
 
 type pendingDeadline struct {
@@ -406,6 +468,8 @@ type Metrics struct {
 	ReplicationDropped                                               atomic.Uint64
 	AckActionDropped, NackActionDropped                              atomic.Uint64
 	Delivered, Redelivered, Acked, Dropped, Duplicate                atomic.Uint64
+	PublishLatency, ReplicationLatency, AckLatency                   durationHistogram
+	PublicAuthRejected, AdminAuthRejected, PeerAuthRejected          atomic.Uint64
 }
 
 type Broker struct {
@@ -431,9 +495,16 @@ type Broker struct {
 	requestSlots     chan struct{}
 	streamSlots      chan struct{}
 	internalSlots    chan struct{}
+	ready            atomic.Bool
 }
 
 func New(cfg Config) *Broker {
+	if cfg.RequireClientAuth && cfg.ClientToken == "" && cfg.BasicUsername == "" {
+		panic("spruce: client authentication is required but no credential is configured")
+	}
+	if cfg.RequireAdminAuth && cfg.AdminToken == "" && cfg.AdminBasicUsername == "" {
+		panic("spruce: admin authentication is required but no credential is configured")
+	}
 	if cfg.CacheBytes <= 0 {
 		cfg.CacheBytes = DefaultConfig().CacheBytes
 	}
@@ -445,6 +516,9 @@ func New(cfg Config) *Broker {
 	}
 	if cfg.MaxMessage <= 0 {
 		cfg.MaxMessage = DefaultConfig().MaxMessage
+	}
+	if cfg.MaxMessage > 23<<20 {
+		panic("spruce: max message exceeds the snapshot wire limit")
 	}
 	if cfg.QueueDepth <= 0 {
 		cfg.QueueDepth = DefaultConfig().QueueDepth
@@ -524,6 +598,8 @@ func New(cfg Config) *Broker {
 
 func (b *Broker) Handler() http.Handler { return http.HandlerFunc(b.serveHTTP) }
 func (b *Broker) Close()                { b.closeOnce.Do(func() { close(b.stop) }) }
+func (b *Broker) BeginDrain()           { b.ready.Store(false) }
+func (b *Broker) Ready()                { b.ready.Store(true) }
 
 func (b *Broker) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, "/health/") {
@@ -548,11 +624,11 @@ func (b *Broker) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		b.mux.ServeHTTP(w, r)
 		return
 	}
-	required := b.cfg.ClientToken
+	required, previous := b.cfg.ClientToken, b.cfg.PreviousClientToken
 	basicUsername, basicPassword := b.cfg.BasicUsername, b.cfg.BasicPassword
 	if r.URL.Path == "/metrics" || strings.HasPrefix(r.URL.Path, "/v1/status") {
 		if b.cfg.AdminToken != "" || b.cfg.AdminBasicUsername != "" {
-			required, basicUsername, basicPassword = b.cfg.AdminToken, b.cfg.AdminBasicUsername, b.cfg.AdminBasicPassword
+			required, previous, basicUsername, basicPassword = b.cfg.AdminToken, b.cfg.PreviousAdminToken, b.cfg.AdminBasicUsername, b.cfg.AdminBasicPassword
 		}
 	}
 	if required != "" || basicUsername != "" {
@@ -560,13 +636,18 @@ func (b *Broker) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		allowed := false
 		if required != "" && strings.HasPrefix(authorization, "Bearer ") {
 			provided := strings.TrimPrefix(authorization, "Bearer ")
-			allowed = len(provided) == len(required) && subtle.ConstantTimeCompare([]byte(provided), []byte(required)) == 1
+			allowed = tokenEqual(provided, required) || tokenEqual(provided, previous)
 		}
 		if !allowed && basicUsername != "" {
 			username, password, ok := r.BasicAuth()
 			allowed = ok && len(username) == len(basicUsername) && len(password) == len(basicPassword) && subtle.ConstantTimeCompare([]byte(username), []byte(basicUsername)) == 1 && subtle.ConstantTimeCompare([]byte(password), []byte(basicPassword)) == 1
 		}
 		if !allowed {
+			if r.URL.Path == "/metrics" || strings.HasPrefix(r.URL.Path, "/v1/status") {
+				b.metrics.AdminAuthRejected.Add(1)
+			} else {
+				b.metrics.PublicAuthRejected.Add(1)
+			}
 			w.Header().Set("WWW-Authenticate", `Basic realm="spruce", charset="UTF-8"`)
 			problem(w, http.StatusUnauthorized, "unauthorized")
 			return
@@ -582,11 +663,18 @@ func (b *Broker) routes() {
 	b.mux.HandleFunc("POST /v1/deliveries/ack", b.ack)
 	b.mux.HandleFunc("POST /v1/deliveries/nack", b.nack)
 	b.mux.HandleFunc("POST /internal/replicate", b.replicate)
+	b.mux.HandleFunc("GET /internal/snapshot", b.snapshot)
 	b.mux.HandleFunc("POST /internal/ack", b.internalAck)
 	b.mux.HandleFunc("POST /internal/nack", b.internalNack)
 	b.mux.HandleFunc("GET /metrics", b.prometheus)
 	b.mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(204) })
-	b.mux.HandleFunc("GET /health/ready", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(204) })
+	b.mux.HandleFunc("GET /health/ready", func(w http.ResponseWriter, _ *http.Request) {
+		if !b.ready.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 	b.mux.HandleFunc("GET /v1/status", b.status)
 	b.mux.HandleFunc("GET /v1/status/messages/{id}", b.messageStatus)
 }
@@ -600,6 +688,8 @@ const (
 // Topic, TTL, key, and content type are shared by the batch. This intentionally
 // keeps the fast producer path trivial to encode and decode.
 func (b *Broker) publishBatch(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	defer func() { b.metrics.PublishLatency.observe(time.Since(started)) }()
 	if r.ContentLength > maxBatchBytes {
 		problem(w, 413, "batch_too_large")
 		return
@@ -740,7 +830,7 @@ func messageFingerprint(payload []byte, key, contentType string, ttl time.Durati
 func (b *Broker) beginIdempotency(ctx context.Context, key, id string, expiresAt int64, fingerprint [32]byte) (*idempotencyEntry, bool, error) {
 	for {
 		b.mu.Lock()
-		if existing := b.idempotency[key]; existing != nil && existing.expiresAt > time.Now().UnixMilli() {
+		if existing := b.idempotency[key]; existing != nil && (existing.inProgress || existing.expiresAt > time.Now().UnixMilli()) {
 			if existing.fingerprint != fingerprint {
 				b.mu.Unlock()
 				return nil, false, errIdempotencyConflict
@@ -822,6 +912,8 @@ func (b *Broker) idempotencyReplicated(entry *idempotencyEntry) bool {
 }
 
 func (b *Broker) publish(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	defer func() { b.metrics.PublishLatency.observe(time.Since(started)) }()
 	if r.ContentLength > b.cfg.MaxMessage {
 		problem(w, 413, "message_too_large")
 		return
@@ -1136,6 +1228,8 @@ func (b *Broker) sendPeerBatch(ctx context.Context, p *peer, messages []*Message
 }
 
 func (b *Broker) sendPeerBody(ctx context.Context, p *peer, body []byte, count int) bool {
+	started := time.Now()
+	defer func() { b.metrics.ReplicationLatency.observe(time.Since(started)) }()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, p.url+"/internal/replicate", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/vnd.spruce.peer")
 	req.Header.Set("Spruce-Peer-Token", b.cfg.PeerToken)
@@ -1220,10 +1314,94 @@ func (b *Broker) replicateOne(ctx context.Context, m *Message) bool {
 
 func (b *Broker) peerAllowed(r *http.Request) bool {
 	provided := r.Header.Get("Spruce-Peer-Token")
-	if b.cfg.PeerToken == "" || len(provided) != len(b.cfg.PeerToken) || subtle.ConstantTimeCompare([]byte(provided), []byte(b.cfg.PeerToken)) != 1 {
+	if b.cfg.PeerToken == "" || (!tokenEqual(provided, b.cfg.PeerToken) && !tokenEqual(provided, b.cfg.PreviousPeerToken)) {
+		b.metrics.PeerAuthRejected.Add(1)
 		return false
 	}
-	return r.Header.Get("Spruce-Cluster-ID") == b.cfg.ClusterID
+	allowed := r.Header.Get("Spruce-Cluster-ID") == b.cfg.ClusterID
+	if !allowed {
+		b.metrics.PeerAuthRejected.Add(1)
+	}
+	return allowed
+}
+
+func tokenEqual(provided, expected string) bool {
+	return expected != "" && len(provided) == len(expected) && subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
+}
+
+func (b *Broker) snapshot(w http.ResponseWriter, r *http.Request) {
+	if !b.peerAllowed(r) {
+		problem(w, http.StatusUnauthorized, "invalid_peer")
+		return
+	}
+	messages, next, valid := b.cache.page(r.URL.Query().Get("after"), 24<<20)
+	if !valid {
+		problem(w, http.StatusConflict, "snapshot_cursor_expired")
+		return
+	}
+	if len(messages) == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	w.Header().Set("Content-Type", "application/vnd.spruce.peer")
+	w.Header().Set("Spruce-Next-Cursor", next)
+	if err := writePeerBatch(w, messages); err != nil {
+		b.cfg.Logger.Error("encode snapshot", "error", err)
+	}
+}
+
+var ErrNoPeerSnapshot = errors.New("no peer snapshot available")
+
+func (b *Broker) SyncFromPeers(ctx context.Context) error {
+	var lastErr error
+	available := false
+	for _, p := range b.peers {
+		cursor := ""
+		peerAvailable := false
+		var peerErr error
+		for {
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, p.url+"/internal/snapshot?after="+url.QueryEscape(cursor), nil)
+			req.Header.Set("Spruce-Peer-Token", b.cfg.PeerToken)
+			req.Header.Set("Spruce-Cluster-ID", b.cfg.ClusterID)
+			resp, err := b.client.Do(req)
+			if err != nil {
+				lastErr, peerErr = err, err
+				break
+			}
+			peerAvailable, available = true, true
+			if resp.StatusCode == http.StatusNoContent {
+				resp.Body.Close()
+				break
+			}
+			if resp.StatusCode != http.StatusOK {
+				lastErr = fmt.Errorf("snapshot peer returned %s", resp.Status)
+				peerErr = lastErr
+				resp.Body.Close()
+				break
+			}
+			messages, err := readPeerBatch(io.LimitReader(resp.Body, 25<<20), b.cfg.MaxMessage)
+			resp.Body.Close()
+			if err != nil {
+				lastErr, peerErr = err, err
+				break
+			}
+			if err := b.acceptBatch(messages); err != nil {
+				return err
+			}
+			next := resp.Header.Get("Spruce-Next-Cursor")
+			if next == "" || next == cursor {
+				return errors.New("invalid snapshot cursor")
+			}
+			cursor = next
+		}
+		if peerAvailable && peerErr != nil {
+			return peerErr
+		}
+	}
+	if available {
+		return nil
+	}
+	return fmt.Errorf("%w: %v", ErrNoPeerSnapshot, lastErr)
 }
 
 func (b *Broker) replicate(w http.ResponseWriter, r *http.Request) {
@@ -1361,7 +1539,8 @@ func (b *Broker) removeSubscriberLocked(s *subscriber) {
 func (b *Broker) sendDelivery(s *subscriber, m *Message, attempt int) bool {
 	d := Delivery{DeliveryID: b.nextID(), MessageID: m.ID, Topic: m.Topic, Key: m.Key, Headers: m.Headers, CreatedAt: m.CreatedAt, Attempt: attempt, Payload: m.Payload}
 	bytes := messageSize(m)
-	p := &pending{delivery: d, group: s.group, subscriberID: s.id, expiresAt: m.ExpiresAt, bytes: bytes, next: time.Now().Add(b.cfg.AckDeadline)}
+	now := time.Now()
+	p := &pending{delivery: d, group: s.group, subscriberID: s.id, expiresAt: m.ExpiresAt, bytes: bytes, deliveredAt: now, next: now.Add(b.cfg.AckDeadline)}
 	p.deadline = pendingDeadline{id: d.DeliveryID, at: p.next}
 	b.mu.Lock()
 	if s.detached || b.pendingBytes+bytes > b.cfg.MaxInflightBytes || s.inflightBytes+bytes > b.cfg.MaxSubscriberInflightBytes {
@@ -1513,7 +1692,11 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 		b.mu.Unlock()
 	}()
 	for _, m := range replay {
-		b.sendDelivery(s, m, 1)
+		if group == "" {
+			b.sendDelivery(s, m, 1)
+		} else {
+			b.deliver(m, group, 1)
+		}
 	}
 	w.Header().Set("Content-Type", "application/vnd.spruce.stream")
 	w.Header().Set("Cache-Control", "no-store")
@@ -1527,6 +1710,7 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 		case <-streamCtx.Done():
 			return
 		case d := <-s.ch:
+			_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := writeFrame(bw, d); err != nil {
 				return
 			}
@@ -1546,6 +1730,7 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 			}
 			flusher.Flush()
 		case <-heartbeat.C:
+			_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := writeFrame(bw, Delivery{}); err != nil {
 				return
 			}
@@ -1595,6 +1780,7 @@ func (b *Broker) removeAcks(ids []string) {
 				s.inflightBytes -= p.bytes
 			}
 			b.metrics.Acked.Add(1)
+			b.metrics.AckLatency.observe(time.Since(p.deliveredAt))
 		}
 	}
 	b.mu.Unlock()
@@ -1890,7 +2076,7 @@ func (b *Broker) prometheus(w http.ResponseWriter, _ *http.Request) {
 	vals := []struct {
 		name  string
 		value uint64
-	}{{"spruce_publish_total", b.metrics.Published.Load()}, {"spruce_publish_bytes_total", b.metrics.PublishBytes.Load()}, {"spruce_publish_rejected_total", b.metrics.Rejected.Load()}, {"spruce_replication_total", b.metrics.Replicated.Load()}, {"spruce_replication_errors_total", b.metrics.ReplicationErrors.Load()}, {"spruce_replication_dropped_messages_total", b.metrics.ReplicationDropped.Load()}, {"spruce_ack_propagation_dropped_ids_total", b.metrics.AckActionDropped.Load()}, {"spruce_nack_propagation_dropped_ids_total", b.metrics.NackActionDropped.Load()}, {"spruce_deliveries_total", b.metrics.Delivered.Load()}, {"spruce_redeliveries_total", b.metrics.Redelivered.Load()}, {"spruce_acks_total", b.metrics.Acked.Load()}, {"spruce_delivery_dropped_total", b.metrics.Dropped.Load()}, {"spruce_cache_evictions_total", evicted}, {"spruce_cache_expired_total", expired}, {"spruce_cache_messages", uint64(entries)}, {"spruce_cache_accounted_bytes", uint64(bytes)}, {"spruce_consumers", uint64(consumers)}, {"spruce_consumer_inflight", uint64(inflight)}, {"spruce_consumer_inflight_bytes", uint64(pendingBytes)}, {"spruce_replication_queue_bytes", uint64(replicationQueueBytes)}, {"spruce_action_queue_bytes", uint64(actionQueueBytes)}}
+	}{{"spruce_publish_total", b.metrics.Published.Load()}, {"spruce_publish_bytes_total", b.metrics.PublishBytes.Load()}, {"spruce_publish_rejected_total", b.metrics.Rejected.Load()}, {"spruce_public_auth_rejected_total", b.metrics.PublicAuthRejected.Load()}, {"spruce_admin_auth_rejected_total", b.metrics.AdminAuthRejected.Load()}, {"spruce_peer_auth_rejected_total", b.metrics.PeerAuthRejected.Load()}, {"spruce_replication_total", b.metrics.Replicated.Load()}, {"spruce_replication_errors_total", b.metrics.ReplicationErrors.Load()}, {"spruce_replication_dropped_messages_total", b.metrics.ReplicationDropped.Load()}, {"spruce_ack_propagation_dropped_ids_total", b.metrics.AckActionDropped.Load()}, {"spruce_nack_propagation_dropped_ids_total", b.metrics.NackActionDropped.Load()}, {"spruce_deliveries_total", b.metrics.Delivered.Load()}, {"spruce_redeliveries_total", b.metrics.Redelivered.Load()}, {"spruce_acks_total", b.metrics.Acked.Load()}, {"spruce_delivery_dropped_total", b.metrics.Dropped.Load()}, {"spruce_cache_evictions_total", evicted}, {"spruce_cache_expired_total", expired}, {"spruce_cache_messages", uint64(entries)}, {"spruce_cache_accounted_bytes", uint64(bytes)}, {"spruce_consumers", uint64(consumers)}, {"spruce_consumer_inflight", uint64(inflight)}, {"spruce_consumer_inflight_bytes", uint64(pendingBytes)}, {"spruce_replication_queue_bytes", uint64(replicationQueueBytes)}, {"spruce_action_queue_bytes", uint64(actionQueueBytes)}}
 	for _, v := range vals {
 		kind := "counter"
 		if v.name == "spruce_cache_messages" || v.name == "spruce_cache_accounted_bytes" || v.name == "spruce_consumers" || v.name == "spruce_consumer_inflight" || strings.HasSuffix(v.name, "_queue_bytes") || v.name == "spruce_consumer_inflight_bytes" {
@@ -1898,4 +2084,18 @@ func (b *Broker) prometheus(w http.ResponseWriter, _ *http.Request) {
 		}
 		_, _ = fmt.Fprintf(w, "# TYPE %s %s\n%s %d\n", v.name, kind, v.name, v.value)
 	}
+	b.writeHistogram(w, "spruce_publish_request_duration_microseconds", &b.metrics.PublishLatency)
+	b.writeHistogram(w, "spruce_replication_request_duration_microseconds", &b.metrics.ReplicationLatency)
+	b.writeHistogram(w, "spruce_delivery_ack_duration_microseconds", &b.metrics.AckLatency)
+	var memory runtime.MemStats
+	runtime.ReadMemStats(&memory)
+	_, _ = fmt.Fprintf(w, "# TYPE spruce_process_heap_bytes gauge\nspruce_process_heap_bytes %d\n# TYPE spruce_process_gc_cycles_total counter\nspruce_process_gc_cycles_total %d\n# TYPE spruce_process_goroutines gauge\nspruce_process_goroutines %d\n", memory.HeapAlloc, memory.NumGC, runtime.NumGoroutine())
+}
+
+func (b *Broker) writeHistogram(w io.Writer, name string, h *durationHistogram) {
+	_, _ = fmt.Fprintf(w, "# TYPE %s histogram\n", name)
+	for i, bound := range latencyBoundsUS {
+		_, _ = fmt.Fprintf(w, "%s_bucket{le=\"%d\"} %d\n", name, bound, h.buckets[i].Load())
+	}
+	_, _ = fmt.Fprintf(w, "%s_bucket{le=\"+Inf\"} %d\n%s_sum %d\n%s_count %d\n", name, h.count.Load(), name, h.sumUS.Load(), name, h.count.Load())
 }

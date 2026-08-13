@@ -1,0 +1,56 @@
+{{- if .Values.tests.enabled }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "spruce.fullname" . }}-test
+  labels:
+    {{- include "spruce.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: test
+    spruce.io/client-access: "true"
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  activeDeadlineSeconds: 120
+  automountServiceAccountToken: false
+  containers:
+    - name: smoke
+      image: "{{ .Values.tests.image.repository }}{{ if .Values.tests.image.digest }}@{{ .Values.tests.image.digest }}{{ else }}:{{ .Values.tests.image.tag }}{{ end }}"
+      imagePullPolicy: {{ .Values.tests.image.pullPolicy }}
+      securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, runAsNonRoot: true, runAsUser: 100, runAsGroup: 101, capabilities: {drop: [ALL]}, seccompProfile: {type: RuntimeDefault}}
+      env:
+        - name: TOKEN
+          valueFrom:
+            secretKeyRef: {name: {{ include "spruce.secretName" . }}, key: client-token, optional: {{ .Values.auth.allowAnonymous }}}
+        - name: ADMIN_TOKEN
+          valueFrom:
+            secretKeyRef: {name: {{ include "spruce.secretName" . }}, key: admin-token}
+      command: [sh, -ec]
+      args:
+        - |
+          base=http://{{ include "spruce.fullname" . }}:{{ .Values.gateway.service.port }}
+          auth=""
+          test -z "$TOKEN" || auth="Authorization: Bearer $TOKEN"
+          curl --retry 20 --retry-all-errors --retry-delay 1 -fsS "$base/health/ready" -o /dev/null
+          test "$(curl -sS -o /dev/null -w '%{http_code}' --data-binary denied "$base/v1/topics/helm-test/messages")" = 401
+          test "$(curl -sS -o /dev/null -w '%{http_code}' "$base/metrics")" = 404
+          test "$(curl -sS -o /dev/null -w '%{http_code}' "$base/internal/snapshot")" = 404
+          curl --max-time 10 -fsS -H "$auth" "$base/v1/subscriptions/stream?topic=helm-test&group=workers" >/tmp/member-a & a=$!
+          curl --max-time 10 -fsS -H "$auth" "$base/v1/subscriptions/stream?topic=helm-test&group=workers" >/tmp/member-b & b=$!
+          sleep 1
+          result=$(printf 'opaque-helm-test-payload' | curl -fsS -H "$auth" --data-binary @- "$base/v1/topics/helm-test/messages")
+          id=$(printf '%s' "$result" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+          test -n "$id"
+          wait "$a" || test $? = 28
+          wait "$b" || test $? = 28
+          test "$(grep -a -l 'opaque-helm-test-payload' /tmp/member-a /tmp/member-b | wc -l | tr -d ' ')" = 1
+          {{- range $i := until (int .Values.replicaCount) }}
+          test "$(curl -ksS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $ADMIN_TOKEN" "{{ include "spruce.scheme" $ }}://{{ include "spruce.fullname" $ }}-{{ $i }}.{{ include "spruce.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local:{{ $.Values.service.port }}/v1/status/messages/$id")" = 204
+          {{- end }}
+      volumeMounts:
+        - {name: tmp, mountPath: /tmp}
+  volumes:
+    - name: tmp
+      emptyDir: {}
+{{- end }}

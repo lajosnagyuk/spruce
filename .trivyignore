@@ -1,0 +1,2 @@
+# Scratch runtime healthcheck - Kubernetes and Compose use external HTTP probes
+DS-0026 exp:2026-10-12 # An in-image probe would add a second binary solely for Docker HEALTHCHECK

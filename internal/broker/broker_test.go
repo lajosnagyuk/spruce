@@ -105,6 +105,59 @@ func TestReplicationRejectsWrongCluster(t *testing.T) {
 	}
 }
 
+func TestSnapshotPagesAreByteBoundedAndCursorStable(t *testing.T) {
+	c := newCache(64 << 20)
+	now := time.Now()
+	for i := 0; i < 40; i++ {
+		m := &Message{ID: string(rune('a' + i)), Topic: "snapshot", Payload: make([]byte, 1<<20), CreatedAt: now.UnixMilli(), ExpiresAt: now.Add(time.Hour).UnixMilli()}
+		if _, err := c.put(m, now.UnixMilli()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, cursor, valid := c.page("", 24<<20)
+	if !valid || len(page) == 0 || len(page) >= 40 || cursor != page[len(page)-1].ID {
+		t.Fatalf("invalid first page: messages=%d cursor=%q valid=%v", len(page), cursor, valid)
+	}
+	next, _, valid := c.page(cursor, 24<<20)
+	if !valid || len(next) == 0 || next[0].ID == cursor {
+		t.Fatalf("invalid continuation: messages=%d valid=%v", len(next), valid)
+	}
+}
+
+func TestSnapshotRejectsEvictedCursor(t *testing.T) {
+	c := newCache(320)
+	now := time.Now()
+	first := &Message{ID: "first", Topic: "snapshot", Payload: make([]byte, 80), ExpiresAt: now.Add(time.Hour).UnixMilli()}
+	_, _ = c.put(first, now.UnixMilli())
+	for i := 0; i < 10; i++ {
+		_, _ = c.put(&Message{ID: string(rune('k' + i)), Topic: "snapshot", Payload: make([]byte, 80), ExpiresAt: now.Add(time.Hour).UnixMilli()}, now.UnixMilli())
+	}
+	if _, _, valid := c.page(first.ID, 24<<20); valid {
+		t.Fatal("evicted cursor was accepted")
+	}
+}
+
+func TestBootstrapFailsClosedAfterPartialPeerResponse(t *testing.T) {
+	calls := atomic.Int32{}
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) > 1 {
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+		m := &Message{ID: "one", Topic: "snapshot", Payload: []byte("x"), CreatedAt: time.Now().UnixMilli(), ExpiresAt: time.Now().Add(time.Hour).UnixMilli()}
+		w.Header().Set("Spruce-Next-Cursor", m.ID)
+		_ = writePeerBatch(w, []*Message{m})
+	}))
+	defer peer.Close()
+	cfg := DefaultConfig()
+	cfg.Peers, cfg.PeerToken, cfg.ClusterID = []string{peer.URL}, "peer", "cluster"
+	b := New(cfg)
+	defer b.Close()
+	if err := b.SyncFromPeers(context.Background()); err == nil {
+		t.Fatal("partial bootstrap succeeded")
+	}
+}
+
 func TestPublishBatch(t *testing.T) {
 	b := New(DefaultConfig())
 	defer b.Close()
@@ -406,6 +459,22 @@ func TestRetryTargetsOnlyItsConsumerGroup(t *testing.T) {
 	}
 }
 
+func TestGroupReplayArbitratesOneMember(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	a := &subscriber{id: "a", topic: "t", group: "workers", ch: make(chan Delivery, 1)}
+	c := &subscriber{id: "b", topic: "t", group: "workers", ch: make(chan Delivery, 1)}
+	b.mu.Lock()
+	b.addSubscriberLocked(a)
+	b.addSubscriberLocked(c)
+	b.mu.Unlock()
+	m := &Message{ID: "replay", Topic: "t", Payload: []byte("x"), ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
+	b.deliver(m, "workers", 1)
+	if len(a.ch)+len(c.ch) != 1 {
+		t.Fatalf("group replay fan-out: a=%d b=%d", len(a.ch), len(c.ch))
+	}
+}
+
 func TestInflightByteLimitRejectsDelivery(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.MaxInflightBytes = 1
@@ -579,6 +648,29 @@ func TestHealthBypassesPublicAdmissionLimit(t *testing.T) {
 	if w.Code != 204 {
 		t.Fatalf("health status %d", w.Code)
 	}
+}
+
+func TestCacheRejectsAggregateOversizedBatch(t *testing.T) {
+	c := newCache(180)
+	messages := []*Message{
+		{ID: "one", Topic: "t", Payload: make([]byte, 80), ExpiresAt: time.Now().Add(time.Minute).UnixMilli()},
+		{ID: "two", Topic: "t", Payload: make([]byte, 80), ExpiresAt: time.Now().Add(time.Minute).UnixMilli()},
+	}
+	if _, err := c.putBatch(messages, time.Now().UnixMilli()); err == nil {
+		t.Fatal("aggregate oversized batch was accepted")
+	}
+	if c.has("one") || c.has("two") {
+		t.Fatal("rejected batch partially mutated the cache")
+	}
+}
+
+func TestRejectsMaxMessageAboveSnapshotLimit(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxMessage = 23<<20 + 1
+	defer func() {
+		if recover() == nil { t.Fatal("oversized snapshot configuration was accepted") }
+	}()
+	_ = New(cfg)
 }
 
 func FuzzReadPeerBatch(f *testing.F) {

@@ -12,3 +12,17 @@ spec:
       {{- include "spruce.selectorLabels" . | nindent 6 }}
       app.kubernetes.io/component: broker
 {{- end }}
+{{- if and .Values.gateway.enabled .Values.gateway.podDisruptionBudget.enabled (gt (int .Values.gateway.replicaCount) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "spruce.fullname" . }}-gateway
+  labels: {{ include "spruce.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.gateway.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "spruce.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: gateway
+{{- end }}

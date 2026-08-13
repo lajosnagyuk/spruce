@@ -27,16 +27,24 @@ public sealed partial class SpruceClient : IDisposable
     private readonly string? _username;
     private readonly string? _password;
     private readonly bool _ownsHttp;
+    private readonly TimeSpan _requestTimeout;
     public Action<ClientEvent>? OnEvent { get; init; }
 
-    public SpruceClient(string baseUrl, HttpClient? http = null, string? token = null, string? username = null, string? password = null)
+    public SpruceClient(string baseUrl, HttpClient? http = null, string? token = null, string? username = null, string? password = null, bool allowInsecureCredentials = false, TimeSpan? requestTimeout = null)
     {
         _baseUrl = baseUrl.TrimEnd('/');
+        if (!allowInsecureCredentials && (token is not null || username is not null))
+        {
+            if (!Uri.TryCreate(_baseUrl, UriKind.Absolute, out var endpoint) || endpoint.Scheme != Uri.UriSchemeHttps)
+                throw new ArgumentException("Credentials require an HTTPS base URL; use allowInsecureCredentials only for isolated development", nameof(baseUrl));
+        }
         _ownsHttp = http is null;
         _http = http ?? new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         _token = token;
         _username = username;
         _password = password;
+        _requestTimeout = requestTimeout ?? TimeSpan.FromSeconds(30);
+        if (_requestTimeout <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(requestTimeout));
         if ((username is null) != (password is null)) throw new ArgumentException("Basic username and password must be supplied together");
     }
 
@@ -45,7 +53,7 @@ public sealed partial class SpruceClient : IDisposable
     public async Task<PublishResult> PublishAsync(string topic, ReadOnlyMemory<byte> payload, PublishOptions? options = null, CancellationToken cancellationToken = default)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(TimeSpan.FromSeconds(30));
+        timeout.CancelAfter(_requestTimeout);
         options ??= new();
         using var request = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/v1/topics/{Uri.EscapeDataString(topic)}/messages");
         request.Content = new ByteArrayContent(payload.ToArray());
@@ -64,13 +72,14 @@ public sealed partial class SpruceClient : IDisposable
     public async Task<BatchResult> PublishBatchAsync(string topic, IReadOnlyList<ReadOnlyMemory<byte>> payloads, PublishOptions? options = null, CancellationToken cancellationToken = default)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(TimeSpan.FromSeconds(30));
+        timeout.CancelAfter(_requestTimeout);
         if (payloads.Count == 0) throw new ArgumentException("Batch is empty", nameof(payloads));
         if (payloads.Count > 4096) throw new ArgumentException("Batch exceeds 4096 messages", nameof(payloads));
         options ??= new();
         if (options.Ack is not null and not "local") throw new ArgumentException("Batch only supports local acknowledgement", nameof(options));
         if (options.IdempotencyKey is not null) throw new ArgumentException("Batch idempotency is not supported", nameof(options));
         var total = payloads.Aggregate(0L, (sum, payload) => checked(sum + 4 + payload.Length));
+        if (payloads.Any(payload => payload.Length > 1024 * 1024)) throw new ArgumentException("A batch message exceeds 1 MiB", nameof(payloads));
         if (total > 16 * 1024 * 1024) throw new ArgumentException("Batch exceeds 16 MiB", nameof(payloads));
         using var body = new MemoryStream(checked((int)total));
         var size = new byte[4];
@@ -93,6 +102,8 @@ public sealed partial class SpruceClient : IDisposable
 
     public async Task SubscribeAsync(string topic, string? group, Func<Delivery, CancellationToken, Task> handler, CancellationToken cancellationToken = default, int concurrency = 16, int maxPayloadBytes = 1024 * 1024, long since = 0, TimeSpan? drainTimeout = null)
     {
+        if (string.IsNullOrWhiteSpace(topic)) throw new ArgumentException("Topic is required", nameof(topic));
+        if (concurrency <= 0) concurrency = 16;
         if (concurrency < 1 || concurrency > 1024) throw new ArgumentOutOfRangeException(nameof(concurrency));
         if (maxPayloadBytes < 1 || maxPayloadBytes > 64 * 1024 * 1024) throw new ArgumentOutOfRangeException(nameof(maxPayloadBytes));
         drainTimeout ??= TimeSpan.FromSeconds(1);
@@ -194,8 +205,20 @@ public sealed partial class SpruceClient : IDisposable
                     catch (OperationCanceledException) when (connection.IsCancellationRequested) { }
                     if (since > connectedSince) backoff = TimeSpan.FromMilliseconds(50);
                 }
+                if (gracefulEnd && !cancellationToken.IsCancellationRequested)
+                {
+                    var jitter = 0.5 + Random.Shared.NextDouble();
+                    await Task.Delay(TimeSpan.FromMilliseconds(backoff.TotalMilliseconds * jitter), cancellationToken);
+                    backoff = TimeSpan.FromMilliseconds(Math.Min(2000, backoff.TotalMilliseconds * 2));
+                }
             }
             catch (HttpRequestException ex) when (!cancellationToken.IsCancellationRequested && ex.StatusCode is null or >= System.Net.HttpStatusCode.InternalServerError)
+            {
+                var jitter = 0.5 + Random.Shared.NextDouble();
+                await Task.Delay(TimeSpan.FromMilliseconds(backoff.TotalMilliseconds * jitter), cancellationToken);
+                backoff = TimeSpan.FromMilliseconds(Math.Min(2000, backoff.TotalMilliseconds * 2));
+            }
+            catch (SpruceException ex) when (!cancellationToken.IsCancellationRequested && (ex.StatusCode == 408 || ex.StatusCode == 429 || ex.StatusCode >= 500))
             {
                 var jitter = 0.5 + Random.Shared.NextDouble();
                 await Task.Delay(TimeSpan.FromMilliseconds(backoff.TotalMilliseconds * jitter), cancellationToken);
@@ -235,7 +258,10 @@ public sealed partial class SpruceClient : IDisposable
     private static async Task EnsureSuccessAsync(HttpResponseMessage response, CancellationToken cancellationToken)
     {
         if (response.IsSuccessStatusCode) return;
-        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        var buffer = new byte[4097];
+        var read = await stream.ReadAsync(buffer, cancellationToken);
+        var body = System.Text.Encoding.UTF8.GetString(buffer, 0, Math.Min(read, 4096));
         string? code = null;
         try { code = JsonDocument.Parse(body).RootElement.GetProperty("error").GetString(); } catch (Exception) { }
         throw new SpruceException((int)response.StatusCode, response.ReasonPhrase ?? response.StatusCode.ToString(), code, body);
@@ -244,17 +270,28 @@ public sealed partial class SpruceClient : IDisposable
     private async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, HttpCompletionOption completion, CancellationToken cancellationToken, string operation)
     {
         var started = DateTimeOffset.UtcNow;
+        var emitted = false;
         try
         {
             var response = await _http.SendAsync(request, completion, cancellationToken);
-            OnEvent?.Invoke(new(operation, DateTimeOffset.UtcNow - started, (int)response.StatusCode, null));
+            if (!response.IsSuccessStatusCode)
+            {
+                try { await EnsureSuccessAsync(response, cancellationToken); }
+                catch (Exception error) { Emit(new(operation, DateTimeOffset.UtcNow - started, (int)response.StatusCode, error)); emitted = true; response.Dispose(); throw; }
+            }
+            Emit(new(operation, DateTimeOffset.UtcNow - started, (int)response.StatusCode, null));
             return response;
         }
         catch (Exception ex)
         {
-            OnEvent?.Invoke(new(operation, DateTimeOffset.UtcNow - started, null, ex));
+            if (!emitted) Emit(new(operation, DateTimeOffset.UtcNow - started, null, ex));
             throw;
         }
+    }
+
+    private void Emit(ClientEvent value)
+    {
+        try { OnEvent?.Invoke(value); } catch { }
     }
 
     private sealed class AckBatcher : IAsyncDisposable

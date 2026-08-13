@@ -8,6 +8,8 @@ services:
       SPRUCE_ACK_DEADLINE: 5s
       SPRUCE_PEER_TOKEN: ${SPRUCE_PEER_TOKEN:?set SPRUCE_PEER_TOKEN}
       SPRUCE_CLUSTER_ID: ${SPRUCE_CLUSTER_ID:?set SPRUCE_CLUSTER_ID}
+      SPRUCE_ALLOW_ANONYMOUS: "true"
+      SPRUCE_ALLOW_INSECURE_TRANSPORT: "true"
     command: []
     mem_limit: 512m
     restart: unless-stopped

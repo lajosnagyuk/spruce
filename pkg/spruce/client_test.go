@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -259,4 +260,35 @@ func TestConsumableDeliveryControlsAcknowledgement(t *testing.T) {
 	if acked.Load() != 1 {
 		t.Fatalf("acks=%d", acked.Load())
 	}
+}
+
+func TestCredentialsRejectHTTPSDowngradeRedirect(t *testing.T) {
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" { t.Fatal("credential reached plaintext redirect target") }
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer httpServer.Close()
+	httpsServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, httpServer.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer httpsServer.Close()
+	c := New(httpsServer.URL)
+	c.HTTP = httpsServer.Client()
+	c.Token = "secret"
+	if _, err := c.Publish(context.Background(), "t", []byte("x"), PublishOptions{}); err == nil {
+		t.Fatal("HTTPS credential downgrade redirect succeeded")
+	}
+}
+
+func TestHandlerPanicReturnsErrorInsteadOfCrashing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/deliveries/nack" { w.WriteHeader(http.StatusNoContent); return }
+		metadata, _ := json.Marshal(Delivery{DeliveryID: "d", MessageID: "m", Topic: "t", CreatedAt: 1})
+		var sizes [8]byte
+		binary.BigEndian.PutUint32(sizes[:4], uint32(len(metadata)))
+		_, _ = w.Write(sizes[:]); _, _ = w.Write(metadata)
+	}))
+	defer server.Close()
+	err := New(server.URL).Subscribe(context.Background(), SubscribeOptions{Topic: "t"}, func(context.Context, Delivery) error { panic("boom") })
+	if err == nil || !strings.Contains(err.Error(), "handler panic") { t.Fatalf("err=%v", err) }
 }

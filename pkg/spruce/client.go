@@ -19,12 +19,13 @@ import (
 )
 
 type Client struct {
-	BaseURL  string
-	Token    string
-	Username string
-	Password string
-	HTTP     *http.Client
-	OnEvent  func(ClientEvent)
+	BaseURL                  string
+	Token                    string
+	Username                 string
+	Password                 string
+	HTTP                     *http.Client
+	OnEvent                  func(ClientEvent)
+	AllowInsecureCredentials bool
 }
 type ClientEvent struct {
 	Operation  string
@@ -32,6 +33,8 @@ type ClientEvent struct {
 	StatusCode int
 	Err        error
 }
+type HandlerPanicError struct{ Value any }
+func (e *HandlerPanicError) Error() string { return fmt.Sprintf("spruce: handler panic: %v", e.Value) }
 type PublishOptions struct {
 	Key, ContentType, ProducerID, IdempotencyKey, Ack string
 	TTL                                               time.Duration
@@ -65,16 +68,41 @@ func (c *Client) httpClient() *http.Client {
 	}
 	return http.DefaultClient
 }
-func (c *Client) authorize(req *http.Request) {
+func (c *Client) doWith(base *http.Client, req *http.Request) (*http.Response, error) {
+	copy := *base
+	previous := copy.CheckRedirect
+	copy.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		if len(via) > 0 && via[0].Header.Get("Authorization") != "" && next.URL.Scheme != "https" && !c.AllowInsecureCredentials {
+			return errors.New("spruce: refusing credential redirect to plaintext HTTP")
+		}
+		if previous != nil {
+			return previous(next, via)
+		}
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		return nil
+	}
+	return copy.Do(req)
+}
+func (c *Client) do(req *http.Request) (*http.Response, error) { return c.doWith(c.httpClient(), req) }
+func (c *Client) authorize(req *http.Request) error {
+	if (c.Token != "" || c.Username != "") && req.URL.Scheme != "https" && !c.AllowInsecureCredentials {
+		return errors.New("spruce: credentials require HTTPS; enable AllowInsecureCredentials only for isolated development")
+	}
 	if c.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	} else if c.Username != "" {
 		req.SetBasicAuth(c.Username, c.Password)
 	}
+	return nil
 }
 func (c *Client) emit(operation string, started time.Time, status int, err error) {
 	if c.OnEvent != nil {
-		c.OnEvent(ClientEvent{Operation: operation, Duration: time.Since(started), StatusCode: status, Err: err})
+		func() {
+			defer func() { _ = recover() }()
+			c.OnEvent(ClientEvent{Operation: operation, Duration: time.Since(started), StatusCode: status, Err: err})
+		}()
 	}
 }
 
@@ -125,8 +153,11 @@ func (c *Client) Publish(ctx context.Context, topic string, payload []byte, o Pu
 	if o.ProducerID != "" {
 		req.Header.Set("Spruce-Producer-ID", o.ProducerID)
 	}
-	c.authorize(req)
-	resp, err := c.httpClient().Do(req)
+	if err = c.authorize(req); err != nil {
+		finalErr = err
+		return out, err
+	}
+	resp, err := c.do(req)
 	if err != nil {
 		finalErr = err
 		return out, err
@@ -138,6 +169,7 @@ func (c *Client) Publish(ctx context.Context, topic string, payload []byte, o Pu
 		return out, finalErr
 	}
 	err = json.NewDecoder(resp.Body).Decode(&out)
+	finalErr = err
 	return out, err
 }
 
@@ -191,6 +223,9 @@ func (c *Client) PublishRetry(ctx context.Context, topic string, payload []byte,
 
 func (c *Client) PublishBatch(ctx context.Context, topic string, payloads [][]byte, o PublishOptions) (BatchResult, error) {
 	started := time.Now()
+	status := 0
+	var finalErr error
+	defer func() { c.emit("publish_batch", started, status, finalErr) }()
 	var out BatchResult
 	if len(payloads) == 0 || len(payloads) > 4096 {
 		if len(payloads) == 0 {
@@ -235,18 +270,23 @@ func (c *Client) PublishBatch(ctx context.Context, topic string, payloads [][]by
 	if o.IdempotencyKey != "" {
 		return out, errors.New("batch idempotency is not supported")
 	}
-	c.authorize(req)
-	resp, err := c.httpClient().Do(req)
-	if err != nil {
-		c.emit("publish_batch", started, 0, err)
+	if err = c.authorize(req); err != nil {
+		finalErr = err
 		return out, err
 	}
-	c.emit("publish_batch", started, resp.StatusCode, nil)
+	resp, err := c.do(req)
+	if err != nil {
+		finalErr = err
+		return out, err
+	}
+	status = resp.StatusCode
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return out, responseError(resp)
+		finalErr = responseError(resp)
+		return out, finalErr
 	}
 	err = json.NewDecoder(resp.Body).Decode(&out)
+	finalErr = err
 	return out, err
 }
 
@@ -361,6 +401,10 @@ func (c *Client) Subscribe(ctx context.Context, o SubscribeOptions, handler Hand
 		if errors.Is(err, ErrHandlerDrainTimeout) {
 			return err
 		}
+		var panicErr *HandlerPanicError
+		if errors.As(err, &panicErr) {
+			return err
+		}
 		var apiErr *Error
 		if errors.As(err, &apiErr) && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 {
 			return err
@@ -400,20 +444,26 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
 		c.emit("get", started, 0, err)
 		return err
 	}
-	c.authorize(req)
-	resp, err := c.httpClient().Do(req)
+	if err = c.authorize(req); err != nil {
+		return err
+	}
+	resp, err := c.do(req)
 	if err != nil {
 		c.emit("get", started, 0, err)
 		return err
 	}
-	c.emit("get", started, resp.StatusCode, nil)
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return responseError(resp)
+		err = responseError(resp)
+		c.emit("get", started, resp.StatusCode, err)
+		return err
 	}
 	if out != nil {
-		return json.NewDecoder(resp.Body).Decode(out)
+		err = json.NewDecoder(resp.Body).Decode(out)
+		c.emit("get", started, resp.StatusCode, err)
+		return err
 	}
+	c.emit("get", started, resp.StatusCode, nil)
 	return nil
 }
 func (c *Client) Status(ctx context.Context) (Status, error) {
@@ -432,8 +482,10 @@ func (c *Client) MessageCached(ctx context.Context, id string) (bool, error) {
 }
 func (c *Client) Metrics(ctx context.Context) ([]byte, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/metrics", nil)
-	c.authorize(req)
-	resp, err := c.httpClient().Do(req)
+	if err := c.authorize(req); err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -503,10 +555,12 @@ func (c *Client) subscribeOnce(ctx context.Context, o SubscribeOptions, handler 
 		v.Set("since", fmt.Sprint(o.Since))
 	}
 	req, _ := http.NewRequestWithContext(streamCtx, http.MethodGet, c.BaseURL+"/v1/subscriptions/stream?"+v.Encode(), nil)
-	c.authorize(req)
+	if err := c.authorize(req); err != nil {
+		return o.Since, err
+	}
 	streamHTTP := *c.httpClient()
 	streamHTTP.Timeout = 0
-	resp, err := streamHTTP.Do(req)
+	resp, err := c.doWith(&streamHTTP, req)
 	if err != nil {
 		return o.Since, err
 	}
@@ -593,13 +647,27 @@ func (c *Client) subscribeOnce(ctx context.Context, o SubscribeOptions, handler 
 		index := sequence.Add(1)
 		go func() {
 			defer func() { <-sem }()
-			if handler(streamCtx, d) != nil {
+			var handlerErr error
+			func() {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						handlerErr = &HandlerPanicError{Value: recovered}
+					}
+				}()
+				handlerErr = handler(streamCtx, d)
+			}()
+			if handlerErr != nil {
 				if e := nacks.submit(streamCtx, d.DeliveryID); e != nil {
 					select {
 					case workerErrors <- e:
 						cancel()
 					default:
 					}
+					return
+				}
+				var panicErr *HandlerPanicError
+				if errors.As(handlerErr, &panicErr) {
+					select { case workerErrors <- handlerErr: cancel(); default: }
 					return
 				}
 				markComplete(index, d.CreatedAt)
@@ -642,8 +710,10 @@ func (c *Client) ack(ctx context.Context, kind string, ids []string) error {
 	body, _ := json.Marshal(map[string][]string{"delivery_ids": ids})
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/v1/deliveries/"+kind, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	c.authorize(req)
-	resp, e := c.httpClient().Do(req)
+	if e := c.authorize(req); e != nil {
+		return e
+	}
+	resp, e := c.do(req)
 	if e != nil {
 		return e
 	}

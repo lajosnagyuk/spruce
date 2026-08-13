@@ -1,40 +1,52 @@
 name: CI
-
 on:
   push:
     branches: [main]
   pull_request:
-
 permissions:
   contents: read
-
 jobs:
   go:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.26.x'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with: {go-version: '1.26.x'}
       - run: go test ./...
       - run: go test -race ./...
       - run: CGO_ENABLED=0 go build -trimpath ./cmd/spruce
-
   dotnet:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.0.x'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with: {dotnet-version: '8.0.x'}
       - run: dotnet run --project clients/csharp/Spruce.Conformance/Spruce.Conformance.csproj
+      - run: dotnet run --project clients/csharp/Spruce.BatcherConformance/Spruce.BatcherConformance.csproj
       - run: dotnet pack clients/csharp/Spruce/Spruce.csproj -c Release -o artifacts
-
-  manifests:
+  helm:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
-      - run: helm lint deploy/helm/spruce
-      - run: helm template spruce deploy/helm/spruce --set replicaCount=1 >/dev/null
-      - run: helm template spruce deploy/helm/spruce --set replicaCount=3 --set tls.enabled=true --set tls.existingSecret=spruce-tls >/dev/null
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: azure/setup-helm@bf6a7d304bc2fdb57e0331155b7ebf2c504acf0a # v4
+      - run: helm lint deploy/helm/spruce --set image.repository=spruce --set image.tag=ci --set image.pullPolicy=Never --set tls.allowInsecureTransport=true --set gateway.allowInsecureClientTransport=true
+      - run: |
+          for replicas in 1 2 3; do
+            helm template spruce deploy/helm/spruce --set image.repository=spruce --set image.tag=ci --set image.pullPolicy=Never --set replicaCount=$replicas --set tls.allowInsecureTransport=true --set gateway.allowInsecureClientTransport=true | kubectl apply --dry-run=client --validate=false -f - >/dev/null
+          done
+      - run: helm template spruce deploy/helm/spruce --set image.repository=spruce --set image.tag=ci --set image.pullPolicy=Never --set tls.enabled=true --set tls.existingSecret=spruce-tls --set ingress.enabled=true --set ingress.tls[0].secretName=public-tls --set ingress.tls[0].hosts[0]=spruce.example.com | kubectl apply --dry-run=client --validate=false -f - >/dev/null
+  kubernetes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: azure/setup-helm@bf6a7d304bc2fdb57e0331155b7ebf2c504acf0a # v4
+      - uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1.12.0
+        with: {cluster_name: spruce-ci}
+      - run: |
+          docker build -t spruce:ci .
+          kind load docker-image spruce:ci --name spruce-ci
+          helm upgrade --install spruce deploy/helm/spruce --namespace spruce --create-namespace \
+            --set image.repository=spruce --set image.tag=ci --set image.pullPolicy=Never \
+            --set tls.allowInsecureTransport=true --set gateway.allowInsecureClientTransport=true \
+            --wait --timeout 5m
+          helm test spruce --namespace spruce --logs --timeout 3m

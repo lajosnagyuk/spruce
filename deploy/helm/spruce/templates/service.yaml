@@ -4,10 +4,9 @@ metadata:
   name: {{ include "spruce.fullname" . }}-headless
   labels:
     {{- include "spruce.labels" . | nindent 4 }}
-    spruce.io/metrics: broker
 spec:
   clusterIP: None
-  publishNotReadyAddresses: true
+  publishNotReadyAddresses: false
   selector:
     {{- include "spruce.selectorLabels" . | nindent 4 }}
     app.kubernetes.io/component: broker
@@ -31,3 +30,20 @@ spec:
     - name: http
       port: {{ ternary .Values.gateway.service.port .Values.service.port .Values.gateway.enabled }}
       targetPort: {{ ternary "http" "broker" .Values.gateway.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "spruce.fullname" . }}-admin
+  labels:
+    {{- include "spruce.labels" . | nindent 4 }}
+    spruce.io/metrics: broker
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "spruce.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: broker
+  ports:
+    - name: {{ include "spruce.scheme" . }}
+      port: {{ .Values.service.port }}
+      targetPort: broker

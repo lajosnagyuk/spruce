@@ -6,13 +6,23 @@ metadata:
   labels:
     {{- include "spruce.labels" . | nindent 4 }}
 spec:
+  namespaceSelector: {{ toYaml .Values.serviceMonitor.namespaceSelector | nindent 4 }}
   selector:
     matchLabels:
       spruce.io/metrics: broker
   endpoints:
     - port: {{ include "spruce.scheme" . }}
       interval: {{ .Values.serviceMonitor.interval }}
+      bearerTokenSecret:
+        name: {{ include "spruce.secretName" . }}
+        key: admin-token
       {{- if .Values.tls.enabled }}
       scheme: https
+      tlsConfig:
+        ca:
+          secret:
+            name: {{ .Values.tls.existingSecret }}
+            key: {{ .Values.tls.caKey }}
+        serverName: {{ include "spruce.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local
       {{- end }}
 {{- end }}

@@ -39,6 +39,7 @@ data:
       server {
         listen 8080;
         client_max_body_size 17m;
+        location ~ ^/(internal/|metrics$|v1/status) { return 404; }
         location = /v1/subscriptions/stream {
           proxy_pass {{ include "spruce.scheme" . }}://streams;
           proxy_http_version 1.1;
@@ -68,6 +69,11 @@ metadata:
     {{- include "spruce.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.gateway.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       {{- include "spruce.selectorLabels" . | nindent 6 }}
@@ -78,17 +84,32 @@ spec:
         {{- include "spruce.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: gateway
       annotations:
-        checksum/config: {{ printf "%s:%d:%d:%d" (toJson .Values.gateway) (int .Values.replicaCount) (int .Values.service.port) .Release.Revision | sha256sum }}
+        checksum/config: {{ printf "%s:%s:%d:%d" .Chart.Version (toJson .Values.gateway) (int .Values.replicaCount) (int .Values.service.port) | sha256sum }}
+        {{- if .Values.tls.enabled }}
+        checksum/tls: {{ include "spruce.tlsChecksum" . }}
+        {{- end }}
     spec:
-      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.gateway.terminationGracePeriodSeconds }}
+      {{- if .Values.gateway.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "spruce.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: gateway
+      {{- end }}
+      securityContext: {runAsNonRoot: true, fsGroup: 101, fsGroupChangePolicy: OnRootMismatch, seccompProfile: {type: RuntimeDefault}}
       containers:
         - name: nginx
-          image: "{{ .Values.gateway.image.repository }}:{{ .Values.gateway.image.tag }}"
+          image: "{{ .Values.gateway.image.repository }}{{ if .Values.gateway.image.digest }}@{{ .Values.gateway.image.digest }}{{ else }}:{{ .Values.gateway.image.tag }}{{ end }}"
           imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
           ports:
             - {name: http, containerPort: 8080}
           readinessProbe:
-            tcpSocket: {port: http}
+            httpGet: {path: /health/ready, port: http}
           livenessProbe:
             tcpSocket: {port: http}
           resources: {{ toYaml .Values.gateway.resources | nindent 12 }}
@@ -98,6 +119,9 @@ spec:
             runAsUser: 101
             runAsGroup: 101
             capabilities: {drop: [ALL]}
+          lifecycle:
+            preStop:
+              exec: {command: [sh, -c, "kill -QUIT 1; sleep 5"]}
           volumeMounts:
             - {name: config, mountPath: /etc/nginx/nginx.conf, subPath: nginx.conf, readOnly: true}
             - {name: cache, mountPath: /var/cache/nginx}
@@ -116,5 +140,6 @@ spec:
         - name: tls
           secret:
             secretName: {{ required "tls.existingSecret is required when TLS is enabled" .Values.tls.existingSecret }}
+            defaultMode: 0440
         {{- end }}
 {{- end }}

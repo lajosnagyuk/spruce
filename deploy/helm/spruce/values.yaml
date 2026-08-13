@@ -2,7 +2,8 @@ replicaCount: 3
 
 image:
   repository: ghcr.io/lajosnagyuk/spruce
-  tag: v0.1.0
+  tag: ""
+  digest: ""
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -11,10 +12,13 @@ fullnameOverride: ""
 
 gateway:
   enabled: true
+  allowInsecureClientTransport: false
+  configRevision: "3"
   replicaCount: 2
   image:
     repository: nginx
     tag: 1.29-alpine
+    digest: sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
     pullPolicy: IfNotPresent
   service:
     type: ClusterIP
@@ -25,19 +29,30 @@ gateway:
       memory: 16Mi
     limits:
       memory: 64Mi
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
+  topologySpreadConstraints: true
+  terminationGracePeriodSeconds: 30
 
 service:
   port: 8080
 
 auth:
   existingSecret: ""
+  allowMissingExistingSecretForRender: false
+  allowAnonymous: false
   peerToken: ""
+  previousPeerToken: ""
   clusterID: ""
   clientToken: ""
+  previousClientToken: ""
   adminToken: ""
+  previousAdminToken: ""
 
 tls:
   enabled: false
+  allowInsecureTransport: false
   existingSecret: ""
   caKey: ca.crt
 
@@ -48,6 +63,7 @@ config:
   defaultTTL: 1m
   maxTTL: 24h
   ackDeadline: 15s
+  drainDelay: 30s
   replicationQueueBytes: "16777216"
   actionQueueBytes: "4194304"
   maxInflightBytes: "33554432"
@@ -62,6 +78,8 @@ podAnnotations: {}
 podLabels: {}
 podSecurityContext:
   runAsNonRoot: true
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
   seccompProfile:
     type: RuntimeDefault
 securityContext:
@@ -81,7 +99,7 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 topologySpreadConstraints: true
-terminationGracePeriodSeconds: 15
+terminationGracePeriodSeconds: 45
 
 podDisruptionBudget:
   enabled: true
@@ -89,7 +107,56 @@ podDisruptionBudget:
 
 networkPolicy:
   enabled: true
+  clientIngress:
+    namespaceSelector: {}
+    podSelector:
+      matchLabels:
+        spruce.io/client-access: "true"
+  ingressControllerIngress:
+    namespaceSelector:
+      matchLabels:
+        spruce.io/ingress-access: "true"
+    podSelector: {}
+  adminIngress:
+    namespaceSelector:
+      matchLabels:
+        spruce.io/admin-access: "true"
+    podSelector:
+      matchLabels:
+        spruce.io/admin-access: "true"
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: spruce.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
 
 serviceMonitor:
   enabled: false
   interval: 15s
+  namespaceSelector: {}
+
+tests:
+  enabled: true
+  image:
+    repository: curlimages/curl
+    tag: 8.16.0
+    digest: sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6
+    pullPolicy: IfNotPresent
+
+benchmark:
+  enabled: false
+  image:
+    repository: ""
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  messages: "100000"
+  messageBytes: "256"
+  producers: "16"
+  batchSize: "256"
