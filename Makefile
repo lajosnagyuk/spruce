@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := build
-.PHONY: build test test-race benchmark csharp csharp-pack image compose-up compose-down smoke validate-local k8s-render k8s-apply clean
+.PHONY: build test test-race benchmark csharp csharp-pack image compose-up compose-down smoke validate-local helm-lint helm-render helm-install clean
 
 BIN := bin
 GOCACHE ?= $(CURDIR)/.cache/go-build
@@ -13,6 +13,7 @@ build:
 	go build -trimpath -o $(BIN)/spruce-producer ./cmd/spruce-producer
 	go build -trimpath -o $(BIN)/spruce-consumer ./cmd/spruce-consumer
 	go build -trimpath -o $(BIN)/spruce-bench ./cmd/spruce-bench
+	go build -trimpath -o $(BIN)/spruce-integration ./cmd/spruce-integration
 
 test:
 	go test ./...
@@ -47,11 +48,14 @@ smoke:
 validate-local: build csharp
 	sh scripts/validate-local.sh
 
-k8s-render:
-	kubectl kustomize deploy/kubernetes
+helm-lint:
+	helm lint deploy/helm/spruce
 
-k8s-apply:
-	kubectl apply -k deploy/kubernetes
+helm-render:
+	helm template spruce deploy/helm/spruce
+
+helm-install:
+	helm upgrade --install spruce deploy/helm/spruce --namespace spruce --create-namespace
 
 clean:
 	rm -rf $(BIN) .cache clients/csharp/*/bin clients/csharp/*/obj

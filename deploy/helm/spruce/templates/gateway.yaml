@@ -1,0 +1,120 @@
+{{- if .Values.gateway.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "spruce.fullname" . }}-gateway
+  labels:
+    {{- include "spruce.labels" . | nindent 4 }}
+data:
+  nginx.conf: |
+    events { worker_connections 4096; }
+    http {
+      access_log off;
+      resolver kube-dns.kube-system.svc.cluster.local valid=5s ipv6=off;
+      {{- if .Values.tls.enabled }}
+      proxy_ssl_trusted_certificate /tls/{{ .Values.tls.caKey }};
+      proxy_ssl_verify on;
+      proxy_ssl_server_name on;
+      proxy_ssl_name {{ include "spruce.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local;
+      {{- end }}
+      map $arg_group $stream_key {
+        "" "$remote_addr:$remote_port:$connection";
+        default "$arg_topic:$arg_group";
+      }
+      upstream brokers {
+        zone brokers 64k;
+        least_conn;
+        {{- range $i := until (int .Values.replicaCount) }}
+        server {{ include "spruce.fullname" $ }}-{{ $i }}.{{ include "spruce.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local:{{ $.Values.service.port }} resolve;
+        {{- end }}
+        keepalive 64;
+      }
+      upstream streams {
+        zone streams 64k;
+        hash $stream_key consistent;
+        {{- range $i := until (int .Values.replicaCount) }}
+        server {{ include "spruce.fullname" $ }}-{{ $i }}.{{ include "spruce.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local:{{ $.Values.service.port }} resolve;
+        {{- end }}
+      }
+      server {
+        listen 8080;
+        client_max_body_size 17m;
+        location = /v1/subscriptions/stream {
+          proxy_pass {{ include "spruce.scheme" . }}://streams;
+          proxy_http_version 1.1;
+          proxy_set_header Connection "";
+          proxy_buffering off;
+          proxy_connect_timeout 250ms;
+          proxy_read_timeout 1h;
+        }
+        location / {
+          proxy_pass {{ include "spruce.scheme" . }}://brokers;
+          proxy_http_version 1.1;
+          proxy_set_header Connection "";
+          proxy_buffering off;
+          proxy_connect_timeout 250ms;
+          proxy_read_timeout 1h;
+          proxy_next_upstream error timeout http_502 http_503 http_504;
+          proxy_next_upstream_tries 3;
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "spruce.fullname" . }}-gateway
+  labels:
+    {{- include "spruce.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.gateway.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "spruce.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: gateway
+  template:
+    metadata:
+      labels:
+        {{- include "spruce.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: gateway
+      annotations:
+        checksum/config: {{ printf "%s:%d:%d:%d" (toJson .Values.gateway) (int .Values.replicaCount) (int .Values.service.port) .Release.Revision | sha256sum }}
+    spec:
+      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: nginx
+          image: "{{ .Values.gateway.image.repository }}:{{ .Values.gateway.image.tag }}"
+          imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
+          ports:
+            - {name: http, containerPort: 8080}
+          readinessProbe:
+            tcpSocket: {port: http}
+          livenessProbe:
+            tcpSocket: {port: http}
+          resources: {{ toYaml .Values.gateway.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 101
+            runAsGroup: 101
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: config, mountPath: /etc/nginx/nginx.conf, subPath: nginx.conf, readOnly: true}
+            - {name: cache, mountPath: /var/cache/nginx}
+            - {name: run, mountPath: /var/run}
+            {{- if .Values.tls.enabled }}
+            - {name: tls, mountPath: /tls, readOnly: true}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap: {name: {{ include "spruce.fullname" . }}-gateway}
+        - name: cache
+          emptyDir: {}
+        - name: run
+          emptyDir: {}
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ required "tls.existingSecret is required when TLS is enabled" .Values.tls.existingSecret }}
+        {{- end }}
+{{- end }}

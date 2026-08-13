@@ -13,7 +13,7 @@ product definition and architecture decisions.
 - `pkg/spruce`: first-party Go client.
 - `clients/csharp/Spruce`: first-party .NET client.
 - `cmd`: broker, examples, and benchmark tools.
-- `deploy/kubernetes`: production-oriented Kustomize resources.
+- `deploy/helm/spruce`: production Helm chart and deployment defaults.
 - `deploy/nginx.conf`: sticky topic/group stream routing for the local cluster.
 - `scripts`: smoke and local multi-broker validation.
 
@@ -39,7 +39,8 @@ make test
 make test-race
 make csharp
 make csharp-pack
-kubectl kustomize deploy/kubernetes >/dev/null
+helm lint deploy/helm/spruce
+helm template spruce deploy/helm/spruce >/dev/null
 docker compose config --quiet
 ```
 

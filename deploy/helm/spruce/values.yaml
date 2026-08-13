@@ -1,0 +1,95 @@
+replicaCount: 3
+
+image:
+  repository: ghcr.io/lajosnagyuk/spruce
+  tag: v0.1.0
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+gateway:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: nginx
+    tag: 1.29-alpine
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 8080
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      memory: 64Mi
+
+service:
+  port: 8080
+
+auth:
+  existingSecret: ""
+  peerToken: ""
+  clusterID: ""
+  clientToken: ""
+  adminToken: ""
+
+tls:
+  enabled: false
+  existingSecret: ""
+  caKey: ca.crt
+
+config:
+  cacheBytes: "67108864"
+  maxMessageBytes: "1048576"
+  queueDepth: "4096"
+  defaultTTL: 1m
+  maxTTL: 24h
+  ackDeadline: 15s
+  replicationQueueBytes: "16777216"
+  actionQueueBytes: "4194304"
+  maxInflightBytes: "33554432"
+  maxSubscriberInflightBytes: "8388608"
+  maxAttempts: "5"
+  idempotencyEntries: "65536"
+  maxConcurrentRequests: "1024"
+  maxStreams: "4096"
+  maxInternalRequests: "256"
+
+podAnnotations: {}
+podLabels: {}
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 96Mi
+  limits:
+    memory: 256Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: true
+terminationGracePeriodSeconds: 15
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+networkPolicy:
+  enabled: true
+
+serviceMonitor:
+  enabled: false
+  interval: 15s

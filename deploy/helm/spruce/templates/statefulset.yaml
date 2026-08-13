@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "spruce.fullname" . }}
+  labels:
+    {{- include "spruce.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "spruce.fullname" . }}-headless
+  replicas: {{ .Values.replicaCount }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "spruce.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: broker
+  template:
+    metadata:
+      labels:
+        {{- include "spruce.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: broker
+        {{- with .Values.podLabels }}{{ toYaml . | nindent 8 }}{{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations: {{ toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext: {{ toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "spruce.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: broker
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: spruce
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext: {{ toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: broker
+              containerPort: {{ .Values.service.port }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SPRUCE_SELF_URL
+              value: {{ include "spruce.scheme" . }}://$(POD_NAME).{{ include "spruce.fullname" . }}-headless:{{ .Values.service.port }}
+            - name: SPRUCE_PEERS
+              value: {{ range $i := until (int .Values.replicaCount) }}{{ if $i }},{{ end }}{{ include "spruce.scheme" $ }}://{{ include "spruce.fullname" $ }}-{{ $i }}.{{ include "spruce.fullname" $ }}-headless:{{ $.Values.service.port }}{{- end }}
+            - name: SPRUCE_PEER_TOKEN
+              valueFrom:
+                secretKeyRef: {name: {{ include "spruce.secretName" . }}, key: peer-token}
+            - name: SPRUCE_CLUSTER_ID
+              valueFrom:
+                secretKeyRef: {name: {{ include "spruce.secretName" . }}, key: cluster-id}
+            - name: SPRUCE_CLIENT_TOKEN
+              valueFrom:
+                secretKeyRef: {name: {{ include "spruce.secretName" . }}, key: client-token, optional: true}
+            - name: SPRUCE_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef: {name: {{ include "spruce.secretName" . }}, key: admin-token, optional: true}
+            {{- if .Values.tls.enabled }}
+            - {name: SPRUCE_TLS_CERT_FILE, value: /tls/tls.crt}
+            - {name: SPRUCE_TLS_KEY_FILE, value: /tls/tls.key}
+            - {name: SPRUCE_PEER_CA_FILE, value: /tls/{{ .Values.tls.caKey }}}
+            {{- end }}
+            - {name: SPRUCE_CACHE_BYTES, value: {{ .Values.config.cacheBytes | quote }}}
+            - {name: SPRUCE_MAX_MESSAGE_BYTES, value: {{ .Values.config.maxMessageBytes | quote }}}
+            - {name: SPRUCE_QUEUE_DEPTH, value: {{ .Values.config.queueDepth | quote }}}
+            - {name: SPRUCE_DEFAULT_TTL, value: {{ .Values.config.defaultTTL | quote }}}
+            - {name: SPRUCE_MAX_TTL, value: {{ .Values.config.maxTTL | quote }}}
+            - {name: SPRUCE_ACK_DEADLINE, value: {{ .Values.config.ackDeadline | quote }}}
+            - {name: SPRUCE_REPLICATION_QUEUE_BYTES, value: {{ .Values.config.replicationQueueBytes | quote }}}
+            - {name: SPRUCE_ACTION_QUEUE_BYTES, value: {{ .Values.config.actionQueueBytes | quote }}}
+            - {name: SPRUCE_MAX_INFLIGHT_BYTES, value: {{ .Values.config.maxInflightBytes | quote }}}
+            - {name: SPRUCE_MAX_SUBSCRIBER_INFLIGHT_BYTES, value: {{ .Values.config.maxSubscriberInflightBytes | quote }}}
+            - {name: SPRUCE_MAX_ATTEMPTS, value: {{ .Values.config.maxAttempts | quote }}}
+            - {name: SPRUCE_IDEMPOTENCY_ENTRIES, value: {{ .Values.config.idempotencyEntries | quote }}}
+            - {name: SPRUCE_MAX_CONCURRENT_REQUESTS, value: {{ .Values.config.maxConcurrentRequests | quote }}}
+            - {name: SPRUCE_MAX_STREAMS, value: {{ .Values.config.maxStreams | quote }}}
+            - {name: SPRUCE_MAX_INTERNAL_REQUESTS, value: {{ .Values.config.maxInternalRequests | quote }}}
+          readinessProbe:
+            httpGet: {path: /health/ready, port: broker, scheme: {{ ternary "HTTPS" "HTTP" .Values.tls.enabled }}}
+            periodSeconds: 2
+            timeoutSeconds: 1
+          livenessProbe:
+            httpGet: {path: /health/live, port: broker, scheme: {{ ternary "HTTPS" "HTTP" .Values.tls.enabled }}}
+            periodSeconds: 10
+            timeoutSeconds: 1
+          resources: {{ toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.tls.enabled }}
+          volumeMounts:
+            - {name: tls, mountPath: /tls, readOnly: true}
+          {{- end }}
+      {{- if .Values.tls.enabled }}
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ required "tls.existingSecret is required when TLS is enabled" .Values.tls.existingSecret }}
+      {{- end }}

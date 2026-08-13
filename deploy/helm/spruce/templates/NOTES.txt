@@ -1,0 +1,5 @@
+Spruce is available inside the cluster at:
+  http://{{ include "spruce.fullname" . }}.{{ .Release.Namespace }}.svc:{{ ternary .Values.gateway.service.port .Values.service.port .Values.gateway.enabled }}
+
+For local access:
+  kubectl -n {{ .Release.Namespace }} port-forward service/{{ include "spruce.fullname" . }} 8080:{{ ternary .Values.gateway.service.port .Values.service.port .Values.gateway.enabled }}

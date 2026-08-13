@@ -56,22 +56,19 @@ The stream uses length-delimited binary frames. ACK and NACK endpoints accept ba
 
 ## Kubernetes
 
-The manifests under `deploy/kubernetes` deploy three interchangeable replicas behind Services. Every replica can publish, stream, replay, ACK, and NACK; there is no leader or quorum.
+The Helm chart deploys one to many interchangeable brokers plus a tiny stateless gateway. Every broker can publish, stream, replay, ACK, and NACK; there is no leader or quorum. The gateway consistently hashes streaming consumers by topic and group so all members of a consumer group reach the same broker, while publishes remain load-balanced.
 
 Create runtime credentials outside source control:
 
 ```sh
-kubectl create namespace spruce
-kubectl -n spruce create secret generic spruce-auth \
-  --from-literal=peer-token="$(openssl rand -hex 32)" \
-  --from-literal=cluster-id=production
-kubectl -n spruce create secret tls spruce-tls \
-  --cert=server.crt \
-  --key=server.key
-kubectl apply -k deploy/kubernetes
+helm upgrade --install spruce deploy/helm/spruce \
+  --namespace spruce \
+  --create-namespace \
+  --set image.tag=v0.1.0 \
+  --set replicaCount=3
 ```
 
-The supplied certificate must cover the Service DNS names used by clients and peers. Pin the container image tag in `deploy/kubernetes/kustomization.yaml` before production rollout; do not deploy mutable tags.
+The chart creates and preserves a random peer credential when `auth.existingSecret` is unset. For production, use an externally managed Secret and terminate client TLS at an Ingress or service mesh. Internal TLS can be enabled with `tls.enabled=true` and `tls.existingSecret`; its certificate must cover every StatefulSet pod and the headless-Service DNS name. The gateway and peers verify it using the supplied CA. Pin immutable image tags in production.
 
 Recommended starting resources per replica:
 
@@ -101,8 +98,8 @@ Both libraries use the public HTTPS API. They are conveniences, not protocol req
 
 ## Operations
 
-- `GET /healthz` reports process health.
-- `GET /readyz` reports readiness.
+- `GET /health/live` reports process health.
+- `GET /health/ready` reports readiness.
 - `GET /metrics` exposes Prometheus counters and gauges.
 - Graceful shutdown stops admission, drains bounded work, and then exits.
 - Cache pressure, expired messages, dropped replication, pending bytes, retries, and action-queue saturation are observable separately.
@@ -115,8 +112,9 @@ Run at least two replicas for availability and three for routine rolling mainten
 make build
 make test
 make test-race
-make test-csharp
+make csharp
 make image
+make helm-lint
 ```
 
 Performance results and methodology are documented in [docs/PERFORMANCE.md](docs/PERFORMANCE.md). CI runs correctness, race, C# conformance, build, and Kubernetes render checks.
@@ -129,7 +127,7 @@ Performance results and methodology are documented in [docs/PERFORMANCE.md](docs
 - `internal/broker`: cache, routing, replay, replication, and metrics.
 - `pkg/spruce`: Go client.
 - `clients/csharp`: C# client and conformance tests.
-- `deploy`: container-edge and Kubernetes configuration.
+- `deploy/helm/spruce`: Kubernetes Helm chart.
 
 ## License
 

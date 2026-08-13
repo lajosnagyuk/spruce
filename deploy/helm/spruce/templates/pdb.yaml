@@ -1,0 +1,14 @@
+{{- if and .Values.podDisruptionBudget.enabled (gt (int .Values.replicaCount) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "spruce.fullname" . }}
+  labels:
+    {{- include "spruce.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "spruce.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: broker
+{{- end }}

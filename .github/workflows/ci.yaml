@@ -34,5 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/setup-kubectl@v4
-      - run: kubectl kustomize deploy/kubernetes >/dev/null
+      - uses: azure/setup-helm@v4
+      - run: helm lint deploy/helm/spruce
+      - run: helm template spruce deploy/helm/spruce --set replicaCount=1 >/dev/null
+      - run: helm template spruce deploy/helm/spruce --set replicaCount=3 --set tls.enabled=true --set tls.existingSecret=spruce-tls >/dev/null

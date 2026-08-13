@@ -87,3 +87,40 @@ throughput gate, because developer hardware and concurrent workloads vary.
 - Run correctness and race tests before comparative benchmarks.
 - Do not compare amortized batch latency with end-to-end latency for an individual
   unbatched message.
+
+## K3s topology baseline
+
+Measured on the local `spruce-dev` K3s cluster on 2026-08-13. Each Debian 13 VM had
+2 vCPU and 4 GiB RAM. Traffic crossed a local `kubectl port-forward`, two Nginx
+gateways, and 1-3 Spruce brokers. Payloads were 256 bytes with 16 publishers.
+
+| Brokers | Single msg/s | Batch msg/s | Batch size |
+|---:|---:|---:|---:|
+| 1 | 1,535 | 108,698 | 256 |
+| 2 | 1,572 | 138,553 | 256 |
+| 3 | 1,569 | 128,643 | 256 |
+
+Each batch run published 100,000 messages after a 3,000-message single-request run.
+Every broker converged at 103,000 messages and 39,864,000 accounted cache bytes. The
+three-broker run reported zero replication errors, zero replication drops, and an empty
+replication queue after convergence.
+
+At that cache occupancy, broker RSS was 79-88 MiB and each gateway used 3 MiB. These
+are regression baselines, not portable capacity claims; port forwarding and VM network
+placement materially affect latency.
+
+The mixed correctness matrix also passed without missing or duplicate delivery:
+
+| Brokers | Topics | Messages | Producers | Broadcast/topic | Group members/topic |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 1 | 500 | 1 | 1 | 1 |
+| 2 | 3 | 1,500 | 4 | 2 | 3 |
+| 3 | 6 | 3,000 | 10 | 3 | 5 |
+
+Reproduce a scenario after port-forwarding the Helm Service:
+
+```sh
+./bin/spruce-integration -server http://127.0.0.1:8080 \
+  -topics 6 -messages 500 -producers 10 \
+  -broadcast-consumers 3 -group-consumers 5
+```
