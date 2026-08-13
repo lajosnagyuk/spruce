@@ -57,7 +57,7 @@ jobs:
           image: ghcr.io/${{ github.repository }}@${{ steps.digest.outputs.digest }}
           format: spdx-json
           output-file: spruce.spdx.json
-      - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - run: cosign sign --yes ghcr.io/${{ github.repository }}@${{ steps.digest.outputs.digest }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
