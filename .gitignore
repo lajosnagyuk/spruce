@@ -2,6 +2,11 @@
 /.cache/
 clients/csharp/*/bin/
 clients/csharp/*/obj/
+clients/python/build/
+clients/python/src/*.egg-info/
+clients/python/dist/
+__pycache__/
+*.pyc
 .env
 .env.*
 !.env.example

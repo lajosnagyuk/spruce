@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spruce-client"
+dynamic = ["version"]
+description = "Fast, bounded Python client for the Spruce event bus"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "Spruce contributors"}]
+classifiers = ["Programming Language :: Python :: 3", "Typing :: Typed"]
+
+[project.urls]
+Repository = "https://github.com/lajosnagyuk/spruce"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "spruce.__version__"}
+
+[tool.setuptools.package-data]
+spruce = ["py.typed"]

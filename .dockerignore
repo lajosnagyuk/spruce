@@ -1,5 +1,10 @@
 .git
 bin
-clients
+clients/csharp
+**/__pycache__
+**/*.pyc
+clients/python/build
+clients/python/dist
+clients/python/**/*.egg-info
 ARCHITECTURE.md
 README.md

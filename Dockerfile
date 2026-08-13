@@ -14,6 +14,17 @@ COPY --from=build /out/spruce-integration /spruce-integration
 COPY --from=build /out/spruce-bench /spruce-bench
 USER 65532:65532
 
+FROM python:3.14-alpine@sha256:05b2b8b732ecd268fee8727a369f936f022d1321b59befd13c30ede22769dcdc AS python-probe
+WORKDIR /app
+COPY clients/python /src
+RUN pip install --no-cache-dir /src && \
+    pip uninstall -y msgpack setuptools && \
+    python -m pip uninstall -y pip && \
+    find /src -type d -name '*.egg-info' -exec rm -rf {} +
+COPY clients/python/tests/cluster_probe.py /app/cluster_probe.py
+USER 65532:65532
+ENTRYPOINT ["python", "/app/cluster_probe.py"]
+
 FROM scratch AS broker
 COPY --from=build /out/spruce /spruce
 USER 65532:65532

@@ -105,3 +105,16 @@ a special leader.
 **Consequence:** Bootstrap is anti-entropy, not durability. A simultaneous cluster loss,
 TTL expiry, eviction, or a full rolling replacement under traffic can still lose
 messages. Operators that require zero-loss maintenance must pause publishers.
+
+## ADR-010: First-party clients remain protocol conveniences
+
+**Decision:** Go, C#, and dependency-free Python clients expose the same publish,
+bounded batching, streaming consumption, ACK/NACK, retry, explicit completion,
+deduplication, diagnostics, authentication, and telemetry contracts over HTTPS.
+
+**Why:** Service glue should be equally straightforward in compiled services, .NET
+estates, automation, data tooling, and short-lived Kubernetes jobs without introducing a
+mandatory proprietary transport.
+
+**Consequence:** The HTTP and binary stream protocol remains the compatibility boundary.
+Each client has independent conformance tests and can be replaced by ordinary HTTPS code.

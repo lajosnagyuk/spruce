@@ -12,6 +12,7 @@ product definition and architecture decisions.
 - `internal/broker`: cache, replication, subscriptions, delivery, HTTP API, and metrics.
 - `pkg/spruce`: first-party Go client.
 - `clients/csharp/Spruce`: first-party .NET client.
+- `clients/python`: typed Python client, packaging, conformance, and cluster probe.
 - `cmd`: broker, examples, and benchmark tools.
 - `deploy/helm/spruce`: production Helm chart and deployment defaults.
 - `deploy/nginx.conf`: sticky topic/group stream routing for the local cluster.
@@ -43,6 +44,7 @@ make test
 make test-race
 make csharp
 make csharp-pack
+make python
 make helm-lint
 make helm-render >/dev/null
 docker compose config --quiet

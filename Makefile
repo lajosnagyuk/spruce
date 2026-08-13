@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := build
-.PHONY: build test test-race benchmark csharp csharp-pack image image-tools compose-up compose-down smoke validate-local helm-lint helm-render helm-install clean
+.PHONY: build test test-race benchmark csharp csharp-pack python python-pack image image-tools image-python-probe compose-up compose-down smoke validate-local helm-lint helm-render helm-install clean
 
 BIN := bin
 GOCACHE ?= $(CURDIR)/.cache/go-build
@@ -34,11 +34,20 @@ csharp:
 csharp-pack:
 	dotnet pack clients/csharp/Spruce/Spruce.csproj -c Release -o $(BIN)
 
+python:
+	PYTHONPATH=clients/python/src python3 -m unittest discover -s clients/python/tests -p 'test_*.py' -v
+
+python-pack:
+	python3 -m build --outdir $(BIN) clients/python
+
 image:
 	docker build -t spruce:dev .
 
 image-tools:
 	docker build --target tools -t spruce:tools .
+
+image-python-probe:
+	docker build --target python-probe -t spruce:python-probe .
 
 compose-up:
 	docker compose up -d --build
@@ -49,7 +58,7 @@ compose-down:
 smoke:
 	sh scripts/smoke.sh
 
-validate-local: build csharp
+validate-local: build csharp python
 	sh scripts/validate-local.sh
 
 helm-lint:
@@ -62,4 +71,4 @@ helm-install:
 	helm upgrade --install spruce deploy/helm/spruce --namespace spruce --create-namespace --set image.repository=spruce --set image.tag=dev --set image.pullPolicy=Never --set tls.allowInsecureTransport=true --set gateway.allowInsecureClientTransport=true
 
 clean:
-	rm -rf $(BIN) .cache clients/csharp/*/bin clients/csharp/*/obj
+	rm -rf $(BIN) .cache clients/csharp/*/bin clients/csharp/*/obj clients/python/build clients/python/src/*.egg-info

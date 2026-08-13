@@ -155,7 +155,17 @@ go get github.com/lajosnagyuk/spruce/pkg/spruce
 
 C# source and packaging live under `clients/csharp`. The library exposes publish, batch publish, subscribe, ACK/NACK, retry, bounded handler concurrency, and deduplication primitives.
 
-Both libraries use the public HTTPS API. They are conveniences, not protocol requirements.
+Python:
+
+```sh
+pip install spruce-client
+```
+
+The dependency-free Python 3.11+ package provides the same publish, automatic batching,
+streaming consumption, explicit completion, retry, deduplication, diagnostics, and
+credential-safety contracts as Go and C#.
+
+All libraries use the public HTTPS API. They are conveniences, not protocol requirements.
 
 ## Operations
 
@@ -180,6 +190,7 @@ make build
 make test
 make test-race
 make csharp
+make python
 make image
 make helm-lint
 ```

@@ -1,5 +1,8 @@
 version: 2
 updates:
+  - package-ecosystem: pip
+    directory: /clients/python
+    schedule: {interval: weekly}
   - package-ecosystem: nuget
     directory: /clients/csharp
     schedule: {interval: weekly}
