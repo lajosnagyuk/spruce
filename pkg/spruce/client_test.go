@@ -1,0 +1,262 @@
+package spruce
+
+import (
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestNackAdvancesOrderedCursor(t *testing.T) {
+	var acks, nacks atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/deliveries/ack":
+			acks.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		case "/v1/deliveries/nack":
+			nacks.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		for i := 1; i <= 2; i++ {
+			metadata, _ := json.Marshal(Delivery{DeliveryID: string(rune('a' + i)), MessageID: "m", Topic: "t", CreatedAt: int64(i)})
+			var sizes [8]byte
+			binary.BigEndian.PutUint32(sizes[:4], uint32(len(metadata)))
+			_, _ = w.Write(sizes[:])
+			_, _ = w.Write(metadata)
+		}
+	}))
+	defer server.Close()
+	var handled atomic.Int32
+	last, err := New(server.URL).subscribeOnce(context.Background(), SubscribeOptions{Topic: "t"}, func(context.Context, Delivery) error {
+		if handled.Add(1) == 1 {
+			return context.Canceled
+		}
+		return nil
+	})
+	if err == nil || last != 2 || acks.Load() != 1 || nacks.Load() != 1 {
+		t.Fatalf("last=%d acks=%d nacks=%d err=%v", last, acks.Load(), nacks.Load(), err)
+	}
+}
+
+func TestDeduperStaleOrderEntryDoesNotDeleteRefresh(t *testing.T) {
+	d := NewDeduper(2, time.Millisecond)
+	if d.Seen("a") {
+		t.Fatal("new ID reported seen")
+	}
+	time.Sleep(2 * time.Millisecond)
+	if d.Seen("a") {
+		t.Fatal("expired ID reported seen")
+	}
+	if d.Seen("b") {
+		t.Fatal("new ID reported seen")
+	}
+	if !d.Seen("a") {
+		t.Fatal("stale order entry deleted refreshed ID")
+	}
+}
+
+func TestHandlerDrainTimeoutIsTerminal(t *testing.T) {
+	var streams atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		streams.Add(1)
+		metadata, _ := json.Marshal(Delivery{DeliveryID: "d", MessageID: "m", Topic: "t", CreatedAt: 1})
+		var sizes [8]byte
+		binary.BigEndian.PutUint32(sizes[:4], uint32(len(metadata)))
+		_, _ = w.Write(sizes[:])
+		_, _ = w.Write(metadata)
+	}))
+	defer server.Close()
+	block := make(chan struct{})
+	err := New(server.URL).Subscribe(context.Background(), SubscribeOptions{Topic: "t", DrainTimeout: 10 * time.Millisecond}, func(context.Context, Delivery) error { <-block; return nil })
+	close(block)
+	if !errors.Is(err, ErrHandlerDrainTimeout) || streams.Load() != 1 {
+		t.Fatalf("err=%v streams=%d", err, streams.Load())
+	}
+}
+
+func TestHandlerDrainTimeoutAfterTruncatedFrameIsTerminal(t *testing.T) {
+	var streams atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		streams.Add(1)
+		metadata, _ := json.Marshal(Delivery{DeliveryID: "d", MessageID: "m", Topic: "t", CreatedAt: 1})
+		var sizes [8]byte
+		binary.BigEndian.PutUint32(sizes[:4], uint32(len(metadata)))
+		_, _ = w.Write(sizes[:])
+		_, _ = w.Write(metadata)
+		_, _ = w.Write([]byte{1})
+	}))
+	defer server.Close()
+	block := make(chan struct{})
+	err := New(server.URL).Subscribe(context.Background(), SubscribeOptions{Topic: "t", DrainTimeout: 10 * time.Millisecond}, func(context.Context, Delivery) error { <-block; return nil })
+	close(block)
+	if !errors.Is(err, ErrHandlerDrainTimeout) || streams.Load() != 1 {
+		t.Fatalf("err=%v streams=%d", err, streams.Load())
+	}
+}
+
+func TestDefaultSubscribeBatchesAcks(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/deliveries/ack" {
+			calls.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "application/vnd.spruce.stream")
+		for i := 0; i < 32; i++ {
+			metadata, _ := json.Marshal(Delivery{DeliveryID: string(rune('a' + i)), MessageID: "m", Topic: "t", CreatedAt: int64(i + 1)})
+			var sizes [8]byte
+			binary.BigEndian.PutUint32(sizes[:4], uint32(len(metadata)))
+			_, _ = w.Write(sizes[:])
+			_, _ = w.Write(metadata)
+		}
+	}))
+	defer server.Close()
+	c := New(server.URL)
+	last, err := c.subscribeOnce(context.Background(), SubscribeOptions{Topic: "t"}, func(context.Context, Delivery) error { return nil })
+	if err == nil {
+		t.Fatal("expected stream EOF")
+	}
+	if last != 32 {
+		t.Fatalf("cursor=%d", last)
+	}
+	if calls.Load() >= 32 {
+		t.Fatalf("default subscription did not batch acknowledgements: %d requests", calls.Load())
+	}
+}
+
+func TestAckBatcherCoalescesConcurrentAcks(t *testing.T) {
+	var calls atomic.Int32
+	var received atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		var body struct {
+			IDs []string `json:"delivery_ids"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		received.Add(int32(len(body.IDs)))
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	b := newAckBatcher(ctx, New(server.URL), "ack")
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			if err := b.submit(ctx, id); err != nil {
+				t.Error(err)
+			}
+		}(string(rune('a' + i)))
+	}
+	wg.Wait()
+	cancel()
+	if received.Load() != 32 {
+		t.Fatalf("received %d acknowledgements", received.Load())
+	}
+	if calls.Load() >= 32 {
+		t.Fatalf("acknowledgements were not batched: %d requests", calls.Load())
+	}
+}
+
+func TestBasicAuthStructuredErrorAndDiagnostics(t *testing.T) {
+	var basicOK bool
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		username, password, ok := r.BasicAuth()
+		basicOK = ok && username == "u" && password == "p"
+		if r.URL.Path == "/v1/status" {
+			_ = json.NewEncoder(w).Encode(Status{Messages: 2, Peers: 1})
+			return
+		}
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"idempotency_conflict"}`))
+	}))
+	defer server.Close()
+	c := New(server.URL)
+	c.HTTP = server.Client()
+	c.Username, c.Password = "u", "p"
+	status, err := c.Status(context.Background())
+	if err != nil || status.Messages != 2 || !basicOK {
+		t.Fatalf("status=%+v basic=%v err=%v", status, basicOK, err)
+	}
+	_, err = c.Publish(context.Background(), "t", []byte("x"), PublishOptions{})
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code != "idempotency_conflict" {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestPublishRetryRequiresIdempotency(t *testing.T) {
+	_, err := New("http://unused").PublishRetry(context.Background(), "t", nil, PublishOptions{}, RetryOptions{})
+	if err == nil {
+		t.Fatal("retry accepted unsafe publish")
+	}
+}
+
+func TestPublishRetryAndTelemetry(t *testing.T) {
+	var calls, events atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":"peer_ack_unavailable"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"id","replicated":true}`))
+	}))
+	defer server.Close()
+	c := New(server.URL)
+	c.OnEvent = func(ClientEvent) { events.Add(1) }
+	result, err := c.PublishRetry(context.Background(), "t", []byte("x"), PublishOptions{ProducerID: "p", IdempotencyKey: "1"}, RetryOptions{MaxAttempts: 2, MinBackoff: time.Millisecond})
+	if err != nil || result.ID != "id" || calls.Load() != 2 || events.Load() != 2 {
+		t.Fatalf("result=%+v calls=%d events=%d err=%v", result, calls.Load(), events.Load(), err)
+	}
+}
+
+func TestConsumableDeliveryControlsAcknowledgement(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var acked atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/deliveries/ack" {
+			acked.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+			cancel()
+			return
+		}
+		metadata, _ := json.Marshal(Delivery{DeliveryID: "d", MessageID: "m", Topic: "t", CreatedAt: 1})
+		var sizes [8]byte
+		binary.BigEndian.PutUint32(sizes[:4], uint32(len(metadata)))
+		_, _ = w.Write(sizes[:])
+		_, _ = w.Write(metadata)
+	}))
+	defer server.Close()
+	deliveries, _ := New(server.URL).Deliveries(ctx, SubscribeOptions{Topic: "t"})
+	item := <-deliveries
+	if acked.Load() != 0 {
+		t.Fatal("delivery acknowledged before completion")
+	}
+	item.Complete(nil)
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("acknowledgement was not sent")
+	}
+	if acked.Load() != 1 {
+		t.Fatalf("acks=%d", acked.Load())
+	}
+}

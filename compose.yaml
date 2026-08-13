@@ -1,0 +1,35 @@
+name: spruce
+services:
+  broker1:
+    build: .
+    environment: &broker-env
+      SPRUCE_CACHE_BYTES: "67108864"
+      SPRUCE_DEFAULT_TTL: 60s
+      SPRUCE_ACK_DEADLINE: 5s
+      SPRUCE_PEER_TOKEN: ${SPRUCE_PEER_TOKEN:?set SPRUCE_PEER_TOKEN}
+      SPRUCE_CLUSTER_ID: ${SPRUCE_CLUSTER_ID:?set SPRUCE_CLUSTER_ID}
+    command: []
+    mem_limit: 512m
+    restart: unless-stopped
+    networks: [spruce]
+  broker2:
+    build: .
+    environment: *broker-env
+    mem_limit: 512m
+    restart: unless-stopped
+    networks: [spruce]
+  broker3:
+    build: .
+    environment: *broker-env
+    mem_limit: 512m
+    restart: unless-stopped
+    networks: [spruce]
+  proxy:
+    image: nginx:1.29-alpine
+    ports: ["8080:8080"]
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on: [broker1, broker2, broker3]
+    networks: [spruce]
+networks:
+  spruce: {}

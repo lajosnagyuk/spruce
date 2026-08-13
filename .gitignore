@@ -1,0 +1,16 @@
+/bin/
+/.cache/
+clients/csharp/*/bin/
+clients/csharp/*/obj/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.pfx
+*.p12
+*.nupkg
+.idea/
+.vscode/
+.DS_Store

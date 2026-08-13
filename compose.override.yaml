@@ -1,0 +1,10 @@
+services:
+  broker1:
+    environment:
+      SPRUCE_PEERS: http://broker2:8080,http://broker3:8080
+  broker2:
+    environment:
+      SPRUCE_PEERS: http://broker1:8080,http://broker3:8080
+  broker3:
+    environment:
+      SPRUCE_PEERS: http://broker1:8080,http://broker2:8080
