@@ -359,6 +359,7 @@ func (c *cache) snapshot(topic string, since int64) []*Message {
 			out = append(out, m)
 		}
 	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt < out[j].CreatedAt })
 	return out
 }
 

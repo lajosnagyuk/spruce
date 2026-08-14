@@ -100,7 +100,7 @@ public sealed partial class SpruceClient : IDisposable
         return (await response.Content.ReadFromJsonAsync<BatchResult>(timeout.Token))!;
     }
 
-    public async Task SubscribeAsync(string topic, string? group, Func<Delivery, CancellationToken, Task> handler, CancellationToken cancellationToken = default, int concurrency = 16, int maxPayloadBytes = 1024 * 1024, long since = 0, TimeSpan? drainTimeout = null)
+    public async Task SubscribeAsync(string topic, string? group, Func<Delivery, CancellationToken, Task> handler, CancellationToken cancellationToken = default, int concurrency = 16, int maxPayloadBytes = 1024 * 1024, long since = 0, TimeSpan? drainTimeout = null, bool preserveKeyOrder = false)
     {
         if (string.IsNullOrWhiteSpace(topic)) throw new ArgumentException("Topic is required", nameof(topic));
         if (concurrency <= 0) concurrency = 16;
@@ -124,16 +124,18 @@ public sealed partial class SpruceClient : IDisposable
                 using var connection = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 await using var acks = new AckBatcher(this, "ack", connection.Token);
                 await using var nacks = new AckBatcher(this, "nack", connection.Token);
-                var deliveries = Channel.CreateBounded<(Delivery Delivery, long Index)>(new BoundedChannelOptions(concurrency * 2) { FullMode = BoundedChannelFullMode.Wait, SingleWriter = true });
+                var deliveryLanes = preserveKeyOrder
+                    ? Enumerable.Range(0, concurrency).Select(_ => Channel.CreateBounded<(Delivery Delivery, long Index)>(new BoundedChannelOptions(2) { FullMode = BoundedChannelFullMode.Wait, SingleWriter = true })).ToArray()
+                    : [Channel.CreateBounded<(Delivery Delivery, long Index)>(new BoundedChannelOptions(concurrency * 2) { FullMode = BoundedChannelFullMode.Wait, SingleWriter = true })];
                 var progressLock = new object();
                 var completed = new SortedDictionary<long, long>();
                 long sequence = 0, nextProgress = 1;
                 var connectedSince = since;
-                async Task ConsumeAsync()
+                async Task ConsumeAsync(ChannelReader<(Delivery Delivery, long Index)> reader)
                 {
                     try
                     {
-                        await foreach (var work in deliveries.Reader.ReadAllAsync(connection.Token))
+                        await foreach (var work in reader.ReadAllAsync(connection.Token))
                         {
                             try { await handler(work.Delivery, connection.Token); }
                             catch when (!connection.IsCancellationRequested)
@@ -164,7 +166,9 @@ public sealed partial class SpruceClient : IDisposable
                         }
                     }
                 }
-                var workers = Enumerable.Range(0, concurrency).Select(_ => ConsumeAsync()).ToArray();
+                var workers = preserveKeyOrder
+                    ? deliveryLanes.Select(lane => ConsumeAsync(lane.Reader)).ToArray()
+                    : Enumerable.Range(0, concurrency).Select(_ => ConsumeAsync(deliveryLanes[0].Reader)).ToArray();
                 var sizes = new byte[8];
                 var gracefulEnd = false;
                 try
@@ -181,7 +185,8 @@ public sealed partial class SpruceClient : IDisposable
                         if (string.IsNullOrEmpty(delivery.DeliveryId)) continue;
                         delivery = delivery with { Payload = payload };
                         var index = Interlocked.Increment(ref sequence);
-                        await deliveries.Writer.WriteAsync((delivery, index), connection.Token);
+                        var lane = preserveKeyOrder ? StableLane(delivery.Key ?? delivery.MessageId, deliveryLanes.Length) : 0;
+                        await deliveryLanes[lane].Writer.WriteAsync((delivery, index), connection.Token);
                     }
                 }
                 catch (EndOfStreamException)
@@ -190,7 +195,7 @@ public sealed partial class SpruceClient : IDisposable
                 }
                 finally
                 {
-                    deliveries.Writer.TryComplete();
+                    foreach (var lane in deliveryLanes) lane.Writer.TryComplete();
                     if (!gracefulEnd) connection.Cancel();
                     var joined = Task.WhenAll(workers);
                     if (!joined.IsCompleted)
@@ -237,6 +242,13 @@ public sealed partial class SpruceClient : IDisposable
                 backoff = TimeSpan.FromMilliseconds(Math.Min(2000, backoff.TotalMilliseconds * 2));
             }
         }
+    }
+
+    private static int StableLane(string key, int laneCount)
+    {
+        uint hash = 2166136261;
+        foreach (var value in System.Text.Encoding.UTF8.GetBytes(key)) hash = (hash ^ value) * 16777619;
+        return (int)(hash % (uint)laneCount);
     }
 
     private async Task AckAsync(string action, IReadOnlyList<string> ids, CancellationToken cancellationToken)

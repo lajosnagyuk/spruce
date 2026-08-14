@@ -30,6 +30,22 @@ func TestCacheEvictsOldestWithinBound(t *testing.T) {
 		t.Fatal("expected eviction")
 	}
 }
+
+func TestCacheSnapshotOrdersReplayByAcceptanceTime(t *testing.T) {
+	now := time.Now()
+	c := newCache(1 << 20)
+	messages := []*Message{
+		{ID: "later", Topic: "ordered", Key: "key", Payload: []byte("2"), CreatedAt: now.Add(time.Second).UnixMilli(), ExpiresAt: now.Add(time.Minute).UnixMilli()},
+		{ID: "earlier", Topic: "ordered", Key: "key", Payload: []byte("1"), CreatedAt: now.UnixMilli(), ExpiresAt: now.Add(time.Minute).UnixMilli()},
+	}
+	if _, err := c.putBatch(messages, now.UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	replay := c.snapshot("ordered", 1)
+	if len(replay) != 2 || replay[0].ID != "earlier" || replay[1].ID != "later" {
+		t.Fatalf("unexpected replay order: %v", []string{replay[0].ID, replay[1].ID})
+	}
+}
 func TestPublishAndMetrics(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.CacheBytes = 1 << 20

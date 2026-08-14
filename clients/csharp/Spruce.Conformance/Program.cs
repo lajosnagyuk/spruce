@@ -14,6 +14,7 @@ await Run("basic auth and structured error", BasicAuthAndStructuredError, failur
 await Run("deduper", DeduperBehavior, failures);
 await Run("retry diagnostics and telemetry", RetryDiagnosticsTelemetry, failures);
 await Run("explicit stream completion", ExplicitStreamCompletion, failures);
+await Run("key ordered subscription", KeyOrderedSubscription, failures);
 if (failures.Count > 0) throw new Exception(string.Join(Environment.NewLine, failures));
 Console.WriteLine("C# conformance passed");
 
@@ -165,6 +166,46 @@ static async Task ExplicitStreamCompletion()
     }
     catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
     Assert(acks == 1, $"expected one ACK, got {acks}");
+}
+
+static async Task KeyOrderedSubscription()
+{
+    using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+    var completed = new List<byte>();
+    var stream = Frames(("d1", "m1", "same", (byte)1), ("d2", "m2", "same", (byte)2));
+    var client = new SpruceClient("https://spruce.invalid", new HttpClient(new StubHandler(request =>
+    {
+        if (request.RequestUri!.AbsolutePath.StartsWith("/v1/deliveries/")) return new(HttpStatusCode.NoContent);
+        return new(HttpStatusCode.OK) { Content = new StreamContent(stream) };
+    })));
+    try
+    {
+        await client.SubscribeAsync(new SubscribeOptions("t", Concurrency: 2, PreserveKeyOrder: true), async (delivery, _) =>
+        {
+            if (delivery.Payload[0] == 1) await Task.Delay(50);
+            lock (completed) completed.Add(delivery.Payload[0]);
+            if (completed.Count == 2) cancellation.Cancel();
+        }, cancellation.Token);
+    }
+    catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+    Assert(completed.SequenceEqual(new byte[] { 1, 2 }), $"same-key deliveries completed out of order: {string.Join(',', completed)}");
+}
+
+static Stream Frames(params (string Delivery, string Message, string Key, byte Payload)[] deliveries)
+{
+    var output = new MemoryStream();
+    foreach (var item in deliveries)
+    {
+        var metadata = Encoding.UTF8.GetBytes($"{{\"delivery_id\":\"{item.Delivery}\",\"message_id\":\"{item.Message}\",\"topic\":\"t\",\"key\":\"{item.Key}\",\"created_at\":1,\"attempt\":1}}");
+        var sizes = new byte[8];
+        BinaryPrimitives.WriteUInt32BigEndian(sizes.AsSpan(0, 4), (uint)metadata.Length);
+        BinaryPrimitives.WriteUInt32BigEndian(sizes.AsSpan(4, 4), 1);
+        output.Write(sizes);
+        output.Write(metadata);
+        output.WriteByte(item.Payload);
+    }
+    output.Position = 0;
+    return output;
 }
 
 static Stream Frame()
