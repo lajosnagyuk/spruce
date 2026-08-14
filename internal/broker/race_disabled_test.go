@@ -1,0 +1,5 @@
+//go:build !race
+
+package broker
+
+const raceEnabled = false

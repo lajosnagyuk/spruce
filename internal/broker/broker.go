@@ -84,7 +84,9 @@ type Message struct {
 	Payload       []byte            `json:"-"`
 	CreatedAt     int64             `json:"created_at"`
 	ExpiresAt     int64             `json:"expires_at"`
-	expiry        expiryItem
+	expiry        *expiryItem
+	expiryPrev    *Message
+	expiryNext    *Message
 	orderIndex    int
 	topicIndex    int
 	accountedSize int64
@@ -107,7 +109,7 @@ type cache struct {
 	order           []*Message
 	orderHead       int
 	expiry          expiryHeap
-	expiryItems     map[string]*expiryItem
+	expiryItems     map[int64]*expiryItem
 	tombstones      int
 	topics          map[string][]*Message
 	topicTombstones map[string]int
@@ -118,9 +120,10 @@ type cache struct {
 }
 
 type expiryItem struct {
-	id    string
 	at    int64
 	index int
+	head  *Message
+	count int
 }
 type expiryHeap []*expiryItem
 
@@ -143,7 +146,7 @@ func (h *expiryHeap) Pop() any {
 }
 
 func newCache(max int64) *cache {
-	return &cache{items: make(map[string]*Message), expiryItems: make(map[string]*expiryItem), topics: make(map[string][]*Message), topicTombstones: make(map[string]int), maxBytes: max}
+	return &cache{items: make(map[string]*Message), expiryItems: make(map[int64]*expiryItem), topics: make(map[string][]*Message), topicTombstones: make(map[string]int), maxBytes: max}
 }
 
 func messageSize(m *Message) int64 {
@@ -165,6 +168,11 @@ func (c *cache) put(m *Message, now int64) (bool, error) {
 }
 
 func (c *cache) putLocked(m *Message, now int64) (bool, error) {
+	c.expireLocked(now)
+	return c.insertLocked(m)
+}
+
+func (c *cache) insertLocked(m *Message) (bool, error) {
 	if _, ok := c.items[m.ID]; ok {
 		return false, nil
 	}
@@ -172,7 +180,6 @@ func (c *cache) putLocked(m *Message, now int64) (bool, error) {
 	if sz > c.maxBytes {
 		return false, errors.New("message exceeds cache capacity")
 	}
-	c.expireLocked(now)
 	for c.bytes+sz > c.maxBytes && c.orderHead < len(c.order) {
 		c.dropOldestLocked()
 	}
@@ -181,10 +188,19 @@ func (c *cache) putLocked(m *Message, now int64) (bool, error) {
 	c.order = append(c.order, m)
 	m.topicIndex = len(c.topics[m.Topic])
 	c.topics[m.Topic] = append(c.topics[m.Topic], m)
-	m.expiry = expiryItem{id: m.ID, at: m.ExpiresAt}
-	item := &m.expiry
-	c.expiryItems[m.ID] = item
-	heap.Push(&c.expiry, item)
+	item := c.expiryItems[m.ExpiresAt]
+	if item == nil {
+		item = &expiryItem{at: m.ExpiresAt, index: -1}
+		c.expiryItems[m.ExpiresAt] = item
+		heap.Push(&c.expiry, item)
+	}
+	m.expiry = item
+	m.expiryNext = item.head
+	if item.head != nil {
+		item.head.expiryPrev = m
+	}
+	item.head = m
+	item.count++
 	c.bytes += sz
 	return true, nil
 }
@@ -192,6 +208,7 @@ func (c *cache) putLocked(m *Message, now int64) (bool, error) {
 func (c *cache) putBatch(messages []*Message, now int64) ([]bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.expireLocked(now)
 	var total int64
 	for _, m := range messages {
 		sz := messageSize(m)
@@ -202,7 +219,7 @@ func (c *cache) putBatch(messages []*Message, now int64) ([]bool, error) {
 	}
 	inserted := make([]bool, len(messages))
 	for i, m := range messages {
-		inserted[i], _ = c.putLocked(m, now)
+		inserted[i], _ = c.insertLocked(m)
 	}
 	return inserted, nil
 }
@@ -260,12 +277,7 @@ func (c *cache) removeLocked(m *Message, pressure bool) {
 				delete(c.topicTombstones, m.Topic)
 			}
 		}
-		if item := c.expiryItems[m.ID]; item != nil {
-			delete(c.expiryItems, m.ID)
-			if item.index >= 0 {
-				heap.Remove(&c.expiry, item.index)
-			}
-		}
+		c.unlinkExpiryLocked(m)
 		c.bytes -= messageSize(m)
 		if pressure {
 			c.evicted.Add(1)
@@ -275,14 +287,43 @@ func (c *cache) removeLocked(m *Message, pressure bool) {
 	}
 }
 
+func (c *cache) unlinkExpiryLocked(m *Message) {
+	item := m.expiry
+	if item == nil {
+		return
+	}
+	if m.expiryPrev != nil {
+		m.expiryPrev.expiryNext = m.expiryNext
+	} else {
+		item.head = m.expiryNext
+	}
+	if m.expiryNext != nil {
+		m.expiryNext.expiryPrev = m.expiryPrev
+	}
+	m.expiry, m.expiryPrev, m.expiryNext = nil, nil, nil
+	item.count--
+	if item.count == 0 {
+		delete(c.expiryItems, item.at)
+		if item.index >= 0 {
+			heap.Remove(&c.expiry, item.index)
+		}
+	}
+}
+
 func (c *cache) expire(now int64) { c.mu.Lock(); c.expireLocked(now); c.mu.Unlock() }
 func (c *cache) expireLocked(now int64) {
 	for c.expiry.Len() > 0 && c.expiry[0].at <= now {
 		item := heap.Pop(&c.expiry).(*expiryItem)
-		delete(c.expiryItems, item.id)
-		if m := c.items[item.id]; m != nil && m.ExpiresAt == item.at {
-			c.removeLocked(m, false)
+		delete(c.expiryItems, item.at)
+		for m := item.head; m != nil; {
+			next := m.expiryNext
+			m.expiry, m.expiryPrev, m.expiryNext = nil, nil, nil
+			if c.items[m.ID] == m && m.ExpiresAt == item.at {
+				c.removeLocked(m, false)
+			}
+			m = next
 		}
+		item.head, item.count = nil, 0
 	}
 	if c.tombstones > orderCompactTombstones && c.tombstones*2 > len(c.order) {
 		kept := c.order[:0]
@@ -384,7 +425,9 @@ var deliveryCandidates = sync.Pool{New: func() any { return make([]deliveryCandi
 var deliveryMetadata = sync.Pool{New: func() any { return make([]byte, 0, 256) }}
 
 type pending struct {
-	delivery     Delivery
+	deliveryID   string
+	message      *Message
+	attempt      int
 	group        string
 	subscriberID string
 	expiresAt    int64
@@ -392,6 +435,15 @@ type pending struct {
 	next         time.Time
 	deadline     pendingDeadline
 	deliveredAt  time.Time
+}
+
+var pendingPool = sync.Pool{New: func() any { return new(pending) }}
+
+func acquirePending() *pending { return pendingPool.Get().(*pending) }
+func resetPending(p *pending)  { *p = pending{} }
+func releasePending(p *pending) {
+	resetPending(p)
+	pendingPool.Put(p)
 }
 
 var latencyBoundsUS = [...]uint64{100, 250, 500, 1000, 2500, 5000, 10000, 50000}
@@ -495,6 +547,7 @@ type Broker struct {
 	requestSlots     chan struct{}
 	streamSlots      chan struct{}
 	internalSlots    chan struct{}
+	digestSlot       chan struct{}
 	ready            atomic.Bool
 }
 
@@ -572,7 +625,7 @@ func New(cfg Config) *Broker {
 		client: &http.Client{Timeout: 5 * time.Second, Transport: peerTransport}, subs: make(map[string]*subscriber),
 		topicBroadcast: make(map[string]map[string]*subscriber), topicGroups: make(map[string]map[string]map[string]*subscriber),
 		pending: make(map[string]*pending), idempotency: make(map[string]*idempotencyEntry), stop: make(chan struct{}),
-		requestSlots: make(chan struct{}, cfg.MaxConcurrentRequests), streamSlots: make(chan struct{}, cfg.MaxStreams)}
+		requestSlots: make(chan struct{}, cfg.MaxConcurrentRequests), streamSlots: make(chan struct{}, cfg.MaxStreams), digestSlot: make(chan struct{}, 1)}
 	b.internalSlots = make(chan struct{}, cfg.MaxInternalRequests)
 	if _, err := rand.Read(b.boot[:]); err != nil {
 		panic("spruce: generate boot identity: " + err.Error())
@@ -664,6 +717,7 @@ func (b *Broker) routes() {
 	b.mux.HandleFunc("POST /v1/deliveries/nack", b.nack)
 	b.mux.HandleFunc("POST /internal/replicate", b.replicate)
 	b.mux.HandleFunc("GET /internal/snapshot", b.snapshot)
+	b.mux.HandleFunc("GET /internal/cache-digest", b.cacheDigest)
 	b.mux.HandleFunc("POST /internal/ack", b.internalAck)
 	b.mux.HandleFunc("POST /internal/nack", b.internalNack)
 	b.mux.HandleFunc("GET /metrics", b.prometheus)
@@ -683,6 +737,10 @@ const (
 	maxBatchMessages = 4096
 	maxBatchBytes    = 16 << 20
 )
+
+var batchReaders = sync.Pool{New: func() any {
+	return bufio.NewReaderSize(nil, 64<<10)
+}}
 
 // Batch wire format is a sequence of [4 byte big-endian payload length][payload].
 // Topic, TTL, key, and content type are shared by the batch. This intentionally
@@ -716,7 +774,12 @@ func (b *Broker) publishBatch(w http.ResponseWriter, r *http.Request) {
 		problem(w, 400, "invalid_ttl")
 		return
 	}
-	reader := bufio.NewReaderSize(io.LimitReader(r.Body, maxBatchBytes+1), 64<<10)
+	reader := batchReaders.Get().(*bufio.Reader)
+	reader.Reset(io.LimitReader(r.Body, maxBatchBytes+1))
+	defer func() {
+		reader.Reset(nil)
+		batchReaders.Put(reader)
+	}()
 	payloads := make([][]byte, 0, 256)
 	var total int64
 	for len(payloads) < maxBatchMessages {
@@ -1095,6 +1158,14 @@ func writePeerBatch(w io.Writer, messages []*Message) error {
 	if len(messages) == 0 || len(messages) > maxBatchMessages {
 		return errors.New("invalid peer batch size")
 	}
+	if buffer, ok := w.(*bytes.Buffer); ok {
+		encoded, err := appendPeerBatch(buffer.AvailableBuffer(), messages)
+		if err != nil {
+			return err
+		}
+		_, err = buffer.Write(encoded)
+		return err
+	}
 	var count [4]byte
 	binary.BigEndian.PutUint32(count[:], uint32(len(messages)))
 	if _, err := w.Write(count[:]); err != nil {
@@ -1134,6 +1205,50 @@ func writePeerBatch(w io.Writer, messages []*Message) error {
 		}
 	}
 	return nil
+}
+
+func appendPeerBatch(out []byte, messages []*Message) ([]byte, error) {
+	if len(messages) == 0 || len(messages) > maxBatchMessages {
+		return out, errors.New("invalid peer batch size")
+	}
+	out = binary.BigEndian.AppendUint32(out, uint32(len(messages)))
+	for _, m := range messages {
+		var err error
+		if out, err = appendPeerString(out, m.ID); err != nil {
+			return out, err
+		}
+		if out, err = appendPeerString(out, m.Topic); err != nil {
+			return out, err
+		}
+		if out, err = appendPeerString(out, m.Key); err != nil {
+			return out, err
+		}
+		if len(m.Headers) > 65535 || len(m.Payload) > int(^uint32(0)) {
+			return out, errors.New("peer message too large")
+		}
+		out = binary.BigEndian.AppendUint16(out, uint16(len(m.Headers)))
+		out = binary.BigEndian.AppendUint32(out, uint32(len(m.Payload)))
+		out = binary.BigEndian.AppendUint64(out, uint64(m.CreatedAt))
+		out = binary.BigEndian.AppendUint64(out, uint64(m.ExpiresAt))
+		for key, value := range m.Headers {
+			if out, err = appendPeerString(out, key); err != nil {
+				return out, err
+			}
+			if out, err = appendPeerString(out, value); err != nil {
+				return out, err
+			}
+		}
+		out = append(out, m.Payload...)
+	}
+	return out, nil
+}
+
+func appendPeerString(out []byte, value string) ([]byte, error) {
+	if len(value) > 65535 {
+		return out, errors.New("peer string too large")
+	}
+	out = binary.BigEndian.AppendUint16(out, uint16(len(value)))
+	return append(out, value...), nil
 }
 
 func readPeerString(r io.Reader, maximum int) (string, error) {
@@ -1250,12 +1365,13 @@ func (b *Broker) sendPeerBody(ctx context.Context, p *peer, body []byte, count i
 }
 
 func (b *Broker) peerLoop(p *peer) {
+	var encoded bytes.Buffer
 	for {
 		select {
 		case <-b.stop:
 			return
 		case batch := <-p.ch:
-			var encoded bytes.Buffer
+			encoded.Reset()
 			if err := writePeerBatch(&encoded, batch); err != nil {
 				b.metrics.ReplicationErrors.Add(uint64(len(batch)))
 				p.queuedBytes.Add(-batchBytes(batch))
@@ -1285,6 +1401,9 @@ func (b *Broker) peerLoop(p *peer) {
 				b.metrics.ReplicationDropped.Add(uint64(len(batch)))
 			}
 			p.queuedBytes.Add(-batchBytes(batch))
+			if encoded.Cap() > 1<<20 {
+				encoded = bytes.Buffer{}
+			}
 		}
 	}
 }
@@ -1537,21 +1656,24 @@ func (b *Broker) removeSubscriberLocked(s *subscriber) {
 }
 
 func (b *Broker) sendDelivery(s *subscriber, m *Message, attempt int) bool {
-	d := Delivery{DeliveryID: b.nextID(), MessageID: m.ID, Topic: m.Topic, Key: m.Key, Headers: m.Headers, CreatedAt: m.CreatedAt, Attempt: attempt, Payload: m.Payload}
+	deliveryID := b.nextID()
+	d := Delivery{DeliveryID: deliveryID, MessageID: m.ID, Topic: m.Topic, Key: m.Key, Headers: m.Headers, CreatedAt: m.CreatedAt, Attempt: attempt, Payload: m.Payload}
 	bytes := messageSize(m)
 	now := time.Now()
-	p := &pending{delivery: d, group: s.group, subscriberID: s.id, expiresAt: m.ExpiresAt, bytes: bytes, deliveredAt: now, next: now.Add(b.cfg.AckDeadline)}
-	p.deadline = pendingDeadline{id: d.DeliveryID, at: p.next}
+	p := acquirePending()
+	*p = pending{deliveryID: deliveryID, message: m, attempt: attempt, group: s.group, subscriberID: s.id, expiresAt: m.ExpiresAt, bytes: bytes, deliveredAt: now, next: now.Add(b.cfg.AckDeadline)}
+	p.deadline = pendingDeadline{id: deliveryID, at: p.next}
 	b.mu.Lock()
 	if s.detached || b.pendingBytes+bytes > b.cfg.MaxInflightBytes || s.inflightBytes+bytes > b.cfg.MaxSubscriberInflightBytes {
 		b.mu.Unlock()
+		releasePending(p)
 		if s.cancel != nil {
 			s.cancel()
 		}
 		b.metrics.Dropped.Add(1)
 		return false
 	}
-	b.pending[d.DeliveryID] = p
+	b.pending[deliveryID] = p
 	b.pendingBytes += bytes
 	s.inflightBytes += bytes
 	heap.Push(&b.pendingDeadlines, &p.deadline)
@@ -1561,13 +1683,14 @@ func (b *Broker) sendDelivery(s *subscriber, m *Message, attempt int) bool {
 		b.metrics.Delivered.Add(1)
 		return true
 	default:
-		delete(b.pending, d.DeliveryID)
+		delete(b.pending, deliveryID)
 		b.pendingBytes -= bytes
 		s.inflightBytes -= bytes
 		if p.deadline.index >= 0 {
 			heap.Remove(&b.pendingDeadlines, p.deadline.index)
 		}
 		b.mu.Unlock()
+		releasePending(p)
 		if s.cancel != nil {
 			s.cancel()
 		}
@@ -1781,6 +1904,7 @@ func (b *Broker) removeAcks(ids []string) {
 			}
 			b.metrics.Acked.Add(1)
 			b.metrics.AckLatency.observe(time.Since(p.deliveredAt))
+			releasePending(p)
 		}
 	}
 	b.mu.Unlock()
@@ -2000,29 +2124,33 @@ func (b *Broker) maintenance() {
 			}
 			b.mu.Unlock()
 			for _, p := range retry {
-				if p.delivery.Attempt >= b.cfg.MaxAttempts {
+				if p.attempt >= b.cfg.MaxAttempts {
 					b.metrics.Dropped.Add(1)
+					releasePending(p)
 					continue
 				}
-				p.delivery.Attempt++
+				p.attempt++
 				b.metrics.Redelivered.Add(1)
 				if p.expiresAt <= now.UnixMilli() {
 					b.metrics.Dropped.Add(1)
+					releasePending(p)
 					continue
 				}
-				m := &Message{ID: p.delivery.MessageID, Topic: p.delivery.Topic, Key: p.delivery.Key, Headers: p.delivery.Headers, Payload: p.delivery.Payload, CreatedAt: p.delivery.CreatedAt, ExpiresAt: p.expiresAt}
+				m := p.message
 				if p.group != "" {
-					b.deliver(m, p.group, p.delivery.Attempt)
+					b.deliver(m, p.group, p.attempt)
+					releasePending(p)
 					continue
 				}
 				b.mu.RLock()
 				s := b.subs[p.subscriberID]
 				b.mu.RUnlock()
 				if s != nil {
-					b.sendDelivery(s, m, p.delivery.Attempt)
+					b.sendDelivery(s, m, p.attempt)
 				} else {
 					b.metrics.Dropped.Add(1)
 				}
+				releasePending(p)
 			}
 		}
 	}
@@ -2051,6 +2179,61 @@ func (b *Broker) status(w http.ResponseWriter, _ *http.Request) {
 	v["action_queue_bytes"] = actionQueueBytes
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func (b *Broker) cacheDigest(w http.ResponseWriter, r *http.Request) {
+	if !b.peerAllowed(r) {
+		problem(w, http.StatusUnauthorized, "invalid_peer")
+		return
+	}
+	select {
+	case b.digestSlot <- struct{}{}:
+		defer func() { <-b.digestSlot }()
+	default:
+		problem(w, http.StatusTooManyRequests, "digest_in_progress")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = io.WriteString(w, digestMessages(b.cache.digestSnapshot()))
+}
+
+func (c *cache) digestSnapshot() []*Message {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	messages := make([]*Message, 0, len(c.items))
+	for _, message := range c.items {
+		messages = append(messages, message)
+	}
+	return messages
+}
+
+func digestMessages(messages []*Message) string {
+	sort.Slice(messages, func(i, j int) bool { return messages[i].ID < messages[j].ID })
+	digest := sha256.New()
+	for _, message := range messages {
+		messageDigest := sha256.New()
+		_ = writePeerString(messageDigest, message.ID)
+		_ = writePeerString(messageDigest, message.Topic)
+		_ = writePeerString(messageDigest, message.Key)
+		var fixed [22]byte
+		binary.BigEndian.PutUint32(fixed[:4], uint32(len(message.Payload)))
+		binary.BigEndian.PutUint64(fixed[4:12], uint64(message.CreatedAt))
+		binary.BigEndian.PutUint64(fixed[12:20], uint64(message.ExpiresAt))
+		binary.BigEndian.PutUint16(fixed[20:22], uint16(len(message.Headers)))
+		_, _ = messageDigest.Write(fixed[:])
+		headerKeys := make([]string, 0, len(message.Headers))
+		for key := range message.Headers {
+			headerKeys = append(headerKeys, key)
+		}
+		sort.Strings(headerKeys)
+		for _, key := range headerKeys {
+			_ = writePeerString(messageDigest, key)
+			_ = writePeerString(messageDigest, message.Headers[key])
+		}
+		_, _ = messageDigest.Write(message.Payload)
+		_, _ = digest.Write(messageDigest.Sum(nil))
+	}
+	return base64.RawURLEncoding.EncodeToString(digest.Sum(nil))
 }
 
 func (b *Broker) messageStatus(w http.ResponseWriter, r *http.Request) {

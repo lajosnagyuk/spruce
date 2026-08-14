@@ -87,6 +87,63 @@ throughput gate, because developer hardware and concurrent workloads vary.
 - Run correctness and race tests before comparative benchmarks.
 - Do not compare amortized batch latency with end-to-end latency for an individual
   unbatched message.
+- Full cache convergence uses the peer-authenticated internal digest diagnostic. It
+  snapshots message references briefly under the cache lock, then hashes immutable
+  message content after releasing the lock. A dedicated capacity-one gate rejects
+  concurrent diagnostics, and routine status remains constant-time.
+
+## Regression surface
+
+`make perf-test` has hardware-independent allocation-count and allocation-byte gates. It
+also executes hardware-dependent smoke samples for batch ingress, cache admission,
+delivery framing, and consumer-group routing. `make benchmark` runs longer comparative
+measurements across batch sizes, payload sizes, and group sizes. Absolute throughput is
+reported rather than gated because shared CI hardware is not stable enough for a useful
+latency threshold.
+
+The first profile-guided optimization pools the 64 KiB batch parser and expires the
+cache once per atomic batch. On the reference host parser pooling reduced a 512-message
+request from roughly 351 KiB to 285 KiB allocated; the byte ceiling exists to
+prevent that request-scoped memory from drifting back.
+
+Removing the redundant expiry lookup map then reduced the same handler to roughly
+381 us/request and 274 KiB/request on the reference host, about 23% faster and 22%
+fewer allocated bytes than the original baseline. Messages link into an exact-deadline
+expiry bucket; CI checks the bucket map, heap indexes, intrusive links, cache membership,
+order, and topic indexes under sustained pressure.
+
+Exact-deadline expiry buckets reduce a batch to one heap node without rounding TTLs;
+the repeated 512-message handler reached roughly 288 us/request, about 42% faster than
+the original baseline. Replication serialization uses an append-only buffer fast path,
+while snapshot responses retain direct bounded streaming.
+
+The fixed 128-bit message ID encoder measures about 26 ns and one 24-byte retained
+string allocation. It is not a CPU hotspot, and replacing the internal representation
+would expand the integrity-sensitive cache, replay, replication, delivery, status, and
+deduplication surface. Compact binary IDs therefore remain rejected until retained-heap
+profiles demonstrate that the allocation, rather than payload or indexes, is material.
+
+After expiry bucketing and allocation-free steady-state peer encoding for encoded
+batches up to the 1 MiB retained-buffer ceiling, the `spruce-dev`
+three-broker scenario delivered 3,000 messages across six topics, 10 producers, three
+broadcast consumers/topic, and five group members/topic with zero missing, duplicate,
+invalid, or failed operations. The 100,000-message, 256-message batch run through
+port-forward and both gateways measured 150,748 messages/s and 36.80 MiB/s; this remains
+a single observation rather than a portable throughput claim. The run used the `perf2`
+test tag built from the uncommitted working tree, with no warmup or repeated-sample
+dispersion; the in-process repeated benchmarks are the comparative evidence.
+
+Pending delivery state references the immutable message rather than embedding duplicate
+topic, key, header, payload, and timestamp fields. Terminal pending objects are zeroed
+and reused only after removal from the pending map and deadline heap. On the reference
+host this reduced a 256-message publish/deliver/ACK cycle from roughly 229 KiB and 1,826
+allocations to 164 KiB and 1,570 allocations, with no material latency regression.
+
+Parallel 64-message ingress scaled from roughly 289 MB/s on one core to 335 MB/s on two
+and 364 MB/s on four, then remained flat at eight. The global cache lock is therefore a
+saturation ceiling rather than a collapse mode. Cache sharding is rejected for now:
+two-core Kubernetes brokers remain below that point and horizontal replicas scale
+without splitting the correctness-sensitive global eviction and expiry order.
 
 ## K3s topology baseline
 

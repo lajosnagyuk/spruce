@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := build
-.PHONY: build test test-race benchmark csharp csharp-pack python python-pack image image-tools image-python-probe compose-up compose-down smoke validate-local helm-lint helm-render helm-install clean
+.PHONY: build test test-race benchmark perf-test csharp csharp-pack python python-pack image image-tools image-python-probe compose-up compose-down smoke validate-local helm-lint helm-render helm-install clean
 
 BIN := bin
 GOCACHE ?= $(CURDIR)/.cache/go-build
@@ -23,7 +23,11 @@ test-race:
 
 benchmark:
 	go run ./cmd/spruce-bench -server "$${SPRUCE_URL:-http://localhost:8080}"
-	go test -run '^$$' -bench BenchmarkPublishBatch -benchmem ./internal/broker
+	go test -run '^$$' -bench '^(BenchmarkPublishBatch|BenchmarkConcurrentPublishBatch64|BenchmarkCachePutBatch512|BenchmarkWriteFrame|BenchmarkDeliverConsumerGroup|BenchmarkPublishDeliverAck256|BenchmarkWritePeerBatch512|BenchmarkWritePeerBatch512Cold|BenchmarkNextID)$$' -benchmem ./internal/broker
+
+perf-test:
+	go test -run '^TestPerformance' -count=1 ./internal/broker
+	go test -run '^$$' -bench '^(BenchmarkPublishBatch|BenchmarkConcurrentPublishBatch64|BenchmarkCachePutBatch512|BenchmarkWriteFrame|BenchmarkDeliverConsumerGroup|BenchmarkPublishDeliverAck256|BenchmarkWritePeerBatch512|BenchmarkWritePeerBatch512Cold|BenchmarkNextID)$$' -benchtime=10x ./internal/broker
 
 csharp:
 	dotnet build clients/csharp/Spruce.Example/Spruce.Example.csproj --ignore-failed-sources

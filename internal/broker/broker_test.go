@@ -2,12 +2,14 @@ package broker
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
 	"encoding/binary"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -179,22 +181,164 @@ func TestPublishBatch(t *testing.T) {
 	}
 }
 
+func TestPerformancePublishBatchAllocationCeiling(t *testing.T) {
+	if raceEnabled {
+		t.Skip("allocation counts include race instrumentation")
+	}
+	body := benchmarkBatch(512, 256)
+	result := testing.Benchmark(func(b *testing.B) {
+		cfg := DefaultConfig()
+		cfg.CacheBytes = 64 << 20
+		broker := New(cfg)
+		defer broker.Close()
+		b.ResetTimer()
+		for range b.N {
+			r := httptest.NewRequest("POST", "/v1/topics/bench/batches", bytes.NewReader(body))
+			w := httptest.NewRecorder()
+			broker.Handler().ServeHTTP(w, r)
+			if w.Code != 202 {
+				b.Fatalf("batch publish status %d", w.Code)
+			}
+		}
+	})
+	if allocations := result.AllocsPerOp(); allocations > 2090 {
+		t.Fatalf("batch allocation-count regression: got %d allocations/request, ceiling 2090", allocations)
+	}
+	if bytes := result.AllocedBytesPerOp(); bytes > 300<<10 {
+		t.Fatalf("batch allocation-byte regression: got %d bytes/request, ceiling %d", bytes, 300<<10)
+	}
+}
+
+func TestPerformanceExpiryIndexTracksCacheExactly(t *testing.T) {
+	c := newCache(32 << 10)
+	now := time.Now()
+	for i := 0; i < 1000; i++ {
+		m := &Message{ID: strconv.Itoa(i), Topic: "expiry", Payload: make([]byte, 64), ExpiresAt: now.Add(time.Duration(i+1) * time.Millisecond).UnixMilli()}
+		if _, err := c.put(m, now.UnixMilli()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertCacheExpiryInvariant(t, c)
+	c.expire(now.Add(2 * time.Second).UnixMilli())
+	assertCacheExpiryInvariant(t, c)
+	if c.expiry.Len() != 0 || len(c.items) != 0 || c.bytes != 0 {
+		t.Fatalf("expiry/cache drift after expiration: heap=%d cache=%d bytes=%d", c.expiry.Len(), len(c.items), c.bytes)
+	}
+}
+
+func TestPerformanceSustainedChurnKeepsIndexesBounded(t *testing.T) {
+	c := newCache(1 << 20)
+	now := time.Now()
+	for batch := 0; batch < 200; batch++ {
+		messages := make([]*Message, 256)
+		for i := range messages {
+			id := strconv.Itoa(batch*len(messages) + i)
+			messages[i] = &Message{ID: id, Topic: "churn", Payload: make([]byte, 256), ExpiresAt: now.Add(time.Minute).UnixMilli()}
+		}
+		if _, err := c.putBatch(messages, now.UnixMilli()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertCacheExpiryInvariant(t, c)
+	if c.bytes > c.maxBytes {
+		t.Fatalf("cache bound drift: bytes=%d max=%d", c.bytes, c.maxBytes)
+	}
+	if len(c.order) > 2*len(c.items)+orderCompactTombstones {
+		t.Fatalf("order index retained excessive tombstones: order=%d items=%d", len(c.order), len(c.items))
+	}
+	if len(c.topics["churn"]) > 2*len(c.items)+topicCompactTombstones {
+		t.Fatalf("topic index retained excessive tombstones: topic=%d items=%d", len(c.topics["churn"]), len(c.items))
+	}
+}
+
+func expiryMessageCount(c *cache) int {
+	total := 0
+	for _, item := range c.expiryItems {
+		total += item.count
+	}
+	return total
+}
+
+func assertCacheExpiryInvariant(t *testing.T, c *cache) {
+	t.Helper()
+	if len(c.expiryItems) != c.expiry.Len() {
+		t.Fatalf("expiry map/heap drift: map=%d heap=%d", len(c.expiryItems), c.expiry.Len())
+	}
+	seen := make(map[*Message]bool, len(c.items))
+	for index, item := range c.expiry {
+		if item.index != index || c.expiryItems[item.at] != item {
+			t.Fatalf("expiry bucket index mismatch: index=%d stored=%d", index, item.index)
+		}
+		count := 0
+		var previous *Message
+		for message := item.head; message != nil; message = message.expiryNext {
+			if seen[message] || message.expiry != item || message.expiryPrev != previous || message.ExpiresAt != item.at || c.items[message.ID] != message {
+				t.Fatalf("invalid expiry linkage for message %q", message.ID)
+			}
+			seen[message] = true
+			previous = message
+			count++
+		}
+		if count != item.count {
+			t.Fatalf("expiry bucket count mismatch: walked=%d stored=%d", count, item.count)
+		}
+	}
+	if len(seen) != len(c.items) || expiryMessageCount(c) != len(c.items) {
+		t.Fatalf("expiry/cache membership drift: seen=%d indexed=%d cache=%d", len(seen), expiryMessageCount(c), len(c.items))
+	}
+}
+
+func benchmarkBatch(messages, payloadBytes int) []byte {
+	var encoded bytes.Buffer
+	payload := make([]byte, payloadBytes)
+	var size [4]byte
+	binary.BigEndian.PutUint32(size[:], uint32(len(payload)))
+	for range messages {
+		encoded.Write(size[:])
+		encoded.Write(payload)
+	}
+	return encoded.Bytes()
+}
+
 func BenchmarkPublishBatch512(b *testing.B) {
+	benchmarkPublishBatch(b, 512, 256)
+}
+
+func BenchmarkPublishBatch(b *testing.B) {
+	for _, messages := range []int{1, 16, 64, 256, 512} {
+		b.Run(strconv.Itoa(messages), func(b *testing.B) { benchmarkPublishBatch(b, messages, 256) })
+	}
+}
+
+func BenchmarkConcurrentPublishBatch64(b *testing.B) {
+	broker := New(DefaultConfig())
+	defer broker.Close()
+	body := benchmarkBatch(64, 256)
+	b.SetBytes(64 * 256)
+	b.ReportMetric(64, "messages/op")
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			r := httptest.NewRequest("POST", "/v1/topics/bench/batches", bytes.NewReader(body))
+			w := httptest.NewRecorder()
+			broker.Handler().ServeHTTP(w, r)
+			if w.Code != 202 {
+				b.Errorf("status %d", w.Code)
+				return
+			}
+		}
+	})
+}
+
+func benchmarkPublishBatch(b *testing.B, messages, payloadBytes int) {
 	cfg := DefaultConfig()
 	cfg.CacheBytes = 64 << 20
 	broker := New(cfg)
 	defer broker.Close()
-	var encoded bytes.Buffer
-	payload := make([]byte, 256)
-	for range 512 {
-		var size [4]byte
-		binary.BigEndian.PutUint32(size[:], uint32(len(payload)))
-		encoded.Write(size[:])
-		encoded.Write(payload)
-	}
-	body := encoded.Bytes()
-	b.SetBytes(int64(len(payload) * 512))
-	b.ReportMetric(512, "messages/op")
+	body := benchmarkBatch(messages, payloadBytes)
+	b.SetBytes(int64(payloadBytes * messages))
+	b.ReportMetric(float64(messages), "messages/op")
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
@@ -204,6 +348,151 @@ func BenchmarkPublishBatch512(b *testing.B) {
 		if w.Code != 202 {
 			b.Fatalf("status %d", w.Code)
 		}
+	}
+}
+
+func BenchmarkCachePutBatch512(b *testing.B) {
+	c := newCache(64 << 20)
+	now := time.Now()
+	payload := make([]byte, 256)
+	var sequence atomic.Uint64
+	b.ReportMetric(512, "messages/op")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		messages := make([]*Message, 512)
+		for i := range messages {
+			id := strconv.FormatUint(sequence.Add(1), 10)
+			messages[i] = &Message{ID: id, Topic: "bench", Payload: payload, CreatedAt: now.UnixMilli(), ExpiresAt: now.Add(time.Minute).UnixMilli()}
+		}
+		if _, err := c.putBatch(messages, now.UnixMilli()); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkWriteFrame(b *testing.B) {
+	for _, payloadBytes := range []int{64, 256, 4096, 1 << 20} {
+		b.Run(strconv.Itoa(payloadBytes), func(b *testing.B) {
+			d := Delivery{DeliveryID: "delivery", MessageID: "message", Topic: "bench", CreatedAt: time.Now().UnixMilli(), Attempt: 1, Payload: make([]byte, payloadBytes)}
+			b.SetBytes(int64(payloadBytes))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				if err := writeFrame(io.Discard, d); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkDeliverConsumerGroup(b *testing.B) {
+	for _, members := range []int{1, 4, 16, 64} {
+		b.Run(strconv.Itoa(members), func(b *testing.B) {
+			broker := New(DefaultConfig())
+			defer broker.Close()
+			for i := range members {
+				s := &subscriber{id: strconv.Itoa(i), topic: "bench", group: "workers", ch: make(chan Delivery, 1)}
+				broker.addSubscriberLocked(s)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				m := &Message{ID: strconv.Itoa(i), Topic: "bench", Payload: []byte("payload"), CreatedAt: time.Now().UnixMilli(), ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
+				broker.deliver(m, "", 1)
+				broker.mu.Lock()
+				for id, pending := range broker.pending {
+					delete(broker.pending, id)
+					if pending.deadline.index >= 0 {
+						heap.Remove(&broker.pendingDeadlines, pending.deadline.index)
+					}
+					if s := broker.subs[pending.subscriberID]; s != nil {
+						<-s.ch
+						s.inflightBytes -= pending.bytes
+					}
+					broker.pendingBytes -= pending.bytes
+					releasePending(pending)
+				}
+				broker.mu.Unlock()
+			}
+		})
+	}
+}
+
+func BenchmarkPublishDeliverAck256(b *testing.B) {
+	broker := New(DefaultConfig())
+	defer broker.Close()
+	s := &subscriber{id: "consumer", topic: "bench", ch: make(chan Delivery, 256)}
+	broker.mu.Lock()
+	broker.addSubscriberLocked(s)
+	broker.mu.Unlock()
+	body := benchmarkBatch(256, 256)
+	acks := make([]string, 256)
+	b.SetBytes(256 * 256)
+	b.ReportMetric(256, "messages/op")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		r := httptest.NewRequest("POST", "/v1/topics/bench/batches", bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		broker.Handler().ServeHTTP(w, r)
+		if w.Code != 202 {
+			b.Fatalf("status %d", w.Code)
+		}
+		for i := range acks {
+			acks[i] = (<-s.ch).DeliveryID
+		}
+		broker.removeAcks(acks)
+	}
+}
+
+func BenchmarkWritePeerBatch512(b *testing.B) {
+	now := time.Now()
+	payload := make([]byte, 256)
+	messages := make([]*Message, 512)
+	for i := range messages {
+		messages[i] = &Message{ID: strconv.Itoa(i), Topic: "bench", Payload: payload, CreatedAt: now.UnixMilli(), ExpiresAt: now.Add(time.Minute).UnixMilli()}
+	}
+	b.SetBytes(512 * 256)
+	b.ReportMetric(512, "messages/op")
+	b.ReportAllocs()
+	var encoded bytes.Buffer
+	encoded.Grow(512 * 320)
+	b.ResetTimer()
+	for range b.N {
+		encoded.Reset()
+		if err := writePeerBatch(&encoded, messages); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkWritePeerBatch512Cold(b *testing.B) {
+	now := time.Now()
+	payload := make([]byte, 256)
+	messages := make([]*Message, 512)
+	for i := range messages {
+		messages[i] = &Message{ID: strconv.Itoa(i), Topic: "bench", Payload: payload, CreatedAt: now.UnixMilli(), ExpiresAt: now.Add(time.Minute).UnixMilli()}
+	}
+	b.SetBytes(512 * 256)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		var encoded bytes.Buffer
+		if err := writePeerBatch(&encoded, messages); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkNextID(b *testing.B) {
+	broker := New(DefaultConfig())
+	defer broker.Close()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_ = broker.nextID()
 	}
 }
 
@@ -388,6 +677,182 @@ func TestDeliveryIsPendingBeforeConsumerCanAck(t *testing.T) {
 	}
 	if len(b.pendingDeadlines) != 0 {
 		t.Fatal("acknowledged delivery retained a stale deadline")
+	}
+}
+
+func TestPendingPoolReturnsScrubbedState(t *testing.T) {
+	p := new(pending)
+	*p = pending{deliveryID: "delivery", message: &Message{ID: "message", Payload: []byte("secret")}, attempt: 3, group: "group", subscriberID: "subscriber", bytes: 123, next: time.Now(), deliveredAt: time.Now()}
+	resetPending(p)
+	if p.deliveryID != "" || p.message != nil || p.attempt != 0 || p.group != "" || p.subscriberID != "" || p.bytes != 0 || !p.next.IsZero() || !p.deliveredAt.IsZero() || p.deadline.index != 0 {
+		t.Fatalf("reset pending retained state: %+v", p)
+	}
+}
+
+func TestCacheDigestIsOrderIndependentAndContentSensitive(t *testing.T) {
+	now := time.Now()
+	left, right := newCache(1<<20), newCache(1<<20)
+	a := &Message{ID: "a", Topic: "t", Headers: map[string]string{"b": "2", "a": "1"}, Payload: []byte("one"), CreatedAt: now.UnixMilli(), ExpiresAt: now.Add(time.Minute).UnixMilli()}
+	b := &Message{ID: "b", Topic: "t", Payload: []byte("two"), CreatedAt: now.UnixMilli(), ExpiresAt: now.Add(time.Minute).UnixMilli()}
+	_, _ = left.putBatch([]*Message{a, b}, now.UnixMilli())
+	_, _ = right.putBatch([]*Message{
+		{ID: b.ID, Topic: b.Topic, Payload: append([]byte(nil), b.Payload...), CreatedAt: b.CreatedAt, ExpiresAt: b.ExpiresAt},
+		{ID: a.ID, Topic: a.Topic, Headers: map[string]string{"a": "1", "b": "2"}, Payload: append([]byte(nil), a.Payload...), CreatedAt: a.CreatedAt, ExpiresAt: a.ExpiresAt},
+	}, now.UnixMilli())
+	leftDigest := digestMessages(left.digestSnapshot())
+	rightDigest := digestMessages(right.digestSnapshot())
+	right.mu.Lock()
+	right.items["b"].Payload[0] ^= 0xff
+	right.mu.Unlock()
+	changedDigest := digestMessages(right.digestSnapshot())
+	if leftDigest != rightDigest || changedDigest == rightDigest {
+		t.Fatalf("digest mismatch: left=%q right=%q changed=%q", leftDigest, rightDigest, changedDigest)
+	}
+}
+
+func TestCacheDigestRequiresPeerAuthentication(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PeerToken = "peer-token"
+	cfg.ClusterID = "cluster-a"
+	b := New(cfg)
+	defer b.Close()
+
+	unauthorized := httptest.NewRecorder()
+	b.Handler().ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/internal/cache-digest", nil))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d", unauthorized.Code)
+	}
+
+	authorizedRequest := httptest.NewRequest(http.MethodGet, "/internal/cache-digest", nil)
+	authorizedRequest.Header.Set("Spruce-Peer-Token", cfg.PeerToken)
+	authorizedRequest.Header.Set("Spruce-Cluster-ID", cfg.ClusterID)
+	authorized := httptest.NewRecorder()
+	b.Handler().ServeHTTP(authorized, authorizedRequest)
+	if authorized.Code != http.StatusOK || authorized.Body.Len() == 0 {
+		t.Fatalf("authorized status=%d body=%q", authorized.Code, authorized.Body.String())
+	}
+
+	b.digestSlot <- struct{}{}
+	busy := httptest.NewRecorder()
+	b.Handler().ServeHTTP(busy, authorizedRequest.Clone(authorizedRequest.Context()))
+	<-b.digestSlot
+	if busy.Code != http.StatusTooManyRequests {
+		t.Fatalf("busy status=%d", busy.Code)
+	}
+}
+
+func TestPendingDeliverySurvivesCachePressureEviction(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CacheBytes = 512
+	b := New(cfg)
+	defer b.Close()
+	now := time.Now()
+	m := &Message{ID: "pending", Topic: "t", Payload: []byte("original-payload"), ExpiresAt: now.Add(time.Minute).UnixMilli()}
+	if inserted, err := b.cache.put(m, now.UnixMilli()); err != nil || !inserted {
+		t.Fatalf("cache put: inserted=%v err=%v", inserted, err)
+	}
+	s := &subscriber{id: "s", topic: "t", ch: make(chan Delivery, 1)}
+	if !b.sendDelivery(s, m, 1) {
+		t.Fatal("delivery rejected")
+	}
+	d := <-s.ch
+	for i := 0; b.cache.has(m.ID) && i < 20; i++ {
+		_, _ = b.cache.put(&Message{ID: "pressure-" + strconv.Itoa(i), Topic: "t", Payload: make([]byte, 128), ExpiresAt: now.Add(time.Minute).UnixMilli()}, now.UnixMilli())
+	}
+	if b.cache.has(m.ID) || string(d.Payload) != "original-payload" {
+		t.Fatalf("pending payload lost after eviction: cached=%v payload=%q", b.cache.has(m.ID), d.Payload)
+	}
+	b.removeAcks([]string{d.DeliveryID})
+	if len(b.pending) != 0 || len(b.pendingDeadlines) != 0 || b.pendingBytes != 0 {
+		t.Fatalf("pending state remained after ACK: pending=%d deadlines=%d bytes=%d", len(b.pending), len(b.pendingDeadlines), b.pendingBytes)
+	}
+}
+
+func TestPendingTerminalRetryAndNackLifecycle(t *testing.T) {
+	t.Run("max attempts", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.AckDeadline = time.Millisecond
+		cfg.MaxAttempts = 1
+		b := New(cfg)
+		defer b.Close()
+		s := &subscriber{id: "terminal", topic: "t", ch: make(chan Delivery, 1)}
+		m := &Message{ID: "terminal", Topic: "t", Payload: []byte("x"), ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
+		if !b.sendDelivery(s, m, 1) {
+			t.Fatal("delivery rejected")
+		}
+		<-s.ch
+		waitForPendingCount(t, b, 0)
+		if len(b.pendingDeadlines) != 0 || b.pendingBytes != 0 || b.metrics.Dropped.Load() == 0 {
+			t.Fatalf("terminal retry did not converge: deadlines=%d bytes=%d dropped=%d", len(b.pendingDeadlines), b.pendingBytes, b.metrics.Dropped.Load())
+		}
+	})
+	t.Run("nack then ack", func(t *testing.T) {
+		b := New(DefaultConfig())
+		defer b.Close()
+		s := &subscriber{id: "retry", topic: "t", ch: make(chan Delivery, 2)}
+		b.mu.Lock()
+		b.addSubscriberLocked(s)
+		b.mu.Unlock()
+		m := &Message{ID: "retry", Topic: "t", Payload: []byte("x"), ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
+		if !b.sendDelivery(s, m, 1) {
+			t.Fatal("delivery rejected")
+		}
+		first := <-s.ch
+		b.applyNacks([]string{first.DeliveryID})
+		select {
+		case retried := <-s.ch:
+			if retried.Attempt != 2 || retried.MessageID != m.ID {
+				t.Fatalf("invalid retry: %+v", retried)
+			}
+			b.removeAcks([]string{retried.DeliveryID})
+		case <-time.After(2 * time.Second):
+			t.Fatal("NACK was not redelivered")
+		}
+		waitForPendingCount(t, b, 0)
+		if len(b.pendingDeadlines) != 0 || b.pendingBytes != 0 {
+			t.Fatalf("retry ACK did not converge: deadlines=%d bytes=%d", len(b.pendingDeadlines), b.pendingBytes)
+		}
+	})
+}
+
+func waitForPendingCount(t *testing.T, b *Broker, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		b.mu.RLock()
+		got := len(b.pending)
+		b.mu.RUnlock()
+		if got == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("pending count did not reach %d", want)
+}
+
+func TestExpiryBucketsMixedDeadlineUnlinking(t *testing.T) {
+	c := newCache(1 << 20)
+	now := time.Now()
+	messages := []*Message{
+		{ID: "a1", Topic: "t", Payload: []byte("a"), ExpiresAt: now.Add(time.Second).UnixMilli()},
+		{ID: "b1", Topic: "t", Payload: []byte("b"), ExpiresAt: now.Add(2 * time.Second).UnixMilli()},
+		{ID: "a2", Topic: "t", Payload: []byte("a"), ExpiresAt: now.Add(time.Second).UnixMilli()},
+		{ID: "c1", Topic: "t", Payload: []byte("c"), ExpiresAt: now.Add(3 * time.Second).UnixMilli()},
+		{ID: "a3", Topic: "t", Payload: []byte("a"), ExpiresAt: now.Add(time.Second).UnixMilli()},
+	}
+	if _, err := c.putBatch(messages, now.UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	assertCacheExpiryInvariant(t, c)
+	c.mu.Lock()
+	c.removeLocked(messages[2], true)
+	c.removeLocked(messages[4], true)
+	c.mu.Unlock()
+	assertCacheExpiryInvariant(t, c)
+	c.expire(now.Add(1500 * time.Millisecond).UnixMilli())
+	assertCacheExpiryInvariant(t, c)
+	if c.has("a1") || !c.has("b1") || !c.has("c1") {
+		t.Fatal("mixed deadline expiration removed the wrong messages")
 	}
 }
 
@@ -668,7 +1133,9 @@ func TestRejectsMaxMessageAboveSnapshotLimit(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.MaxMessage = 23<<20 + 1
 	defer func() {
-		if recover() == nil { t.Fatal("oversized snapshot configuration was accepted") }
+		if recover() == nil {
+			t.Fatal("oversized snapshot configuration was accepted")
+		}
 	}()
 	_ = New(cfg)
 }
