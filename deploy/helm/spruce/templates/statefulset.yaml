@@ -113,6 +113,7 @@ spec:
             - {name: SPRUCE_MAX_SUBSCRIBER_INFLIGHT_BYTES, value: {{ .Values.config.maxSubscriberInflightBytes | quote }}}
             - {name: SPRUCE_MAX_ATTEMPTS, value: {{ .Values.config.maxAttempts | quote }}}
             - {name: SPRUCE_IDEMPOTENCY_ENTRIES, value: {{ .Values.config.idempotencyEntries | quote }}}
+            - {name: SPRUCE_CHECKPOINT_ENTRIES, value: {{ .Values.config.checkpointEntries | quote }}}
             - {name: SPRUCE_MAX_CONCURRENT_REQUESTS, value: {{ .Values.config.maxConcurrentRequests | quote }}}
             - {name: SPRUCE_MAX_STREAMS, value: {{ .Values.config.maxStreams | quote }}}
             - {name: SPRUCE_MAX_INTERNAL_REQUESTS, value: {{ .Values.config.maxInternalRequests | quote }}}

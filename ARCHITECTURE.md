@@ -28,14 +28,17 @@ is broker-local, so grouped streams require sticky routing by topic and group.
 ## ADR-003: Best-effort delivery with bounded replay
 
 **Decision:** Consumers use binary-framed HTTP streams, explicit ACK/NACK, retries, and
-a timestamp replay cursor. Every queue and in-flight window is bounded by count, bytes,
-or both.
+a timestamp replay cursor. Group ACKs create count-bounded, TTL-bounded in-memory
+checkpoints that are propagated to peers and included in replica bootstrap. Every queue
+and in-flight window is bounded by count, bytes, or both.
 
 **Why:** A slow consumer must not exhaust broker memory or block producers.
 
-**Consequence:** Delivery is not exactly-once or durable at-least-once. Overflow closes
-the stream so clients can reconnect and replay what remains cached. Duplicates and
-ordering changes are valid; first-party clients provide deduplication.
+**Consequence:** Delivery is not exactly-once or durable at-least-once. A reconnecting
+group normally skips completed cached messages, but checkpoint propagation, total
+cluster restart, cache expiry, or capacity eviction can still cause duplicates or loss.
+Overflow closes the stream so clients can reconnect and replay what remains cached.
+First-party clients provide an additional bounded deduplication layer.
 
 ## ADR-004: Opaque payloads and simple HTTP
 

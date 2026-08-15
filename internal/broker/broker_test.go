@@ -956,6 +956,87 @@ func TestGroupReplayArbitratesOneMember(t *testing.T) {
 	}
 }
 
+func TestGroupCheckpointSuppressesCompletedMessage(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	expiresAt := time.Now().Add(time.Minute).UnixMilli()
+	m := &Message{ID: "completed", Topic: "t", Payload: []byte("x"), ExpiresAt: expiresAt}
+	first := &subscriber{id: "first", topic: "t", group: "workers", ch: make(chan Delivery, 1)}
+	b.mu.Lock()
+	b.addSubscriberLocked(first)
+	b.mu.Unlock()
+	if !b.sendDelivery(first, m, 1) {
+		t.Fatal("initial delivery rejected")
+	}
+	delivery := <-first.ch
+	b.removeAcks([]string{delivery.DeliveryID})
+	b.mu.Lock()
+	b.removeSubscriberLocked(first)
+	reconnected := &subscriber{id: "reconnected", topic: "t", group: "workers", ch: make(chan Delivery, 1)}
+	otherGroup := &subscriber{id: "other", topic: "t", group: "other", ch: make(chan Delivery, 1)}
+	b.addSubscriberLocked(reconnected)
+	b.addSubscriberLocked(otherGroup)
+	b.mu.Unlock()
+	b.deliver(m, "", 1)
+	if len(reconnected.ch) != 0 {
+		t.Fatal("completed message was redelivered to the same group")
+	}
+	if len(otherGroup.ch) != 1 {
+		t.Fatal("checkpoint leaked into an unrelated group")
+	}
+}
+
+func TestGroupCheckpointBoundAndExpiry(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CheckpointEntries = 2
+	b := New(cfg)
+	defer b.Close()
+	now := time.Now()
+	b.applyCheckpoints([]groupCheckpoint{
+		{Topic: "t", Group: "g", MessageID: "one", ExpiresAt: now.Add(time.Minute).UnixMilli()},
+		{Topic: "t", Group: "g", MessageID: "two", ExpiresAt: now.Add(time.Minute).UnixMilli()},
+		{Topic: "t", Group: "g", MessageID: "three", ExpiresAt: now.Add(time.Minute).UnixMilli()},
+		{Topic: "t", Group: "g", MessageID: "expired", ExpiresAt: now.Add(-time.Second).UnixMilli()},
+	})
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.checkpointCount != 2 {
+		t.Fatalf("checkpoint count %d exceeds configured bound", b.checkpointCount)
+	}
+	if b.checkpointActiveLocked("t", "g", "one", now.UnixMilli()) {
+		t.Fatal("oldest checkpoint was not evicted")
+	}
+	if !b.checkpointActiveLocked("t", "g", "two", now.UnixMilli()) || !b.checkpointActiveLocked("t", "g", "three", now.UnixMilli()) {
+		t.Fatal("live checkpoints were not retained")
+	}
+	if b.checkpointActiveLocked("t", "g", "expired", now.UnixMilli()) {
+		t.Fatal("expired checkpoint remained active")
+	}
+}
+
+func TestCheckpointBootstrapFromPeer(t *testing.T) {
+	peerCfg := DefaultConfig()
+	peerCfg.PeerToken, peerCfg.ClusterID = "peer", "cluster"
+	peer := New(peerCfg)
+	defer peer.Close()
+	peer.applyCheckpoints([]groupCheckpoint{{Topic: "t", Group: "workers", MessageID: "completed", ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}})
+	server := httptest.NewServer(peer.Handler())
+	defer server.Close()
+	cfg := DefaultConfig()
+	cfg.Peers, cfg.PeerToken, cfg.ClusterID = []string{server.URL}, "peer", "cluster"
+	b := New(cfg)
+	defer b.Close()
+	if err := b.SyncFromPeers(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b.mu.RLock()
+	active := b.checkpointActiveLocked("t", "workers", "completed", time.Now().UnixMilli())
+	b.mu.RUnlock()
+	if !active {
+		t.Fatal("joining replica did not bootstrap the group checkpoint")
+	}
+}
+
 func TestInflightByteLimitRejectsDelivery(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.MaxInflightBytes = 1

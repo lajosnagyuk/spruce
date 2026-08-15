@@ -15,7 +15,9 @@
 ## Delivery and maintenance
 
 Spruce is at-least-once while data remains in bounded replica memory. Client deduplication
-is required when duplicate handler execution is unsafe. Abrupt loss of one broker
+is required when duplicate handler execution is unsafe. Group ACK checkpoints suppress
+completed cached messages after ordinary consumer reconnects and replica replacement,
+but are non-durable and bounded by `config.checkpointEntries`. Abrupt loss of one broker
 delivered zero missing logical messages in the local K3s gate at one message/second; a
 node drain lost 14 of 480 expected deliveries in the final production-candidate run.
 Replacing all three brokers while publishing lost 24-62 of 480 expected deliveries

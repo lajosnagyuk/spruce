@@ -70,6 +70,7 @@ config:
   maxSubscriberInflightBytes: "8388608"
   maxAttempts: "5"
   idempotencyEntries: "65536"
+  checkpointEntries: "65536"
   maxConcurrentRequests: "1024"
   maxStreams: "4096"
   maxInternalRequests: "256"

@@ -8,8 +8,9 @@ It provides opaque binary messages over HTTPS, N producers and consumers, broadc
 
 - Delivery is at least once while a message remains in a replica's bounded cache.
 - Messages are not persisted. Restarting every replica can lose all cached messages.
-- ACK and NACK are replica-local by default; retry is best effort.
+- Group ACK checkpoints are propagated and bootstrapped between replicas on a best-effort basis; NACK retry remains best effort.
 - Consumer groups deliver to one healthy member. Ungrouped subscribers receive broadcasts.
+- Reconnecting consumer groups skip acknowledged messages while their bounded in-memory checkpoints and messages remain cached.
 - Duplicate delivery is expected. First-party clients provide bounded client-side deduplication.
 - Payloads are opaque bytes. Spruce does not inspect schemas or formats.
 

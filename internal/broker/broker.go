@@ -63,6 +63,7 @@ type Config struct {
 	RequireClientAuth          bool
 	RequireAdminAuth           bool
 	IdempotencyEntries         int
+	CheckpointEntries          int
 	MaxConcurrentRequests      int
 	MaxStreams                 int
 	MaxInternalRequests        int
@@ -73,7 +74,7 @@ func DefaultConfig() Config {
 	return Config{CacheBytes: 256 << 20, DefaultTTL: time.Minute, MaxTTL: 24 * time.Hour,
 		MaxMessage: 1 << 20, QueueDepth: 4096, ReplicationQueueBytes: 64 << 20, ActionQueueBytes: 4 << 20,
 		MaxInflightBytes: 64 << 20, MaxSubscriberInflightBytes: 16 << 20, AckDeadline: 30 * time.Second, MaxAttempts: 8,
-		IdempotencyEntries: 65536, MaxConcurrentRequests: 4096, MaxStreams: 1024, MaxInternalRequests: 1024}
+		IdempotencyEntries: 65536, CheckpointEntries: 65536, MaxConcurrentRequests: 4096, MaxStreams: 1024, MaxInternalRequests: 1024}
 }
 
 type Message struct {
@@ -501,8 +502,23 @@ type peer struct {
 }
 
 type actionBatch struct {
-	ids   []string
-	bytes int64
+	ids         []string
+	checkpoints []groupCheckpoint
+	bytes       int64
+}
+
+type groupCheckpoint struct {
+	Topic     string `json:"topic"`
+	Group     string `json:"group"`
+	MessageID string `json:"message_id"`
+	ExpiresAt int64  `json:"expires_at"`
+}
+
+type checkpointScope struct{ topic, group string }
+type checkpointOrderEntry struct {
+	scope     checkpointScope
+	messageID string
+	expiresAt int64
 }
 
 type idempotencyEntry struct {
@@ -542,6 +558,10 @@ type Broker struct {
 	pendingDeadlines pendingHeap
 	idempotency      map[string]*idempotencyEntry
 	idempotencyOrder []idempotencyOrderEntry
+	checkpoints      map[checkpointScope]map[string]int64
+	checkpointOrder  []checkpointOrderEntry
+	checkpointHead   int
+	checkpointCount  int
 	peers            []*peer
 	stop             chan struct{}
 	closeOnce        sync.Once
@@ -598,6 +618,9 @@ func New(cfg Config) *Broker {
 	if cfg.IdempotencyEntries <= 0 {
 		cfg.IdempotencyEntries = DefaultConfig().IdempotencyEntries
 	}
+	if cfg.CheckpointEntries <= 0 {
+		cfg.CheckpointEntries = DefaultConfig().CheckpointEntries
+	}
 	if cfg.MaxConcurrentRequests <= 0 {
 		cfg.MaxConcurrentRequests = DefaultConfig().MaxConcurrentRequests
 	}
@@ -625,7 +648,7 @@ func New(cfg Config) *Broker {
 	b := &Broker{cfg: cfg, cache: newCache(cfg.CacheBytes), mux: http.NewServeMux(),
 		client: &http.Client{Timeout: 5 * time.Second, Transport: peerTransport}, subs: make(map[string]*subscriber),
 		topicBroadcast: make(map[string]map[string]*subscriber), topicGroups: make(map[string]map[string]map[string]*subscriber),
-		pending: make(map[string]*pending), idempotency: make(map[string]*idempotencyEntry), stop: make(chan struct{}),
+		pending: make(map[string]*pending), idempotency: make(map[string]*idempotencyEntry), checkpoints: make(map[checkpointScope]map[string]int64), stop: make(chan struct{}),
 		requestSlots: make(chan struct{}, cfg.MaxConcurrentRequests), streamSlots: make(chan struct{}, cfg.MaxStreams), digestSlot: make(chan struct{}, 1)}
 	b.internalSlots = make(chan struct{}, cfg.MaxInternalRequests)
 	if _, err := rand.Read(b.boot[:]); err != nil {
@@ -718,6 +741,7 @@ func (b *Broker) routes() {
 	b.mux.HandleFunc("POST /v1/deliveries/nack", b.nack)
 	b.mux.HandleFunc("POST /internal/replicate", b.replicate)
 	b.mux.HandleFunc("GET /internal/snapshot", b.snapshot)
+	b.mux.HandleFunc("GET /internal/checkpoints", b.checkpointSnapshot)
 	b.mux.HandleFunc("GET /internal/cache-digest", b.cacheDigest)
 	b.mux.HandleFunc("POST /internal/ack", b.internalAck)
 	b.mux.HandleFunc("POST /internal/nack", b.internalNack)
@@ -1470,6 +1494,60 @@ func (b *Broker) snapshot(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (b *Broker) checkpointSnapshot(w http.ResponseWriter, r *http.Request) {
+	if !b.peerAllowed(r) {
+		problem(w, http.StatusUnauthorized, "invalid_peer")
+		return
+	}
+	now := time.Now().UnixMilli()
+	b.mu.RLock()
+	checkpoints := make([]groupCheckpoint, 0, b.checkpointCount)
+	for scope, entries := range b.checkpoints {
+		for messageID, expiresAt := range entries {
+			if expiresAt > now {
+				checkpoints = append(checkpoints, groupCheckpoint{Topic: scope.topic, Group: scope.group, MessageID: messageID, ExpiresAt: expiresAt})
+			}
+		}
+	}
+	b.mu.RUnlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(checkpoints)
+}
+
+func (b *Broker) syncCheckpointsFromPeer(ctx context.Context, p *peer) error {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, p.url+"/internal/checkpoints", nil)
+	req.Header.Set("Spruce-Peer-Token", b.cfg.PeerToken)
+	req.Header.Set("Spruce-Cluster-ID", b.cfg.ClusterID)
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusNoContent {
+		return nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("checkpoint peer returned %s", resp.Status)
+	}
+	var checkpoints []groupCheckpoint
+	decoder := json.NewDecoder(io.LimitReader(resp.Body, 64<<20))
+	if err := decoder.Decode(&checkpoints); err != nil {
+		return err
+	}
+	if len(checkpoints) > b.cfg.CheckpointEntries {
+		return errors.New("checkpoint snapshot exceeds configured limit")
+	}
+	now := time.Now().UnixMilli()
+	maxExpiry := now + int64(b.cfg.MaxTTL/time.Millisecond)
+	for _, checkpoint := range checkpoints {
+		if !validTopic(checkpoint.Topic) || len(checkpoint.Group) == 0 || len(checkpoint.Group) > 255 || len(checkpoint.MessageID) == 0 || len(checkpoint.MessageID) > 64 || checkpoint.ExpiresAt > maxExpiry {
+			return errors.New("invalid checkpoint snapshot")
+		}
+	}
+	b.applyCheckpoints(checkpoints)
+	return nil
+}
+
 var ErrNoPeerSnapshot = errors.New("no peer snapshot available")
 
 func (b *Broker) SyncFromPeers(ctx context.Context) error {
@@ -1516,6 +1594,11 @@ func (b *Broker) SyncFromPeers(ctx context.Context) error {
 		}
 		if peerAvailable && peerErr != nil {
 			return peerErr
+		}
+		if peerAvailable {
+			if err := b.syncCheckpointsFromPeer(ctx, p); err != nil {
+				return err
+			}
 		}
 	}
 	if available {
@@ -1579,8 +1662,12 @@ func (b *Broker) deliver(m *Message, onlyGroup string, attempt int) {
 			candidates = append(candidates, deliveryCandidate{subscriber: s})
 		}
 	}
+	now := time.Now().UnixMilli()
 	for group, indexed := range b.topicGroups[m.Topic] {
 		if onlyGroup != "" && group != onlyGroup {
+			continue
+		}
+		if b.checkpointActiveLocked(m.Topic, group, m.ID, now) {
 			continue
 		}
 		for _, s := range indexed {
@@ -1801,6 +1888,16 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 	}
 	b.mu.Lock()
 	b.addSubscriberLocked(s)
+	if group != "" {
+		kept := replay[:0]
+		now := time.Now().UnixMilli()
+		for _, m := range replay {
+			if !b.checkpointActiveLocked(topic, group, m.ID, now) {
+				kept = append(kept, m)
+			}
+		}
+		replay = kept
+	}
 	b.mu.Unlock()
 	b.cache.mu.Unlock()
 	defer func() {
@@ -1867,21 +1964,27 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 }
 
 type ackRequest struct {
-	DeliveryIDs []string `json:"delivery_ids"`
+	DeliveryIDs []string          `json:"delivery_ids,omitempty"`
+	Checkpoints []groupCheckpoint `json:"checkpoints,omitempty"`
 }
 
 func decodeAckRequest(r io.Reader) (ackRequest, error) {
 	var a ackRequest
-	decoder := json.NewDecoder(io.LimitReader(r, 64<<10))
+	decoder := json.NewDecoder(io.LimitReader(r, 1<<20))
 	if err := decoder.Decode(&a); err != nil {
 		return a, err
 	}
-	if len(a.DeliveryIDs) == 0 || len(a.DeliveryIDs) > 1024 {
+	if len(a.DeliveryIDs) > 1024 || len(a.Checkpoints) > 1024 || len(a.DeliveryIDs)+len(a.Checkpoints) == 0 {
 		return a, errors.New("invalid delivery ID count")
 	}
 	for _, id := range a.DeliveryIDs {
 		if len(id) == 0 || len(id) > 64 {
 			return a, errors.New("invalid delivery ID")
+		}
+	}
+	for _, checkpoint := range a.Checkpoints {
+		if !validTopic(checkpoint.Topic) || len(checkpoint.Group) == 0 || len(checkpoint.Group) > 255 || len(checkpoint.MessageID) == 0 || len(checkpoint.MessageID) > 64 || checkpoint.ExpiresAt <= 0 {
+			return a, errors.New("invalid checkpoint")
 		}
 	}
 	var trailing any
@@ -1891,10 +1994,83 @@ func decodeAckRequest(r io.Reader) (ackRequest, error) {
 	return a, nil
 }
 
-func (b *Broker) removeAcks(ids []string) {
+func (b *Broker) checkpointActiveLocked(topic, group, messageID string, now int64) bool {
+	scope := checkpointScope{topic: topic, group: group}
+	expiresAt := b.checkpoints[scope][messageID]
+	return expiresAt > now
+}
+
+func (b *Broker) putCheckpointLocked(checkpoint groupCheckpoint, now int64) {
+	if checkpoint.ExpiresAt <= now {
+		return
+	}
+	scope := checkpointScope{topic: checkpoint.Topic, group: checkpoint.Group}
+	indexed := b.checkpoints[scope]
+	if indexed == nil {
+		indexed = make(map[string]int64)
+		b.checkpoints[scope] = indexed
+	}
+	if current := indexed[checkpoint.MessageID]; current >= checkpoint.ExpiresAt {
+		return
+	}
+	if indexed[checkpoint.MessageID] == 0 {
+		b.checkpointCount++
+	}
+	indexed[checkpoint.MessageID] = checkpoint.ExpiresAt
+	b.checkpointOrder = append(b.checkpointOrder, checkpointOrderEntry{scope: scope, messageID: checkpoint.MessageID, expiresAt: checkpoint.ExpiresAt})
+	for b.checkpointCount > b.cfg.CheckpointEntries && b.checkpointHead < len(b.checkpointOrder) {
+		old := b.checkpointOrder[b.checkpointHead]
+		b.checkpointOrder[b.checkpointHead] = checkpointOrderEntry{}
+		b.checkpointHead++
+		if entries := b.checkpoints[old.scope]; entries != nil && entries[old.messageID] == old.expiresAt {
+			delete(entries, old.messageID)
+			b.checkpointCount--
+			if len(entries) == 0 {
+				delete(b.checkpoints, old.scope)
+			}
+		}
+	}
+	if b.checkpointHead > b.cfg.CheckpointEntries && b.checkpointHead*2 > len(b.checkpointOrder) {
+		copy(b.checkpointOrder, b.checkpointOrder[b.checkpointHead:])
+		b.checkpointOrder = b.checkpointOrder[:len(b.checkpointOrder)-b.checkpointHead]
+		b.checkpointHead = 0
+	}
+}
+
+func (b *Broker) applyCheckpoints(checkpoints []groupCheckpoint) {
+	now := time.Now().UnixMilli()
+	b.mu.Lock()
+	for _, checkpoint := range checkpoints {
+		if checkpoint.ExpiresAt <= now+int64(b.cfg.MaxTTL/time.Millisecond) {
+			b.putCheckpointLocked(checkpoint, now)
+		}
+	}
+	b.mu.Unlock()
+}
+
+func (b *Broker) checkpointsForAcks(ids []string) []groupCheckpoint {
+	checkpoints := make([]groupCheckpoint, 0, len(ids))
+	b.mu.RLock()
+	for _, id := range ids {
+		if p := b.pending[id]; p != nil && p.group != "" {
+			checkpoints = append(checkpoints, groupCheckpoint{Topic: p.message.Topic, Group: p.group, MessageID: p.message.ID, ExpiresAt: p.expiresAt})
+		}
+	}
+	b.mu.RUnlock()
+	return checkpoints
+}
+
+func (b *Broker) removeAcks(ids []string) []groupCheckpoint {
+	checkpoints := make([]groupCheckpoint, 0, len(ids))
+	now := time.Now().UnixMilli()
 	b.mu.Lock()
 	for _, id := range ids {
 		if p, ok := b.pending[id]; ok {
+			if p.group != "" {
+				checkpoint := groupCheckpoint{Topic: p.message.Topic, Group: p.group, MessageID: p.message.ID, ExpiresAt: p.expiresAt}
+				b.putCheckpointLocked(checkpoint, now)
+				checkpoints = append(checkpoints, checkpoint)
+			}
 			delete(b.pending, id)
 			if p.deadline.index >= 0 {
 				heap.Remove(&b.pendingDeadlines, p.deadline.index)
@@ -1909,6 +2085,7 @@ func (b *Broker) removeAcks(ids []string) {
 		}
 	}
 	b.mu.Unlock()
+	return checkpoints
 }
 func (b *Broker) ack(w http.ResponseWriter, r *http.Request) {
 	a, err := decodeAckRequest(r.Body)
@@ -1916,11 +2093,16 @@ func (b *Broker) ack(w http.ResponseWriter, r *http.Request) {
 		problem(w, 400, "invalid_ack")
 		return
 	}
-	b.removeAcks(a.DeliveryIDs)
+	if len(a.DeliveryIDs) == 0 {
+		problem(w, 400, "invalid_ack")
+		return
+	}
+	a.Checkpoints = b.checkpointsForAcks(a.DeliveryIDs)
 	if !b.broadcastAction(r.Context(), "ack", a) {
 		problem(w, 503, "peer_ack_unavailable")
 		return
 	}
+	b.removeAcks(a.DeliveryIDs)
 	w.WriteHeader(204)
 }
 func (b *Broker) internalAck(w http.ResponseWriter, r *http.Request) {
@@ -1934,15 +2116,20 @@ func (b *Broker) internalAck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	b.removeAcks(a.DeliveryIDs)
+	b.applyCheckpoints(a.Checkpoints)
 	w.WriteHeader(204)
 }
 func (b *Broker) broadcastAction(ctx context.Context, action string, a ackRequest) bool {
 	ok := true
 	for _, p := range b.peers {
 		ids := append([]string(nil), a.DeliveryIDs...)
+		checkpoints := append([]groupCheckpoint(nil), a.Checkpoints...)
 		bytes := int64(32)
 		for _, id := range ids {
 			bytes += int64(len(id) + 4)
+		}
+		for _, checkpoint := range checkpoints {
+			bytes += int64(len(checkpoint.Topic) + len(checkpoint.Group) + len(checkpoint.MessageID) + 48)
 		}
 		reserved := false
 		for {
@@ -1967,7 +2154,7 @@ func (b *Broker) broadcastAction(ctx context.Context, action string, a ackReques
 			ch = p.nacks
 		}
 		select {
-		case ch <- actionBatch{ids: ids, bytes: bytes}:
+		case ch <- actionBatch{ids: ids, checkpoints: checkpoints, bytes: bytes}:
 		case <-ctx.Done():
 			p.actionBytes.Add(-bytes)
 			return false
@@ -2002,6 +2189,7 @@ func (b *Broker) actionLoop(p *peer, action string, ch <-chan actionBatch) {
 			}
 		}
 		ids := append([]string(nil), first.ids...)
+		checkpoints := append([]groupCheckpoint(nil), first.checkpoints...)
 		queuedBytes := first.bytes
 		draining := true
 		for len(ids) < 1024 && draining {
@@ -2014,12 +2202,13 @@ func (b *Broker) actionLoop(p *peer, action string, ch <-chan actionBatch) {
 					continue
 				}
 				ids = append(ids, more.ids...)
+				checkpoints = append(checkpoints, more.checkpoints...)
 				queuedBytes += more.bytes
 			default:
 				draining = false
 			}
 		}
-		body, _ := json.Marshal(ackRequest{DeliveryIDs: ids})
+		body, _ := json.Marshal(ackRequest{DeliveryIDs: ids, Checkpoints: checkpoints})
 		backoff := 50 * time.Millisecond
 		deadline := time.Now().Add(b.cfg.AckDeadline)
 		sent := false
@@ -2065,6 +2254,10 @@ func (b *Broker) nack(w http.ResponseWriter, r *http.Request) {
 		problem(w, 400, "invalid_nack")
 		return
 	}
+	if len(a.DeliveryIDs) == 0 || len(a.Checkpoints) != 0 {
+		problem(w, 400, "invalid_nack")
+		return
+	}
 	b.applyNacks(a.DeliveryIDs)
 	if !b.broadcastAction(r.Context(), "nack", a) {
 		problem(w, 503, "peer_nack_unavailable")
@@ -2092,6 +2285,10 @@ func (b *Broker) internalNack(w http.ResponseWriter, r *http.Request) {
 	}
 	a, err := decodeAckRequest(r.Body)
 	if err != nil {
+		problem(w, 400, "invalid_nack")
+		return
+	}
+	if len(a.DeliveryIDs) == 0 || len(a.Checkpoints) != 0 {
 		problem(w, 400, "invalid_nack")
 		return
 	}
@@ -2170,6 +2367,7 @@ func (b *Broker) status(w http.ResponseWriter, _ *http.Request) {
 	v["consumers"] = len(b.subs)
 	v["pending_deliveries"] = len(b.pending)
 	v["pending_bytes"] = b.pendingBytes
+	v["consumer_checkpoints"] = b.checkpointCount
 	b.mu.RUnlock()
 	var replicationQueueBytes, actionQueueBytes int64
 	for _, p := range b.peers {
@@ -2249,7 +2447,7 @@ func (b *Broker) prometheus(w http.ResponseWriter, _ *http.Request) {
 	entries, bytes, evicted, expired := len(b.cache.items), b.cache.bytes, b.cache.evicted.Load(), b.cache.expired.Load()
 	b.cache.mu.Unlock()
 	b.mu.RLock()
-	consumers, inflight, pendingBytes := len(b.subs), len(b.pending), b.pendingBytes
+	consumers, inflight, pendingBytes, checkpoints := len(b.subs), len(b.pending), b.pendingBytes, b.checkpointCount
 	b.mu.RUnlock()
 	var replicationQueueBytes, actionQueueBytes int64
 	for _, p := range b.peers {
@@ -2260,10 +2458,10 @@ func (b *Broker) prometheus(w http.ResponseWriter, _ *http.Request) {
 	vals := []struct {
 		name  string
 		value uint64
-	}{{"spruce_publish_total", b.metrics.Published.Load()}, {"spruce_publish_bytes_total", b.metrics.PublishBytes.Load()}, {"spruce_publish_rejected_total", b.metrics.Rejected.Load()}, {"spruce_public_auth_rejected_total", b.metrics.PublicAuthRejected.Load()}, {"spruce_admin_auth_rejected_total", b.metrics.AdminAuthRejected.Load()}, {"spruce_peer_auth_rejected_total", b.metrics.PeerAuthRejected.Load()}, {"spruce_replication_total", b.metrics.Replicated.Load()}, {"spruce_replication_errors_total", b.metrics.ReplicationErrors.Load()}, {"spruce_replication_dropped_messages_total", b.metrics.ReplicationDropped.Load()}, {"spruce_ack_propagation_dropped_ids_total", b.metrics.AckActionDropped.Load()}, {"spruce_nack_propagation_dropped_ids_total", b.metrics.NackActionDropped.Load()}, {"spruce_deliveries_total", b.metrics.Delivered.Load()}, {"spruce_redeliveries_total", b.metrics.Redelivered.Load()}, {"spruce_acks_total", b.metrics.Acked.Load()}, {"spruce_delivery_dropped_total", b.metrics.Dropped.Load()}, {"spruce_cache_evictions_total", evicted}, {"spruce_cache_expired_total", expired}, {"spruce_cache_messages", uint64(entries)}, {"spruce_cache_accounted_bytes", uint64(bytes)}, {"spruce_consumers", uint64(consumers)}, {"spruce_consumer_inflight", uint64(inflight)}, {"spruce_consumer_inflight_bytes", uint64(pendingBytes)}, {"spruce_replication_queue_bytes", uint64(replicationQueueBytes)}, {"spruce_action_queue_bytes", uint64(actionQueueBytes)}}
+	}{{"spruce_publish_total", b.metrics.Published.Load()}, {"spruce_publish_bytes_total", b.metrics.PublishBytes.Load()}, {"spruce_publish_rejected_total", b.metrics.Rejected.Load()}, {"spruce_public_auth_rejected_total", b.metrics.PublicAuthRejected.Load()}, {"spruce_admin_auth_rejected_total", b.metrics.AdminAuthRejected.Load()}, {"spruce_peer_auth_rejected_total", b.metrics.PeerAuthRejected.Load()}, {"spruce_replication_total", b.metrics.Replicated.Load()}, {"spruce_replication_errors_total", b.metrics.ReplicationErrors.Load()}, {"spruce_replication_dropped_messages_total", b.metrics.ReplicationDropped.Load()}, {"spruce_ack_propagation_dropped_ids_total", b.metrics.AckActionDropped.Load()}, {"spruce_nack_propagation_dropped_ids_total", b.metrics.NackActionDropped.Load()}, {"spruce_deliveries_total", b.metrics.Delivered.Load()}, {"spruce_redeliveries_total", b.metrics.Redelivered.Load()}, {"spruce_acks_total", b.metrics.Acked.Load()}, {"spruce_delivery_dropped_total", b.metrics.Dropped.Load()}, {"spruce_cache_evictions_total", evicted}, {"spruce_cache_expired_total", expired}, {"spruce_cache_messages", uint64(entries)}, {"spruce_cache_accounted_bytes", uint64(bytes)}, {"spruce_consumers", uint64(consumers)}, {"spruce_consumer_checkpoints", uint64(checkpoints)}, {"spruce_consumer_inflight", uint64(inflight)}, {"spruce_consumer_inflight_bytes", uint64(pendingBytes)}, {"spruce_replication_queue_bytes", uint64(replicationQueueBytes)}, {"spruce_action_queue_bytes", uint64(actionQueueBytes)}}
 	for _, v := range vals {
 		kind := "counter"
-		if v.name == "spruce_cache_messages" || v.name == "spruce_cache_accounted_bytes" || v.name == "spruce_consumers" || v.name == "spruce_consumer_inflight" || strings.HasSuffix(v.name, "_queue_bytes") || v.name == "spruce_consumer_inflight_bytes" {
+		if v.name == "spruce_cache_messages" || v.name == "spruce_cache_accounted_bytes" || v.name == "spruce_consumers" || v.name == "spruce_consumer_checkpoints" || v.name == "spruce_consumer_inflight" || strings.HasSuffix(v.name, "_queue_bytes") || v.name == "spruce_consumer_inflight_bytes" {
 			kind = "gauge"
 		}
 		_, _ = fmt.Fprintf(w, "# TYPE %s %s\n%s %d\n", v.name, kind, v.name, v.value)
