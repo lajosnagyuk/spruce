@@ -12,6 +12,7 @@ await Run("ack failure cancellation", AckFailureCancellation, failures);
 await Run("terminal drain timeout", TerminalDrainTimeout, failures);
 await Run("basic auth and structured error", BasicAuthAndStructuredError, failures);
 await Run("deduper", DeduperBehavior, failures);
+await Run("subscription duplicate suppression", SubscriptionDuplicateSuppression, failures);
 await Run("retry diagnostics and telemetry", RetryDiagnosticsTelemetry, failures);
 await Run("explicit stream completion", ExplicitStreamCompletion, failures);
 await Run("key ordered subscription", KeyOrderedSubscription, failures);
@@ -125,6 +126,38 @@ static Task DeduperBehavior()
     Assert(!deduper.Seen("a"), "new ID was duplicate");
     Assert(deduper.Seen("a"), "existing ID was not duplicate");
     return Task.CompletedTask;
+}
+
+static async Task SubscriptionDuplicateSuppression()
+{
+    using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+    var calls = 0;
+    var acks = 0;
+    var nacks = 0;
+    var stream = Frames(("d1", "m1", "same", (byte)1), ("d2", "m1", "same", (byte)1), ("d3", "m1", "same", (byte)1));
+    var client = new SpruceClient("https://spruce.invalid", new HttpClient(new StubHandler(request =>
+    {
+        if (request.RequestUri!.AbsolutePath.EndsWith("/ack"))
+        {
+            if (Interlocked.Increment(ref acks) == 2) cancellation.Cancel();
+            return new(HttpStatusCode.NoContent);
+        }
+        if (request.RequestUri.AbsolutePath.EndsWith("/nack")) { Interlocked.Increment(ref nacks); return new(HttpStatusCode.NoContent); }
+        return new(HttpStatusCode.OK) { Content = new StreamContent(stream) };
+    })));
+    try
+    {
+        await client.SubscribeAsync(new SubscribeOptions("t", Concurrency: 1, PreserveKeyOrder: true, Deduper: new Deduper()), (_, _) =>
+        {
+            var attempt = Interlocked.Increment(ref calls);
+            if (attempt == 1) throw new InvalidOperationException("retry me");
+            return Task.CompletedTask;
+        }, cancellation.Token);
+    }
+    catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+    Assert(calls == 2, $"expected failed and successful handler attempts only, got {calls}");
+    Assert(nacks == 1, $"expected one NACK, got {nacks}");
+    Assert(acks == 2, $"expected successful and suppressed duplicate ACKs, got {acks}");
 }
 
 static async Task RetryDiagnosticsTelemetry()

@@ -14,7 +14,8 @@ public sealed record SubscribeOptions(
     int Concurrency = 16,
     int MaxPayloadBytes = 1024 * 1024,
     TimeSpan? DrainTimeout = null,
-    bool PreserveKeyOrder = false);
+    bool PreserveKeyOrder = false,
+    Deduper? Deduper = null);
 public sealed record BrokerStatus(
     [property: JsonPropertyName("messages")] int Messages,
     [property: JsonPropertyName("cache_accounted_bytes")] long CacheAccountedBytes,
@@ -91,8 +92,20 @@ public sealed class Deduper(int maxEntries = 65536, TimeSpan? ttl = null)
 
 public sealed partial class SpruceClient
 {
-    public Task SubscribeAsync(SubscribeOptions options, Func<Delivery, CancellationToken, Task> handler, CancellationToken cancellationToken = default) =>
-        SubscribeAsync(options.Topic, options.Group, handler, cancellationToken, options.Concurrency, options.MaxPayloadBytes, options.Since, options.DrainTimeout, options.PreserveKeyOrder);
+    public Task SubscribeAsync(SubscribeOptions options, Func<Delivery, CancellationToken, Task> handler, CancellationToken cancellationToken = default)
+    {
+        if (options.Deduper is null)
+            return SubscribeAsync(options.Topic, options.Group, handler, cancellationToken, options.Concurrency, options.MaxPayloadBytes, options.Since, options.DrainTimeout, options.PreserveKeyOrder);
+
+        async Task Handle(Delivery delivery, CancellationToken token)
+        {
+            if (options.Deduper.Contains(delivery.MessageId)) return;
+            await handler(delivery, token).ConfigureAwait(false);
+            options.Deduper.Mark(delivery.MessageId);
+        }
+
+        return SubscribeAsync(options.Topic, options.Group, Handle, cancellationToken, options.Concurrency, options.MaxPayloadBytes, options.Since, options.DrainTimeout, options.PreserveKeyOrder);
+    }
 
     public async IAsyncEnumerable<ConsumableDelivery> ReadAllAsync(SubscribeOptions options, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
