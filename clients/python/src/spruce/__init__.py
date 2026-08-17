@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections import deque
 import json
 import queue
 import random
@@ -12,13 +13,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Iterator, Mapping, Sequence
 
 MAX_MESSAGE_BYTES = 1 << 20
 MAX_BATCH_BYTES = 16 << 20
 MAX_BATCH_MESSAGES = 4096
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 _DEFAULT_TIMEOUT = object()
 
 
@@ -29,6 +30,10 @@ class SpruceError(Exception):
 
 
 class HandlerPanicError(RuntimeError):
+    pass
+
+
+class HandlerDrainTimeoutError(TimeoutError):
     pass
 
 
@@ -54,6 +59,11 @@ class PublishOptions:
 class PublishResult:
     id: str
     replicated: bool = False
+
+@dataclass(frozen=True)
+class BatchEntry:
+    payload: bytes
+    key: str = ""
 
 
 @dataclass(frozen=True)
@@ -180,15 +190,20 @@ class Client:
         raise RuntimeError("unreachable")
 
     def publish_batch(self, topic: str, payloads: Sequence[bytes], options: PublishOptions = PublishOptions()) -> list[PublishResult]:
-        if not payloads or len(payloads) > MAX_BATCH_MESSAGES: raise ValueError("batch message count is outside protocol limits")
+        return self.publish_batch_entries(topic, [BatchEntry(bytes(payload), options.key) for payload in payloads], options)
+
+    def publish_batch_entries(self, topic: str, entries: Sequence[BatchEntry], options: PublishOptions = PublishOptions()) -> list[PublishResult]:
+        if not entries or len(entries) > MAX_BATCH_MESSAGES: raise ValueError("batch message count is outside protocol limits")
         if options.idempotency_key or options.ack not in ("", "local"): raise ValueError("options are incompatible with batch publishing")
-        total = sum(4 + len(item) for item in payloads)
-        if total > MAX_BATCH_BYTES or any(len(item) > MAX_MESSAGE_BYTES for item in payloads): raise ValueError("batch exceeds protocol limits")
-        body = b"".join(struct.pack(">I", len(item)) + bytes(item) for item in payloads)
+        encoded = [(entry.key.encode(), bytes(entry.payload)) for entry in entries]
+        total = sum(6 + len(key) + len(payload) for key, payload in encoded)
+        if total > MAX_BATCH_BYTES or any(len(key) > 8192 or len(payload) > MAX_MESSAGE_BYTES for key, payload in encoded): raise ValueError("batch exceeds protocol limits")
+        body = b"".join(struct.pack(">H", len(key)) + key + struct.pack(">I", len(payload)) + payload for key, payload in encoded)
         path = f"/v1/topics/{urllib.parse.quote(topic, safe='')}/batches"
-        with self._request("POST", path, body, self._option_headers(options), operation="publish_batch") as response:
+        headers = self._option_headers(replace(options, key="")); headers["Spruce-Batch-Version"] = "2"
+        with self._request("POST", path, body, headers, operation="publish_batch") as response:
             ids = json.load(response).get("ids", [])
-        if len(ids) != len(payloads): raise ValueError("Spruce returned an invalid batch result count")
+        if len(ids) != len(entries): raise ValueError("Spruce returned an invalid batch result count")
         return [PublishResult(item) for item in ids]
 
     def _get(self, path: str, *, operation: str = "get") -> bytes:
@@ -230,6 +245,12 @@ class Client:
         return Delivery(metadata.get("delivery_id", ""), metadata.get("message_id", ""), metadata.get("topic", ""), payload, metadata.get("key", ""), metadata.get("headers", {}), metadata.get("created_at", 0), metadata.get("attempt", 0))
 
     def subscribe(self, options: SubscribeOptions, handler: Callable[[Delivery], object], stop: threading.Event | None = None) -> None:
+        """Consume until stopped; handlers must be bounded or cooperatively cancellable.
+
+        Python cannot forcibly terminate a running synchronous handler. drain_timeout
+        bounds subscribe(), but a non-cooperative handler retains its worker until it
+        returns.
+        """
         if not options.topic: raise ValueError("topic is required")
         if not 1 <= options.concurrency <= 1024 or not 1 <= options.max_payload_bytes <= 64 << 20: raise ValueError("invalid subscription limits")
         stop = stop or threading.Event(); since, backoff = options.since, 0.05
@@ -246,37 +267,66 @@ class Client:
                     since = max(since, completed.pop(next_progress)); next_progress += 1
             try:
                 response = self._request("GET", "/v1/subscriptions/stream?" + urllib.parse.urlencode(query), timeout=None, operation="subscribe")
+                connection_done = threading.Event()
                 def interrupt() -> None:
-                    stop.wait()
-                    if stop.is_set(): response.close()
-                threading.Thread(target=interrupt, daemon=True).start()
-                with response, ThreadPoolExecutor(max_workers=options.concurrency) as workers:
-                    while not stop.is_set():
-                        delivery = self._read_delivery(response, options.max_payload_bytes)
-                        if not delivery.delivery_id: continue
-                        sequence += 1
-                        def consume(item=delivery):
-                            try: handler(item)
-                            except Exception:
-                                nacks.submit(item.delivery_id); return item.created_at
-                            except BaseException as exc:
-                                nacks.submit(item.delivery_id); raise HandlerPanicError(str(exc)) from exc
-                            acks.submit(item.delivery_id); return item.created_at
-                        futures.append((sequence, workers.submit(consume)))
-                        if len(futures) >= options.concurrency * 4:
-                            done, _ = wait([future for _, future in futures], timeout=options.drain_timeout)
-                            pending = []
-                            for index, future in futures:
-                                if future in done: completed[index] = future.result()
-                                else: pending.append((index, future))
-                            futures = pending; advance()
+                    while not connection_done.wait(.05):
+                        if stop.is_set():
+                            response.close()
+                            return
+                threading.Thread(target=interrupt, name="spruce-subscription-interrupt", daemon=True).start()
+                workers = ThreadPoolExecutor(max_workers=options.concurrency)
+                accept_completions = threading.Event()
+                accept_completions.set()
+                try:
+                  stream_error = None
+                  try:
+                    with response:
+                      while not stop.is_set():
+                          delivery = self._read_delivery(response, options.max_payload_bytes)
+                          if not delivery.delivery_id: continue
+                          sequence += 1
+                          def consume(item=delivery):
+                              try: handler(item)
+                              except Exception:
+                                  if accept_completions.is_set(): nacks.submit(item.delivery_id)
+                                  return item.created_at
+                              except BaseException as exc:
+                                  if accept_completions.is_set(): nacks.submit(item.delivery_id)
+                                  raise HandlerPanicError(str(exc)) from exc
+                              if accept_completions.is_set(): acks.submit(item.delivery_id)
+                              return item.created_at
+                          futures.append((sequence, workers.submit(consume)))
+                          if len(futures) >= options.concurrency * 4:
+                              done, _ = wait([future for _, future in futures], timeout=options.drain_timeout)
+                              pending = []
+                              for index, future in futures:
+                                  if future in done: completed[index] = future.result()
+                                  else: pending.append((index, future))
+                              futures = pending; advance()
+                  except BaseException as exc:
+                      stream_error = exc
+                  finally:
+                      connection_done.set()
+                  # Drain before executor shutdown: __exit__ waits without a bound.
+                  deadline = time.monotonic() + options.drain_timeout
+                  for index, future in futures:
+                      try:
+                          completed[index] = future.result(timeout=max(0, deadline - time.monotonic()))
+                          advance()
+                      except TimeoutError as exc:
+                          if future.done():
+                              raise
+                          raise HandlerDrainTimeoutError("Spruce handlers did not stop before drain timeout") from exc
+                  if stream_error is not None:
+                      raise stream_error
+                finally:
+                    accept_completions.clear()
+                    workers.shutdown(wait=False, cancel_futures=True)
             except SpruceError as exc:
                 if 400 <= exc.status_code < 500 and exc.status_code not in (408, 429): raise
             except HandlerPanicError: raise
+            except HandlerDrainTimeoutError: raise
             except (EOFError, OSError, urllib.error.URLError): pass
-            for index, future in futures:
-                try: completed[index] = future.result(timeout=options.drain_timeout); advance()
-                except TimeoutError as exc: raise TimeoutError("Spruce handlers did not stop before drain timeout") from exc
             if stop.wait(random.uniform(backoff / 2, backoff * 1.5)): return
             backoff = min(2.0, backoff * 2)
         finally:
@@ -310,13 +360,20 @@ class ConsumableDelivery:
 
 class _AckBatcher:
     def __init__(self, client: Client, action: str) -> None:
-        self.client, self.action, self.items = client, action, queue.Queue(1024)
+        self.client, self.action, self.items, self.closed, self.close_lock = client, action, queue.Queue(1024), threading.Event(), threading.Lock()
         self.thread = threading.Thread(target=self._run, daemon=True); self.thread.start()
     def submit(self, delivery_id: str) -> None:
-        result: queue.Queue = queue.Queue(1); self.items.put((delivery_id, result)); error = result.get()
+        result: queue.Queue = queue.Queue(1)
+        with self.close_lock:
+            if self.closed.is_set(): raise RuntimeError("ACK batcher is closed")
+            self.items.put((delivery_id, result))
+        error = result.get()
         if error: raise error
     def close(self) -> None:
-        self.items.put(None); self.thread.join(10)
+        with self.close_lock:
+            self.closed.set()
+            self.items.put(None)
+        self.thread.join(10)
     def _run(self) -> None:
         while True:
             first = self.items.get()
@@ -336,14 +393,14 @@ class _AckBatcher:
 class Deduper:
     def __init__(self, max_entries: int = 65536, ttl: float = 300.0) -> None:
         if max_entries < 1 or ttl <= 0: raise ValueError("invalid deduper limits")
-        self.max_entries, self.ttl, self._seen, self._order, self._lock = max_entries, ttl, {}, [], threading.Lock()
+        self.max_entries, self.ttl, self._seen, self._order, self._lock = max_entries, ttl, {}, deque(), threading.Lock()
     def seen(self, message_id: str) -> bool:
         with self._lock:
             now = time.monotonic()
             if self._seen.get(message_id, 0) > now: return True
             until = now + self.ttl; self._seen[message_id] = until; self._order.append((message_id, until))
             while len(self._order) > self.max_entries:
-                old, expiry = self._order.pop(0)
+                old, expiry = self._order.popleft()
                 if self._seen.get(old) == expiry: self._seen.pop(old, None)
             return False
 
@@ -363,7 +420,8 @@ class ProducerBatcher:
         self._thread = threading.Thread(target=self._run, daemon=True); self._thread.start()
     def publish(self, topic: str, payload: bytes, options: PublishOptions = PublishOptions(), timeout: float | None = None) -> PublishResult:
         if self._closed: raise RuntimeError("producer batcher is closed")
-        if not topic or len(payload) > MAX_MESSAGE_BYTES or len(payload) + 4 > self.options.max_bytes: raise ValueError("invalid batch publish")
+        key_bytes = len(options.key.encode())
+        if not topic or len(payload) > MAX_MESSAGE_BYTES or key_bytes > 8192 or len(payload) + key_bytes + 6 > self.options.max_bytes: raise ValueError("invalid batch publish")
         if options.idempotency_key or options.ack not in ("", "local"): raise ValueError("options are incompatible with batch publishing")
         result: queue.Queue = queue.Queue(1); self._queue.put((topic, bytes(payload), options, result), timeout=timeout); value = result.get(timeout=timeout)
         if isinstance(value, BaseException): raise value
@@ -382,13 +440,13 @@ class ProducerBatcher:
     def __enter__(self): return self
     def __exit__(self, exc_type, exc, tb): self.close()
     def _run(self) -> None:
-        pending, deadline = [], None
+        pending, pending_bytes, deadline = [], 0, None
         def flush():
-            nonlocal pending, deadline
+            nonlocal pending, pending_bytes, deadline
             if not pending: return None
-            batch, pending, deadline = pending, [], None
+            batch, pending, pending_bytes, deadline = pending, [], 0, None
             try:
-                values = self.client.publish_batch(batch[0][0], [item[1] for item in batch], batch[0][2])
+                values = self.client.publish_batch_entries(batch[0][0], [BatchEntry(item[1], item[2].key) for item in batch], replace(batch[0][2], key=""))
                 for item, value in zip(batch, values): item[3].put(value)
                 return None
             except BaseException as exc:
@@ -400,12 +458,13 @@ class ProducerBatcher:
             except queue.Empty: flush(); continue
             if item[0] is False: flush(); return
             if item[0] is None: item[3].put(flush()); continue
-            size = sum(4 + len(value[1]) for value in pending)
-            compatible = not pending or (pending[0][0] == item[0] and pending[0][2] == item[2])
-            if pending and (not compatible or len(pending) >= self.options.max_messages or size + 4 + len(item[1]) > self.options.max_bytes): flush()
+            item_bytes = 6 + len(item[2].key.encode()) + len(item[1])
+            compatible = not pending or (pending[0][0] == item[0] and replace(pending[0][2], key="") == replace(item[2], key=""))
+            if pending and (not compatible or len(pending) >= self.options.max_messages or pending_bytes + item_bytes > self.options.max_bytes): flush()
             pending.append(item)
+            pending_bytes += item_bytes
             if len(pending) == 1: deadline = time.monotonic() + self.options.max_delay
-            if len(pending) >= self.options.max_messages or sum(4 + len(value[1]) for value in pending) >= self.options.max_bytes: flush()
+            if len(pending) >= self.options.max_messages or pending_bytes >= self.options.max_bytes: flush()
 
 
-__all__ = ["BatcherOptions", "BrokerStatus", "Client", "ClientEvent", "ConsumableDelivery", "Deduper", "Delivery", "HandlerPanicError", "ProducerBatcher", "PublishOptions", "PublishResult", "RetryOptions", "SpruceError", "SubscribeOptions", "__version__"]
+__all__ = ["BatchEntry", "BatcherOptions", "BrokerStatus", "Client", "ClientEvent", "ConsumableDelivery", "Deduper", "Delivery", "HandlerDrainTimeoutError", "HandlerPanicError", "ProducerBatcher", "PublishOptions", "PublishResult", "RetryOptions", "SpruceError", "SubscribeOptions", "__version__"]

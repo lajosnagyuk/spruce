@@ -9,6 +9,7 @@ namespace Spruce;
 public sealed record PublishOptions(string? Key = null, TimeSpan? Ttl = null, string? ContentType = null, string? Ack = null, string? IdempotencyKey = null, string? ProducerId = null);
 public sealed record PublishResult([property: JsonPropertyName("id")] string Id, [property: JsonPropertyName("replicated")] bool Replicated);
 public sealed record BatchResult([property: JsonPropertyName("ids")] string[] Ids);
+public sealed record BatchEntry(ReadOnlyMemory<byte> Payload, string? Key = null);
 public sealed record Delivery(
     [property: JsonPropertyName("delivery_id")] string DeliveryId,
     [property: JsonPropertyName("message_id")] string MessageId,
@@ -70,30 +71,37 @@ public sealed partial class SpruceClient : IDisposable
     }
 
     public async Task<BatchResult> PublishBatchAsync(string topic, IReadOnlyList<ReadOnlyMemory<byte>> payloads, PublishOptions? options = null, CancellationToken cancellationToken = default)
+        => await PublishBatchAsync(topic, payloads.Select(payload => new BatchEntry(payload, options?.Key)).ToArray(), options, cancellationToken);
+
+    public async Task<BatchResult> PublishBatchAsync(string topic, IReadOnlyList<BatchEntry> entries, PublishOptions? options = null, CancellationToken cancellationToken = default)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(_requestTimeout);
-        if (payloads.Count == 0) throw new ArgumentException("Batch is empty", nameof(payloads));
-        if (payloads.Count > 4096) throw new ArgumentException("Batch exceeds 4096 messages", nameof(payloads));
+        if (entries.Count == 0) throw new ArgumentException("Batch is empty", nameof(entries));
+        if (entries.Count > 4096) throw new ArgumentException("Batch exceeds 4096 messages", nameof(entries));
         options ??= new();
         if (options.Ack is not null and not "local") throw new ArgumentException("Batch only supports local acknowledgement", nameof(options));
         if (options.IdempotencyKey is not null) throw new ArgumentException("Batch idempotency is not supported", nameof(options));
-        var total = payloads.Aggregate(0L, (sum, payload) => checked(sum + 4 + payload.Length));
-        if (payloads.Any(payload => payload.Length > 1024 * 1024)) throw new ArgumentException("A batch message exceeds 1 MiB", nameof(payloads));
-        if (total > 16 * 1024 * 1024) throw new ArgumentException("Batch exceeds 16 MiB", nameof(payloads));
+        var total = entries.Aggregate(0L, (sum, entry) => checked(sum + 6 + entry.Payload.Length + System.Text.Encoding.UTF8.GetByteCount(entry.Key ?? "")));
+        if (entries.Any(entry => entry.Payload.Length > 1024 * 1024 || System.Text.Encoding.UTF8.GetByteCount(entry.Key ?? "") > 8 * 1024)) throw new ArgumentException("A batch entry exceeds its limit", nameof(entries));
+        if (total > 16 * 1024 * 1024) throw new ArgumentException("Batch exceeds 16 MiB", nameof(entries));
         using var body = new MemoryStream(checked((int)total));
         var size = new byte[4];
-        foreach (var payload in payloads)
+        foreach (var entry in entries)
         {
-            BinaryPrimitives.WriteUInt32BigEndian(size, checked((uint)payload.Length));
+            var key = System.Text.Encoding.UTF8.GetBytes(entry.Key ?? "");
+            var keySize = new byte[2]; BinaryPrimitives.WriteUInt16BigEndian(keySize, checked((ushort)key.Length));
+            await body.WriteAsync(keySize, timeout.Token);
+            await body.WriteAsync(key, timeout.Token);
+            BinaryPrimitives.WriteUInt32BigEndian(size, checked((uint)entry.Payload.Length));
             await body.WriteAsync(size, timeout.Token);
-            await body.WriteAsync(payload, timeout.Token);
+            await body.WriteAsync(entry.Payload, timeout.Token);
         }
         body.Position = 0;
         using var request = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/v1/topics/{Uri.EscapeDataString(topic)}/batches") { Content = new StreamContent(body) };
+        request.Headers.Add("Spruce-Batch-Version", "2");
         Authorize(request);
         if (options.ContentType is not null) request.Content.Headers.ContentType = new(options.ContentType);
-        if (options.Key is not null) request.Headers.Add("Spruce-Key", options.Key);
         if (options.Ttl is not null) request.Headers.Add("Spruce-TTL", $"{options.Ttl.Value.TotalMilliseconds}ms");
         using var response = await SendAsync(request, HttpCompletionOption.ResponseContentRead, timeout.Token, "publish_batch");
         await EnsureSuccessAsync(response, timeout.Token);

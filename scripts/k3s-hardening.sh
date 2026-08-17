@@ -68,10 +68,10 @@ wait "$traffic"
 run_case spruce-scale-down -topics 6 -messages 20 -producers 10 -broadcast-consumers 3 -group-consumers 5 -publish-rate 1 -pause-after 1 -pause-for 240s -ttl 10m -dedupe -max-missing 0 -max-duplicates 0 -timeout 480s &
 traffic=$!
 sleep 2
-helm --kube-context "$context" -n "$namespace" upgrade "$release" deploy/helm/spruce --reuse-values --set replicaCount=1 --set benchmark.enabled=false --set gateway.allowInsecureClientTransport=true --wait --timeout 180s >/dev/null
+helm --kube-context "$context" -n "$namespace" upgrade "$release" deploy/helm/spruce --reuse-values --set replicaCount=1 --set podDisruptionBudget.maxUnavailable=0 --set benchmark.enabled=false --set gateway.allowInsecureClientTransport=true --wait --timeout 180s >/dev/null
 wait "$traffic"
 run_case spruce-scale-one -topics 3 -messages 500 -producers 4 -broadcast-consumers 2 -group-consumers 3 -dedupe -max-missing 0 -max-duplicates 0 -timeout 90s
-helm --kube-context "$context" -n "$namespace" upgrade "$release" deploy/helm/spruce --reuse-values --set replicaCount=3 --set benchmark.enabled=false --set gateway.allowInsecureClientTransport=true --wait --timeout 180s >/dev/null
+helm --kube-context "$context" -n "$namespace" upgrade "$release" deploy/helm/spruce --reuse-values --set replicaCount=3 --set podDisruptionBudget.maxUnavailable=1 --set benchmark.enabled=false --set gateway.allowInsecureClientTransport=true --wait --timeout 180s >/dev/null
 
 trap 'kubectl --context "$context" uncordon spruce-k3s-2 >/dev/null 2>&1 || true' EXIT INT TERM
 run_case spruce-node-drain -topics 6 -messages 20 -producers 10 -broadcast-consumers 3 -group-consumers 5 -publish-rate 1 -ttl 10m -dedupe -max-missing 20 -max-duplicates 0 -timeout 240s &

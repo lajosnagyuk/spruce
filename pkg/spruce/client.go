@@ -47,6 +47,7 @@ type PublishResult struct {
 type BatchResult struct {
 	IDs []string `json:"ids"`
 }
+type BatchEntry struct { Payload []byte; Key string }
 type Delivery struct {
 	DeliveryID string            `json:"delivery_id"`
 	MessageID  string            `json:"message_id"`
@@ -222,30 +223,40 @@ func (c *Client) PublishRetry(ctx context.Context, topic string, payload []byte,
 }
 
 func (c *Client) PublishBatch(ctx context.Context, topic string, payloads [][]byte, o PublishOptions) (BatchResult, error) {
+    entries := make([]BatchEntry, len(payloads))
+    for i, payload := range payloads { entries[i] = BatchEntry{Payload: payload, Key: o.Key} }
+    return c.PublishBatchEntries(ctx, topic, entries, o)
+}
+
+func (c *Client) PublishBatchEntries(ctx context.Context, topic string, entries []BatchEntry, o PublishOptions) (BatchResult, error) {
 	started := time.Now()
 	status := 0
 	var finalErr error
 	defer func() { c.emit("publish_batch", started, status, finalErr) }()
 	var out BatchResult
-	if len(payloads) == 0 || len(payloads) > 4096 {
-		if len(payloads) == 0 {
+	if len(entries) == 0 || len(entries) > 4096 {
+		if len(entries) == 0 {
 			return out, errors.New("batch is empty")
 		}
 		return out, errors.New("batch exceeds 4096 messages")
 	}
 	var body bytes.Buffer
 	total := 0
-	for _, payload := range payloads {
-		if len(payload) > 1<<20 || total > (16<<20)-4-len(payload) {
+	for _, entry := range entries {
+		key := []byte(entry.Key)
+		if len(key) > 8<<10 || len(entry.Payload) > 1<<20 || total > (16<<20)-6-len(key)-len(entry.Payload) {
 			return out, errors.New("batch exceeds protocol limits")
 		}
-		total += 4 + len(payload)
+		total += 6 + len(key) + len(entry.Payload)
 	}
 	body.Grow(total)
-	for _, payload := range payloads {
+	for _, entry := range entries {
+		payload, key := entry.Payload, []byte(entry.Key)
 		if len(payload) > int(^uint32(0)) {
 			return out, errors.New("payload is too large")
 		}
+		var keySize [2]byte
+		binary.BigEndian.PutUint16(keySize[:], uint16(len(key))); _, _ = body.Write(keySize[:]); _, _ = body.Write(key)
 		var size [4]byte
 		binary.BigEndian.PutUint32(size[:], uint32(len(payload)))
 		_, _ = body.Write(size[:])
@@ -255,9 +266,7 @@ func (c *Client) PublishBatch(ctx context.Context, topic string, payloads [][]by
 	if err != nil {
 		return out, err
 	}
-	if o.Key != "" {
-		req.Header.Set("Spruce-Key", o.Key)
-	}
+	req.Header.Set("Spruce-Batch-Version", "2")
 	if o.ContentType != "" {
 		req.Header.Set("Content-Type", o.ContentType)
 	}

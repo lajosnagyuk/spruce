@@ -5,6 +5,8 @@ using Spruce;
 
 var failures = new List<string>();
 await Run("invalid batch", RejectsInvalidBatch, failures);
+await Run("batch v2 per-entry keys", BatchV2PerEntryKeys, failures);
+await Run("batcher coalesces keys and skips queued cancellation", BatcherKeysAndCancellation, failures);
 await Run("bearer token", SendsBearerToken, failures);
 await Run("permanent subscription error", SurfacesPermanentSubscriptionErrors, failures);
 await Run("transient subscription retry", RetriesTransientSubscriptionErrors, failures);
@@ -32,6 +34,44 @@ static async Task RejectsInvalidBatch()
     var tooMany = Enumerable.Repeat<ReadOnlyMemory<byte>>(ReadOnlyMemory<byte>.Empty, 4097).ToArray();
     await Expect<ArgumentException>(() => client.PublishBatchAsync("t", tooMany));
     await Expect<ArgumentException>(() => client.PublishBatchAsync("t", [new byte[1]], new(Ack: "one-peer")));
+}
+
+static async Task BatchV2PerEntryKeys()
+{
+    byte[]? wire = null;
+    string? version = null;
+    var client = new SpruceClient("https://spruce.invalid", new HttpClient(new StubHandler(request =>
+    {
+        version = request.Headers.GetValues("Spruce-Batch-Version").Single();
+        wire = request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+        return new(HttpStatusCode.Accepted) { Content = new StringContent("{\"ids\":[\"1\",\"2\"]}") };
+    })));
+    await client.PublishBatchAsync("t", [new BatchEntry(new byte[] { 1 }, "a"), new BatchEntry(new byte[] { 2 }, "b")]);
+    Assert(version == "2", "batch v2 header missing");
+    Assert(wire is not null && wire.SequenceEqual(new byte[] { 0,1,(byte)'a',0,0,0,1,1, 0,1,(byte)'b',0,0,0,1,2 }), "unexpected batch v2 wire");
+}
+
+static async Task BatcherKeysAndCancellation()
+{
+    var requests = 0;
+    byte[]? wire = null;
+    var client = new SpruceClient("https://spruce.invalid", new HttpClient(new StubHandler(request =>
+    {
+        Interlocked.Increment(ref requests);
+        wire = request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+        return new(HttpStatusCode.Accepted) { Content = new StringContent("{\"ids\":[\"1\",\"2\"]}") };
+    })));
+    await using var batcher = new ProducerBatcher(client, new(MaxMessages: 2, MaxDelay: TimeSpan.FromSeconds(1)));
+    var first = batcher.PublishAsync("t", new byte[] { 1 }, new(Key: "event-1"));
+    var second = batcher.PublishAsync("t", new byte[] { 2 }, new(Key: "event-2"));
+    await Task.WhenAll(first, second);
+    Assert(requests == 1, $"unique keys did not coalesce: {requests}");
+    Assert(wire is not null && Encoding.UTF8.GetString(wire).Contains("event-1") && Encoding.UTF8.GetString(wire).Contains("event-2"), "per-entry keys missing from batch");
+
+    using var cancelled = new CancellationTokenSource();
+    cancelled.Cancel();
+    await Expect<OperationCanceledException>(() => batcher.PublishAsync("t", new byte[] { 3 }, new(Key: "cancelled"), cancelled.Token));
+    Assert(requests == 1, "already-cancelled item reached the wire");
 }
 
 static async Task SendsBearerToken()

@@ -5,6 +5,12 @@ binary batches, bounded automatic producer batching, idempotent retry, concurren
 streaming consumption, batched ACK/NACK, explicit completion, deduplication,
 diagnostics, telemetry, Bearer and Basic authentication.
 
+Subscription handlers are synchronous and must be bounded or cooperatively cancellable.
+`drain_timeout` bounds `subscribe()` shutdown, but Python cannot forcibly terminate a
+handler that never returns; it retains its worker thread until it cooperates. Use
+`deliveries()` for caller-controlled completion, or have long-running handlers observe
+an application cancellation event.
+
 ```python
 from spruce import Client, PublishOptions, SubscribeOptions
 
@@ -15,4 +21,5 @@ client.subscribe(SubscribeOptions("orders", group="billing"), lambda delivery: h
 
 Credentials are rejected over plaintext HTTP unless `allow_insecure_credentials=True`
 is explicitly selected for isolated development. Pass an `ssl.SSLContext` through
-`ssl_context` for private roots, mTLS, or stricter trust policy.
+`ssl_context` to trust a private CA or apply a stricter server-certificate policy. The
+client does not provide a first-class client-certificate/mTLS configuration API.

@@ -1,9 +1,17 @@
 #!/bin/sh
 set -eu
 
-context=${KUBE_CONTEXT:-$(kubectl config current-context)}; namespace=${SPRUCE_NAMESPACE:-spruce}; release=${SPRUCE_RELEASE:-spruce}
+namespace=${SPRUCE_NAMESPACE:-spruce}; release=${SPRUCE_RELEASE:-spruce}
 case "$release" in *spruce*) default_fullname=$release;; *) default_fullname=${release}-spruce;; esac
 fullname=${SPRUCE_FULLNAME:-$default_fullname}
+cluster_domain=${SPRUCE_CLUSTER_DOMAIN:-cluster.local}
+extra_dns=${SPRUCE_TLS_EXTRA_DNS:-}
+service_port=${SPRUCE_SERVICE_PORT:-8080}
+if test "${SPRUCE_PRINT_TARGETS:-0}" = 1; then
+  printf 'publish_url=https://%s-0.%s-headless.%s.svc.%s:%s\n' "$fullname" "$fullname" "$namespace" "$cluster_domain" "$service_port"
+  exit 0
+fi
+context=${KUBE_CONTEXT:-$(kubectl config current-context)}
 secret=${SPRUCE_TLS_SECRET:-${fullname}-tls}; auth=${SPRUCE_AUTH_SECRET:-${fullname}-auth}
 work=${TMPDIR:-/tmp}/spruce-tls-rotation-$$
 mkdir -m 700 "$work"
@@ -12,7 +20,7 @@ committed=0
 cleanup() {
   if test "$committed" -ne 1; then
     kubectl --context "$context" apply -f "$work/original-secret.yaml" >/dev/null 2>&1 || true
-    helm --kube-context "$context" -n "$namespace" upgrade "$release" deploy/helm/spruce --reuse-values --set benchmark.enabled=false --set gateway.allowInsecureClientTransport=true --wait --timeout 8m >/dev/null 2>&1 || true
+    helm --kube-context "$context" -n "$namespace" upgrade "$release" deploy/helm/spruce --reuse-values --set benchmark.enabled=false --wait --timeout 8m >/dev/null 2>&1 || true
   fi
   find "$work" -type f -exec sh -c 'for f do : >"$f"; done' sh {} +
   find "$work" -type f -delete
@@ -28,9 +36,9 @@ distinguished_name=dn
 req_extensions=ext
 prompt=no
 [dn]
-CN=$fullname-headless.$namespace.svc.cluster.local
+CN=$fullname-headless.$namespace.svc.$cluster_domain
 [ext]
-subjectAltName=DNS:$fullname-headless.$namespace.svc.cluster.local,DNS:*.$fullname-headless.$namespace.svc.cluster.local
+subjectAltName=DNS:$fullname-headless.$namespace.svc.$cluster_domain,DNS:*.$fullname-headless.$namespace.svc.$cluster_domain${extra_dns:+,DNS:$extra_dns}
 extendedKeyUsage=serverAuth
 EOF
 openssl req -new -newkey rsa:2048 -nodes -keyout "$work/new.key" -out "$work/new.csr" -config "$work/leaf.cnf" >/dev/null 2>&1
@@ -49,27 +57,20 @@ apply_tls() {
   test "$(awk '/  tls.key:/{print length($2)}' "$manifest")" -gt 100
   kubectl --context "$context" apply -f "$manifest" >/dev/null
 }
-roll() { helm --kube-context "$context" -n "$namespace" upgrade "$release" deploy/helm/spruce --reuse-values --set benchmark.enabled=false --set gateway.allowInsecureClientTransport=true --wait --timeout 8m >/dev/null; }
+roll() { helm --kube-context "$context" -n "$namespace" upgrade "$release" deploy/helm/spruce --reuse-values --set benchmark.enabled=false --wait --timeout 8m >/dev/null; }
 token=$(kubectl --context "$context" -n "$namespace" get secret "$auth" -o jsonpath='{.data.client-token}' | base64 -d)
 publish() {
-  probe="tls-probe-$$"
-  kubectl --context "$context" -n "$namespace" delete pod "$probe" --ignore-not-found >/dev/null
-  kubectl --context "$context" -n "$namespace" run "$probe" --restart=Never \
-    --image=curlimages/curl@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6 \
-    --labels="spruce.io/client-access=true" --env="SPRUCE_TOKEN=$token" \
-    --env="SPRUCE_URL=http://$release-spruce:8080/v1/topics/tls-rotation/messages" --command -- sh -ec \
-    'i=0; until curl -fsS -H "Authorization: Bearer $SPRUCE_TOKEN" --data-binary tls-rotation "$SPRUCE_URL"; do i=$((i+1)); test "$i" -lt 30; sleep 2; done' >/dev/null
-  kubectl --context "$context" -n "$namespace" wait --for=jsonpath='{.status.phase}'=Succeeded pod/"$probe" --timeout=90s >/dev/null || {
-    kubectl --context "$context" -n "$namespace" logs "$probe"; return 1;
-  }
-  kubectl --context "$context" -n "$namespace" delete pod "$probe" --wait=false >/dev/null
+  pod=$(kubectl --context "$context" -n "$namespace" get pod -l app.kubernetes.io/component=broker -o jsonpath='{.items[0].metadata.name}')
+  url="https://$pod.$fullname-headless.$namespace.svc.$cluster_domain:$service_port/v1/topics/tls-rotation/messages"
+  kubectl --context "$context" -n "$namespace" exec deploy/"$fullname-gateway" -- \
+    wget -qO- --header="Authorization: Bearer $token" --ca-certificate=/tls/ca.crt --post-data=tls-rotation "$url" >/dev/null
 }
 apply_tls "$work/old.crt" "$work/old.key" "$work/bundle.crt"; roll; publish
 apply_tls "$work/new.crt" "$work/new.key" "$work/bundle.crt"; roll; publish
 apply_tls "$work/new.crt" "$work/new.key" "$work/new-ca.crt"; roll; publish
 admin=$(kubectl --context "$context" -n "$namespace" get secret "$auth" -o jsonpath='{.data.admin-token}' | base64 -d)
 for pod in $(kubectl --context "$context" -n "$namespace" get pod -l app.kubernetes.io/component=broker -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}'); do
-  metrics=$(kubectl --context "$context" -n "$namespace" exec deploy/"$fullname-gateway" -- wget -qO- --header="Authorization: Bearer $admin" --ca-certificate=/tls/ca.crt "https://$pod.$fullname-headless.$namespace.svc.cluster.local:8080/metrics")
+  metrics=$(kubectl --context "$context" -n "$namespace" exec deploy/"$fullname-gateway" -- wget -qO- --header="Authorization: Bearer $admin" --ca-certificate=/tls/ca.crt "https://$pod.$fullname-headless.$namespace.svc.$cluster_domain:$service_port/metrics")
   test "$(printf '%s\n' "$metrics" | awk '/^spruce_replication_errors_total / {print $2}')" = 0
   test "$(printf '%s\n' "$metrics" | awk '/^spruce_replication_dropped_messages_total / {print $2}')" = 0
 done

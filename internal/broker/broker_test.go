@@ -197,6 +197,30 @@ func TestPublishBatch(t *testing.T) {
 	}
 }
 
+func TestPublishBatchV2PreservesPerEntryKeys(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	var body bytes.Buffer
+	for i, payload := range [][]byte{[]byte("one"), {0, 1, 2, 255}} {
+		key := []byte([]string{"first", "second"}[i])
+		var keySize [2]byte
+		binary.BigEndian.PutUint16(keySize[:], uint16(len(key)))
+		body.Write(keySize[:]); body.Write(key)
+		var size [4]byte
+		binary.BigEndian.PutUint32(size[:], uint32(len(payload)))
+		body.Write(size[:]); body.Write(payload)
+	}
+	r := httptest.NewRequest("POST", "/v1/topics/batch-v2/batches", &body)
+	r.Header.Set("Spruce-Batch-Version", "2")
+	w := httptest.NewRecorder()
+	b.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusAccepted { t.Fatalf("status %d: %s", w.Code, w.Body.String()) }
+	messages := b.cache.snapshot("batch-v2", 0)
+	if len(messages) != 2 || messages[0].Key != "first" || messages[1].Key != "second" {
+		t.Fatalf("per-entry keys lost: %#v", messages)
+	}
+}
+
 func TestPerformancePublishBatchAllocationCeiling(t *testing.T) {
 	if raceEnabled {
 		t.Skip("allocation counts include race instrumentation")

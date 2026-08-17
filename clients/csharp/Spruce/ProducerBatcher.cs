@@ -7,7 +7,7 @@ public sealed record ProducerBatcherOptions(int MaxMessages = 256, int MaxBytes 
 public sealed class ProducerBatcher : IAsyncDisposable
 {
     private abstract record Command;
-    private sealed record Item(string Topic, byte[] Payload, PublishOptions Options, TaskCompletionSource<PublishResult> Completion) : Command;
+    private sealed record Item(string Topic, byte[] Payload, PublishOptions Options, TaskCompletionSource<PublishResult> Completion, CancellationTokenRegistration Cancellation) : Command;
     private sealed record Barrier(TaskCompletionSource Completion) : Command;
 
     private readonly SpruceClient _client;
@@ -29,15 +29,24 @@ public sealed class ProducerBatcher : IAsyncDisposable
         _worker = RunAsync();
     }
 
+    /// <summary>
+    /// Queues a publish. Cancellation before flush removes the item from the outgoing batch. Once a flush has
+    /// started, cancellation only stops the caller waiting; the broker may already have accepted the message.
+    /// Use the returned result, or producer idempotency on the unbatched retry API, when acceptance certainty matters.
+    /// </summary>
     public async Task<PublishResult> PublishAsync(string topic, ReadOnlyMemory<byte> payload, PublishOptions? options = null, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(topic)) throw new ArgumentException("Topic is required", nameof(topic));
         if (payload.Length > 1 << 20 || payload.Length + 4 > _options.MaxBytes) throw new ArgumentOutOfRangeException(nameof(payload));
         options ??= new();
         if (!string.IsNullOrEmpty(options.IdempotencyKey) || options.Ack is not (null or "" or "local")) throw new ArgumentException("Options are incompatible with batch publishing", nameof(options));
+        var keyBytes = System.Text.Encoding.UTF8.GetByteCount(options.Key ?? "");
+        if (keyBytes > 8 * 1024 || payload.Length + keyBytes + 6 > _options.MaxBytes) throw new ArgumentOutOfRangeException(nameof(options), "Key and payload exceed the configured batch size");
         if (Volatile.Read(ref _closed) != 0) throw new ObjectDisposedException(nameof(ProducerBatcher));
         var completion = new TaskCompletionSource<PublishResult>(TaskCreationOptions.RunContinuationsAsynchronously);
-        await _queue.Writer.WriteAsync(new Item(topic, payload.ToArray(), options, completion), cancellationToken);
+        var registration = cancellationToken.Register(() => completion.TrySetCanceled(cancellationToken));
+        try { await _queue.Writer.WriteAsync(new Item(topic, payload.ToArray(), options, completion, registration), cancellationToken); }
+        catch { registration.Dispose(); throw; }
         return await completion.Task.WaitAsync(cancellationToken);
     }
 
@@ -112,16 +121,20 @@ public sealed class ProducerBatcher : IAsyncDisposable
         if (pending.Count == 0) return null;
         var batch = pending.ToArray();
         pending.Clear();
+        foreach (var cancelled in batch.Where(item => item.Completion.Task.IsCanceled)) cancelled.Cancellation.Dispose();
+        batch = batch.Where(item => !item.Completion.Task.IsCanceled).ToArray();
+        if (batch.Length == 0) return null;
         try
         {
-            var result = await _client.PublishBatchAsync(batch[0].Topic, batch.Select(x => (ReadOnlyMemory<byte>)x.Payload).ToArray(), batch[0].Options, _shutdown.Token);
+            var options = batch[0].Options with { Key = null };
+            var result = await _client.PublishBatchAsync(batch[0].Topic, batch.Select(x => new BatchEntry(x.Payload, x.Options.Key)).ToArray(), options, _shutdown.Token);
             if (result.Ids.Length != batch.Length) throw new InvalidDataException("Spruce returned an invalid batch result");
-            for (var i = 0; i < batch.Length; i++) batch[i].Completion.TrySetResult(new PublishResult(result.Ids[i], false));
+            for (var i = 0; i < batch.Length; i++) { batch[i].Completion.TrySetResult(new PublishResult(result.Ids[i], false)); batch[i].Cancellation.Dispose(); }
         }
-        catch (Exception error) { foreach (var item in batch) item.Completion.TrySetException(error); return error; }
+        catch (Exception error) { foreach (var item in batch) { item.Completion.TrySetException(error); item.Cancellation.Dispose(); } return error; }
         return null;
     }
 
-    private static bool Compatible(Item left, Item right) => left.Topic == right.Topic && left.Options == right.Options;
-    private static int Bytes(List<Item> items) => items.Sum(x => x.Payload.Length + 4);
+    private static bool Compatible(Item left, Item right) => left.Topic == right.Topic && (left.Options with { Key = null }) == (right.Options with { Key = null });
+    private static int Bytes(List<Item> items) => items.Sum(x => x.Payload.Length + 6 + System.Text.Encoding.UTF8.GetByteCount(x.Options.Key ?? ""));
 }

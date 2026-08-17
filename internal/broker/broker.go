@@ -767,9 +767,9 @@ var batchReaders = sync.Pool{New: func() any {
 	return bufio.NewReaderSize(nil, 64<<10)
 }}
 
-// Batch wire format is a sequence of [4 byte big-endian payload length][payload].
-// Topic, TTL, key, and content type are shared by the batch. This intentionally
-// keeps the fast producer path trivial to encode and decode.
+// Batch v1 is [4 byte payload length][payload] and shares Spruce-Key.
+// Batch v2 is [2 byte key length][key][4 byte payload length][payload].
+// The version is selected by Spruce-Batch-Version; retaining v1 keeps existing clients compatible.
 func (b *Broker) publishBatch(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	defer func() { b.metrics.PublishLatency.observe(time.Since(started)) }()
@@ -806,8 +806,27 @@ func (b *Broker) publishBatch(w http.ResponseWriter, r *http.Request) {
 		batchReaders.Put(reader)
 	}()
 	payloads := make([][]byte, 0, 256)
+	keys := make([]string, 0, 256)
+	version := r.Header.Get("Spruce-Batch-Version")
+	if version != "" && version != "1" && version != "2" {
+		problem(w, 400, "invalid_batch_version")
+		return
+	}
 	var total int64
 	for len(payloads) < maxBatchMessages {
+		var key string
+		if version == "2" {
+			var keySize [2]byte
+			_, err := io.ReadFull(reader, keySize[:])
+			if errors.Is(err, io.EOF) { break }
+			if err != nil { problem(w, 400, "invalid_batch"); return }
+			kn := int64(binary.BigEndian.Uint16(keySize[:]))
+			total += 2 + kn
+			if kn > maxHeaders || total > maxBatchBytes { problem(w, 413, "batch_too_large"); return }
+			keyBytes := make([]byte, kn)
+			if _, err = io.ReadFull(reader, keyBytes); err != nil { problem(w, 400, "invalid_batch"); return }
+			key = string(keyBytes)
+		}
 		var size [4]byte
 		_, err := io.ReadFull(reader, size[:])
 		if errors.Is(err, io.EOF) {
@@ -832,6 +851,7 @@ func (b *Broker) publishBatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		payloads = append(payloads, payload)
+		keys = append(keys, key)
 	}
 	if len(payloads) == maxBatchMessages {
 		if _, err := reader.Peek(1); err == nil {
@@ -846,8 +866,10 @@ func (b *Broker) publishBatch(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	ids := make([]string, 0, len(payloads))
 	messages := make([]*Message, 0, len(payloads))
-	key, contentType := r.Header.Get("Spruce-Key"), r.Header.Get("Content-Type")
-	for _, payload := range payloads {
+	sharedKey, contentType := r.Header.Get("Spruce-Key"), r.Header.Get("Content-Type")
+	for i, payload := range payloads {
+		key := sharedKey
+		if version == "2" { key = keys[i] }
 		m := &Message{ID: b.nextID(), Topic: topic, Key: key, Payload: payload,
 			CreatedAt: now.UnixMilli(), ExpiresAt: now.Add(ttl).UnixMilli()}
 		if contentType != "" {

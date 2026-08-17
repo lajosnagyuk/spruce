@@ -19,19 +19,17 @@ spec:
           podSelector: {{ toYaml .Values.networkPolicy.clientIngress.podSelector | nindent 12 }}
         - namespaceSelector: {{ toYaml $ingressNamespace | nindent 12 }}
           podSelector: {{ toYaml $ingressPods | nindent 12 }}
-      ports: [{protocol: TCP, port: 8080}]
+      ports: [{protocol: TCP, port: {{ .Values.gateway.service.port }}}]
   egress:
     - to:
         - podSelector:
             matchLabels:
               {{- include "spruce.selectorLabels" . | nindent 14 }}
               app.kubernetes.io/component: broker
-      ports: [{protocol: TCP, port: 8080}]
+      ports: [{protocol: TCP, port: {{ .Values.service.port }}}]
     - to:
-        - namespaceSelector:
-            matchLabels: {kubernetes.io/metadata.name: kube-system}
-          podSelector:
-            matchLabels: {k8s-app: kube-dns}
+        - namespaceSelector: {{ toYaml .Values.networkPolicy.dns.namespaceSelector | nindent 12 }}
+          podSelector: {{ toYaml .Values.networkPolicy.dns.podSelector | nindent 12 }}
       ports:
         - {protocol: UDP, port: 53}
         - {protocol: TCP, port: 53}
@@ -52,29 +50,27 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "spruce.selectorLabels" . | nindent 14 }}
-      ports: [{protocol: TCP, port: 8080}]
+      ports: [{protocol: TCP, port: {{ .Values.service.port }}}]
     - from:
         - namespaceSelector: {{ toYaml .Values.networkPolicy.adminIngress.namespaceSelector | nindent 12 }}
           podSelector: {{ toYaml .Values.networkPolicy.adminIngress.podSelector | nindent 12 }}
-      ports: [{protocol: TCP, port: 8080}]
+      ports: [{protocol: TCP, port: {{ .Values.service.port }}}]
     - from:
         - podSelector:
             matchLabels:
               {{- include "spruce.selectorLabels" . | nindent 14 }}
               app.kubernetes.io/component: test
-      ports: [{protocol: TCP, port: 8080}]
+      ports: [{protocol: TCP, port: {{ .Values.service.port }}}]
   egress:
     - to:
         - podSelector:
             matchLabels:
               {{- include "spruce.selectorLabels" . | nindent 14 }}
               app.kubernetes.io/component: broker
-      ports: [{protocol: TCP, port: 8080}]
+      ports: [{protocol: TCP, port: {{ .Values.service.port }}}]
     - to:
-        - namespaceSelector:
-            matchLabels: {kubernetes.io/metadata.name: kube-system}
-          podSelector:
-            matchLabels: {k8s-app: kube-dns}
+        - namespaceSelector: {{ toYaml .Values.networkPolicy.dns.namespaceSelector | nindent 12 }}
+          podSelector: {{ toYaml .Values.networkPolicy.dns.podSelector | nindent 12 }}
       ports:
         - {protocol: UDP, port: 53}
         - {protocol: TCP, port: 53}
@@ -97,17 +93,15 @@ spec:
             matchLabels:
               {{- include "spruce.selectorLabels" . | nindent 14 }}
               app.kubernetes.io/component: gateway
-      ports: [{protocol: TCP, port: 8080}]
+      ports: [{protocol: TCP, port: {{ .Values.gateway.service.port }}}]
     - to:
         - podSelector:
             matchLabels:
               {{- include "spruce.selectorLabels" . | nindent 14 }}
               app.kubernetes.io/component: broker
-      ports: [{protocol: TCP, port: 8080}]
+      ports: [{protocol: TCP, port: {{ .Values.service.port }}}]
     - to:
-        - namespaceSelector:
-            matchLabels: {kubernetes.io/metadata.name: kube-system}
-          podSelector:
-            matchLabels: {k8s-app: kube-dns}
+        - namespaceSelector: {{ toYaml .Values.networkPolicy.dns.namespaceSelector | nindent 12 }}
+          podSelector: {{ toYaml .Values.networkPolicy.dns.podSelector | nindent 12 }}
       ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
 {{- end }}

@@ -1,0 +1,47 @@
+name: Bounded memory soak
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 0'
+permissions:
+  contents: read
+jobs:
+  memory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: azure/setup-helm@bf6a7d304bc2fdb57e0331155b7ebf2c504acf0a # v4
+      - uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1.12.0
+        with: {cluster_name: spruce-soak}
+      - run: |
+          docker build -t spruce:ci .
+          docker build --target tools -t spruce:tools .
+          kind load docker-image spruce:ci spruce:tools --name spruce-soak
+          mkdir -p .cache/soak-tls
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj '/CN=spruce-headless.spruce.svc.cluster.local' \
+            -addext 'subjectAltName=DNS:spruce-headless.spruce.svc.cluster.local,DNS:*.spruce-headless.spruce.svc.cluster.local' \
+            -keyout .cache/soak-tls/tls.key -out .cache/soak-tls/tls.crt
+          cp .cache/soak-tls/tls.crt .cache/soak-tls/ca.crt
+          kubectl create namespace spruce
+          kubectl -n spruce create secret generic spruce-tls \
+            --from-file=tls.crt=.cache/soak-tls/tls.crt --from-file=tls.key=.cache/soak-tls/tls.key --from-file=ca.crt=.cache/soak-tls/ca.crt
+          helm upgrade --install spruce deploy/helm/spruce --namespace spruce --create-namespace \
+            --set image.repository=spruce --set image.tag=ci --set image.pullPolicy=Never \
+            --set tls.enabled=true --set tls.existingSecret=spruce-tls \
+            --set ingress.enabled=true --set ingress.hosts[0].host=spruce.invalid \
+            --set ingress.tls[0].secretName=spruce-tls --set ingress.tls[0].hosts[0]=spruce.invalid \
+            --wait --timeout 5m
+      - name: Bounded cache memory envelope
+        env:
+          SPRUCE_TOOLS_IMAGE: spruce:tools
+          SPRUCE_TOOLS_PULL_POLICY: Never
+          SPRUCE_TLS_SECRET: spruce-tls
+          SOAK_SECONDS: '600'
+          SOAK_TTL: 30s
+          SOAK_FILL_MESSAGES: '300000'
+          SOAK_SETTLE_SECONDS: '90'
+          SOAK_REPORT: /tmp/spruce-soak.csv
+        run: sh scripts/k3s-soak.sh
+      - if: always()
+        run: test ! -f /tmp/spruce-soak.csv || tail -n 20 /tmp/spruce-soak.csv

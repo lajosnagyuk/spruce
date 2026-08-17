@@ -9,11 +9,11 @@ image:
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
+clusterDomain: cluster.local
 
 gateway:
   enabled: true
   allowInsecureClientTransport: false
-  configRevision: "3"
   replicaCount: 2
   image:
     repository: nginx
@@ -40,6 +40,7 @@ service:
 
 auth:
   existingSecret: ""
+  requireExistingSecret: false
   allowMissingExistingSecretForRender: false
   allowAnonymous: false
   peerToken: ""
@@ -108,6 +109,15 @@ podDisruptionBudget:
 
 networkPolicy:
   enabled: true
+  dns:
+    serviceName: kube-dns
+    namespace: kube-system
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: kube-system
+    podSelector:
+      matchLabels:
+        k8s-app: kube-dns
   clientIngress:
     namespaceSelector: {}
     podSelector:

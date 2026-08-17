@@ -10,12 +10,12 @@ data:
     events { worker_connections 4096; }
     http {
       access_log off;
-      resolver kube-dns.kube-system.svc.cluster.local valid=5s ipv6=off;
+      resolver {{ .Values.networkPolicy.dns.serviceName }}.{{ .Values.networkPolicy.dns.namespace }}.svc.{{ .Values.clusterDomain }} valid=5s ipv6=off;
       {{- if .Values.tls.enabled }}
       proxy_ssl_trusted_certificate /tls/{{ .Values.tls.caKey }};
       proxy_ssl_verify on;
       proxy_ssl_server_name on;
-      proxy_ssl_name {{ include "spruce.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local;
+      proxy_ssl_name {{ include "spruce.fullname" . }}-headless.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }};
       {{- end }}
       map $arg_group $stream_key {
         "" "$remote_addr:$remote_port:$connection";
@@ -29,7 +29,7 @@ data:
         zone brokers 64k;
         least_conn;
         {{- range $i := until (int .Values.replicaCount) }}
-        server {{ include "spruce.fullname" $ }}-{{ $i }}.{{ include "spruce.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local:{{ $.Values.service.port }} resolve;
+        server {{ include "spruce.fullname" $ }}-{{ $i }}.{{ include "spruce.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.clusterDomain }}:{{ $.Values.service.port }} resolve;
         {{- end }}
         keepalive 64;
       }
@@ -37,19 +37,19 @@ data:
         zone streams 64k;
         hash $stream_key consistent;
         {{- range $i := until (int .Values.replicaCount) }}
-        server {{ include "spruce.fullname" $ }}-{{ $i }}.{{ include "spruce.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local:{{ $.Values.service.port }} resolve;
+        server {{ include "spruce.fullname" $ }}-{{ $i }}.{{ include "spruce.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.clusterDomain }}:{{ $.Values.service.port }} resolve;
         {{- end }}
       }
       upstream keyed_publishes {
         zone keyed_publishes 64k;
         hash $publish_key consistent;
         {{- range $i := until (int .Values.replicaCount) }}
-        server {{ include "spruce.fullname" $ }}-{{ $i }}.{{ include "spruce.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local:{{ $.Values.service.port }} resolve;
+        server {{ include "spruce.fullname" $ }}-{{ $i }}.{{ include "spruce.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.clusterDomain }}:{{ $.Values.service.port }} resolve;
         {{- end }}
         keepalive 64;
       }
       server {
-        listen 8080;
+        listen {{ .Values.gateway.service.port }};
         client_max_body_size 17m;
         location ~ ^/(internal/|metrics$|v1/status) { return 404; }
         location = /v1/subscriptions/stream {
@@ -129,7 +129,7 @@ spec:
           image: "{{ .Values.gateway.image.repository }}{{ if .Values.gateway.image.digest }}@{{ .Values.gateway.image.digest }}{{ else }}:{{ .Values.gateway.image.tag }}{{ end }}"
           imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
           ports:
-            - {name: http, containerPort: 8080}
+            - {name: http, containerPort: {{ .Values.gateway.service.port }}}
           readinessProbe:
             httpGet: {path: /health/ready, port: http}
           livenessProbe:

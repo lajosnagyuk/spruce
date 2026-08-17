@@ -8,6 +8,21 @@ permissions:
   id-token: write
   attestations: write
 jobs:
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: azure/setup-helm@bf6a7d304bc2fdb57e0331155b7ebf2c504acf0a # v4
+      - run: |
+          version="${GITHUB_REF_NAME#v}"
+          helm lint deploy/helm/spruce --set image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --set tls.allowInsecureTransport=true --set gateway.allowInsecureClientTransport=true
+          helm package deploy/helm/spruce --version "$version" --app-version "$version" --destination artifacts
+          echo "$GITHUB_TOKEN" | helm registry login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          helm push "artifacts/spruce-$version.tgz" "oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with: {name: helm-chart, path: 'artifacts/*.tgz'}
   image:
     runs-on: ubuntu-latest
     outputs:

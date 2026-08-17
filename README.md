@@ -2,7 +2,7 @@
 
 Spruce is a small, leaderless, in-memory event bus for service-to-service glue where Kafka is operationally excessive and rare message loss is acceptable.
 
-It provides opaque binary messages over HTTPS, N producers and consumers, broadcast and consumer-group delivery, bounded replay, Go and C# clients, Prometheus metrics, and a Kubernetes deployment.
+It provides opaque binary messages over HTTPS, N producers and consumers, broadcast and consumer-group delivery, bounded replay, Go, C#, and Python clients, Prometheus metrics, and a Kubernetes deployment.
 
 ## Delivery contract
 
@@ -199,7 +199,7 @@ make image
 make helm-lint
 ```
 
-Performance results and methodology are documented in [docs/PERFORMANCE.md](docs/PERFORMANCE.md). CI runs correctness, race, C# conformance, build, and Kubernetes render checks.
+Performance results and methodology are documented in [docs/PERFORMANCE.md](docs/PERFORMANCE.md). CI runs correctness, race, all-client conformance, Helm validation, and verified public/internal TLS rotation checks; a scheduled full-cache soak enforces the bounded memory envelope.
 
 ## Repository guide
 
@@ -210,6 +210,7 @@ Performance results and methodology are documented in [docs/PERFORMANCE.md](docs
 - `internal/broker`: cache, routing, replay, replication, and metrics.
 - `pkg/spruce`: Go client.
 - `clients/csharp`: C# client and conformance tests.
+- `clients/python`: Python client, packaging, and conformance tests.
 - `deploy/helm/spruce`: Kubernetes Helm chart.
 
 ## License

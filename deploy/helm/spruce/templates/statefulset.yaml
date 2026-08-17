@@ -67,9 +67,9 @@ spec:
                 fieldRef:
                   fieldPath: metadata.name
             - name: SPRUCE_SELF_URL
-              value: {{ include "spruce.scheme" . }}://$(POD_NAME).{{ include "spruce.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+              value: {{ include "spruce.scheme" . }}://$(POD_NAME).{{ include "spruce.fullname" . }}-headless.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}:{{ .Values.service.port }}
             - name: SPRUCE_PEERS
-              value: {{ range $i := until (int .Values.replicaCount) }}{{ if $i }},{{ end }}{{ include "spruce.scheme" $ }}://{{ include "spruce.fullname" $ }}-{{ $i }}.{{ include "spruce.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local:{{ $.Values.service.port }}{{- end }}
+              value: {{ range $i := until (int .Values.replicaCount) }}{{ if $i }},{{ end }}{{ include "spruce.scheme" $ }}://{{ include "spruce.fullname" $ }}-{{ $i }}.{{ include "spruce.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.clusterDomain }}:{{ $.Values.service.port }}{{- end }}
             - name: SPRUCE_PEER_TOKEN
               valueFrom:
                 secretKeyRef: {name: {{ include "spruce.secretName" . }}, key: peer-token}
