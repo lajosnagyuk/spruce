@@ -1,8 +1,10 @@
 #!/bin/sh
 set -eu
 
-context=${KUBE_CONTEXT:-spruce-dev}; namespace=${SPRUCE_NAMESPACE:-spruce-hardening}; release=${SPRUCE_RELEASE:-hardened}
-secret=${SPRUCE_TLS_SECRET:-spruce-hardening-tls}; auth=${SPRUCE_AUTH_SECRET:-hardening-auth}
+context=${KUBE_CONTEXT:-$(kubectl config current-context)}; namespace=${SPRUCE_NAMESPACE:-spruce}; release=${SPRUCE_RELEASE:-spruce}
+case "$release" in *spruce*) default_fullname=$release;; *) default_fullname=${release}-spruce;; esac
+fullname=${SPRUCE_FULLNAME:-$default_fullname}
+secret=${SPRUCE_TLS_SECRET:-${fullname}-tls}; auth=${SPRUCE_AUTH_SECRET:-${fullname}-auth}
 work=${TMPDIR:-/tmp}/spruce-tls-rotation-$$
 mkdir -m 700 "$work"
 kubectl --context "$context" -n "$namespace" get secret "$secret" -o yaml >"$work/original-secret.yaml"
@@ -26,9 +28,9 @@ distinguished_name=dn
 req_extensions=ext
 prompt=no
 [dn]
-CN=$release-spruce-headless.$namespace.svc.cluster.local
+CN=$fullname-headless.$namespace.svc.cluster.local
 [ext]
-subjectAltName=DNS:$release-spruce-headless.$namespace.svc.cluster.local,DNS:*.$release-spruce-headless.$namespace.svc.cluster.local
+subjectAltName=DNS:$fullname-headless.$namespace.svc.cluster.local,DNS:*.$fullname-headless.$namespace.svc.cluster.local
 extendedKeyUsage=serverAuth
 EOF
 openssl req -new -newkey rsa:2048 -nodes -keyout "$work/new.key" -out "$work/new.csr" -config "$work/leaf.cnf" >/dev/null 2>&1
@@ -67,7 +69,7 @@ apply_tls "$work/new.crt" "$work/new.key" "$work/bundle.crt"; roll; publish
 apply_tls "$work/new.crt" "$work/new.key" "$work/new-ca.crt"; roll; publish
 admin=$(kubectl --context "$context" -n "$namespace" get secret "$auth" -o jsonpath='{.data.admin-token}' | base64 -d)
 for pod in $(kubectl --context "$context" -n "$namespace" get pod -l app.kubernetes.io/component=broker -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}'); do
-  metrics=$(kubectl --context "$context" -n "$namespace" exec deploy/"$release-spruce-gateway" -- wget -qO- --header="Authorization: Bearer $admin" --ca-certificate=/tls/ca.crt "https://$pod.$release-spruce-headless.$namespace.svc.cluster.local:8080/metrics")
+  metrics=$(kubectl --context "$context" -n "$namespace" exec deploy/"$fullname-gateway" -- wget -qO- --header="Authorization: Bearer $admin" --ca-certificate=/tls/ca.crt "https://$pod.$fullname-headless.$namespace.svc.cluster.local:8080/metrics")
   test "$(printf '%s\n' "$metrics" | awk '/^spruce_replication_errors_total / {print $2}')" = 0
   test "$(printf '%s\n' "$metrics" | awk '/^spruce_replication_dropped_messages_total / {print $2}')" = 0
 done

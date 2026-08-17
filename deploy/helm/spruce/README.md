@@ -16,6 +16,10 @@ helm upgrade --install spruce deploy/helm/spruce \
   --set ingress.tls[0].hosts[0]=spruce.example.com
 ```
 
+The default release produces `spruce`, `spruce-headless`, and `spruce-admin`
+Services in the `spruce` namespace. `nameOverride` and `fullnameOverride` remain
+available when platform naming policy requires different resource names.
+
 Label the Ingress controller namespace before installation so the default NetworkPolicy
 admits it: `kubectl label namespace ingress-nginx spruce.io/ingress-access=true`.
 

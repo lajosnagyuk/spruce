@@ -119,6 +119,9 @@ helm upgrade --install spruce deploy/helm/spruce \
   --set ingress.tls[0].hosts[0]=spruce.example.com
 ```
 
+With these defaults the public Service is `spruce`, the headless Service is
+`spruce-headless`, and the namespace is `spruce`.
+
 Allow the Ingress controller through the default NetworkPolicy by labeling its
 namespace once, for example:
 

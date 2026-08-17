@@ -1,10 +1,12 @@
 #!/bin/sh
 set -eu
 
-context=${KUBE_CONTEXT:-spruce-dev}
-namespace=${SPRUCE_NAMESPACE:-spruce-hardening}
-release=${SPRUCE_RELEASE:-hardened}
-secret=${SPRUCE_AUTH_SECRET:-hardening-auth}
+context=${KUBE_CONTEXT:-$(kubectl config current-context)}
+namespace=${SPRUCE_NAMESPACE:-spruce}
+release=${SPRUCE_RELEASE:-spruce}
+case "$release" in *spruce*) default_fullname=$release;; *) default_fullname=${release}-spruce;; esac
+fullname=${SPRUCE_FULLNAME:-$default_fullname}
+secret=${SPRUCE_AUTH_SECRET:-${fullname}-auth}
 probe=spruce-rotation-probe
 
 read_key() { kubectl --context "$context" -n "$namespace" get secret "$secret" -o "jsonpath={.data.$1}" | base64 -d; }
@@ -26,7 +28,7 @@ roll() {
   i=0
   until kubectl --context "$context" -n "$namespace" exec "$probe" -- \
     curl -ksSf -o /dev/null -H "Authorization: Bearer $(read_key admin-token)" \
-    "https://$release-spruce-0.$release-spruce-headless.$namespace.svc.cluster.local:8080/metrics"; do
+    "https://$fullname-0.$fullname-headless.$namespace.svc.cluster.local:8080/metrics"; do
     i=$((i + 1)); test "$i" -lt 30 || return 1; sleep 2
   done
 }
@@ -38,8 +40,8 @@ kubectl --context "$context" -n "$namespace" run "$probe" --restart=Never \
   --command -- sleep 1800 >/dev/null
 trap 'kubectl --context "$context" -n "$namespace" delete pod "$probe" --wait=false >/dev/null 2>&1 || true' EXIT INT TERM
 kubectl --context "$context" -n "$namespace" wait pod/"$probe" --for=condition=Ready --timeout=120s >/dev/null
-client() { kubectl --context "$context" -n "$namespace" exec "$probe" -- curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $1" --data-binary rotation "http://$release-spruce:8080/v1/topics/rotation/messages"; }
-admin() { kubectl --context "$context" -n "$namespace" exec "$probe" -- curl -ksS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $1" "https://$release-spruce-admin:8080/metrics"; }
+client() { kubectl --context "$context" -n "$namespace" exec "$probe" -- curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $1" --data-binary rotation "http://$fullname:8080/v1/topics/rotation/messages"; }
+admin() { kubectl --context "$context" -n "$namespace" exec "$probe" -- curl -ksS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $1" "https://$fullname-admin:8080/metrics"; }
 
 apply_secret "$old_peer" "$old_client" "$old_admin" "$new_peer" "$new_client" "$new_admin"; roll
 test "$(client "$old_client")" = 202; test "$(client "$new_client")" = 202
@@ -57,8 +59,8 @@ roll; wait "$traffic"
 apply_secret "$new_peer" "$new_client" "$new_admin"; roll
 test "$(client "$new_client")" = 202; test "$(client "$old_client")" = 401
 test "$(admin "$new_admin")" = 200; test "$(admin "$old_admin")" = 401
-for broker in $(seq 0 $(( $(kubectl --context "$context" -n "$namespace" get statefulset "$release-spruce" -o jsonpath='{.spec.replicas}') - 1 ))); do
-  metrics=$(kubectl --context "$context" -n "$namespace" exec "$probe" -- curl -ksS -H "Authorization: Bearer $new_admin" "https://$release-spruce-$broker.$release-spruce-headless.$namespace.svc.cluster.local:8080/metrics")
+for broker in $(seq 0 $(( $(kubectl --context "$context" -n "$namespace" get statefulset "$fullname" -o jsonpath='{.spec.replicas}') - 1 ))); do
+  metrics=$(kubectl --context "$context" -n "$namespace" exec "$probe" -- curl -ksS -H "Authorization: Bearer $new_admin" "https://$fullname-$broker.$fullname-headless.$namespace.svc.cluster.local:8080/metrics")
   test "$(printf '%s\n' "$metrics" | awk '/^spruce_replication_errors_total / {print $2}')" = 0
   test "$(printf '%s\n' "$metrics" | awk '/^spruce_replication_dropped_messages_total / {print $2}')" = 0
 done

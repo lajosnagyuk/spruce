@@ -1,10 +1,12 @@
 #!/bin/sh
 set -eu
 
-context=${KUBE_CONTEXT:-spruce-dev}
-namespace=${SPRUCE_NAMESPACE:-spruce-hardening}
-release=${SPRUCE_RELEASE:-hardened}
-auth=${SPRUCE_AUTH_SECRET:-${release}-spruce-auth}
+context=${KUBE_CONTEXT:-$(kubectl config current-context)}
+namespace=${SPRUCE_NAMESPACE:-spruce}
+release=${SPRUCE_RELEASE:-spruce}
+case "$release" in *spruce*) default_fullname=$release;; *) default_fullname=${release}-spruce;; esac
+fullname=${SPRUCE_FULLNAME:-$default_fullname}
+auth=${SPRUCE_AUTH_SECRET:-${fullname}-auth}
 image=${SPRUCE_TOOLS_IMAGE:-spruce:tools}
 duration=${SOAK_SECONDS:-7200}
 report=${SOAK_REPORT:-/tmp/spruce-soak.csv}
@@ -32,7 +34,7 @@ spec:
           image: "$image"
           imagePullPolicy: Never
           command: [/spruce-integration]
-          args: [-server, http://$release-spruce:8080, -topics, "6", -messages, "$messages", -producers, "10", -broadcast-consumers, "3", -group-consumers, "5", -publish-rate, "1", -ttl, "10m", -dedupe, -max-missing, "0", -max-duplicates, "0", -timeout, "$((duration + 180))s", -allow-insecure-credentials]
+          args: [-server, http://$fullname:8080, -topics, "6", -messages, "$messages", -producers, "10", -broadcast-consumers, "3", -group-consumers, "5", -publish-rate, "1", -ttl, "10m", -dedupe, -max-missing, "0", -max-duplicates, "0", -timeout, "$((duration + 180))s", -allow-insecure-credentials]
           env:
             - name: SPRUCE_TOKEN
               valueFrom:
@@ -53,7 +55,7 @@ while :; do
   sampled_at=$(date -u +%FT%TZ)
   for pod in $(kubectl --context "$context" -n "$namespace" get pod -l app.kubernetes.io/component=broker -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}'); do
     rss=$(kubectl --context "$context" top pod -n "$namespace" "$pod" --no-headers | awk '{gsub("Mi","",$3); print $3+0}')
-    metrics=$(kubectl --context "$context" -n "$namespace" exec "$probe" -- wget -qO- --header="Authorization: Bearer $admin" --no-check-certificate "https://$pod.$release-spruce-headless.$namespace.svc.cluster.local:8080/metrics")
+    metrics=$(kubectl --context "$context" -n "$namespace" exec "$probe" -- wget -qO- --header="Authorization: Bearer $admin" --no-check-certificate "https://$pod.$fullname-headless.$namespace.svc.cluster.local:8080/metrics")
     metric() { printf '%s\n' "$metrics" | awk -v name="$1" '$1 == name {print $2}'; }
     printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$sampled_at" "$pod" "$rss" "$(metric spruce_process_heap_bytes)" "$(metric spruce_process_goroutines)" "$(metric spruce_replication_errors_total)" "$(metric spruce_replication_dropped_messages_total)" "$(metric spruce_delivery_dropped_total)" >>"$report"
     test "$rss" -le 240
