@@ -171,6 +171,12 @@ credential-safety contracts as Go and C#.
 
 All libraries use the public HTTPS API. They are conveniences, not protocol requirements.
 
+Tagged releases always build and retain the Python distributions. Publishing them to
+PyPI is opt-in: set the repository variable `PUBLISH_PYPI=true` only after configuring
+the repository as a PyPI trusted publisher. C#, image, and Helm release
+failures remain release-blocking and are not suppressed by this switch. Client package
+versions are derived from the `vMAJOR.MINOR.PATCH` release tag.
+
 ## Operations
 
 - `GET /health/live` reports process health.

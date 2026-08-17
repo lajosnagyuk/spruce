@@ -4,7 +4,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>Spruce.Client</PackageId>
-    <Version>0.2.0</Version>
+    <Version>0.2.1</Version>
     <Description>Fast, bounded Spruce event bus client for .NET.</Description>
     <Authors>Spruce contributors</Authors>
     <PackageReadmeFile>README.md</PackageReadmeFile>

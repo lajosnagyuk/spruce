@@ -97,7 +97,6 @@ jobs:
         with: {name: csharp-client, path: 'artifacts/*.nupkg'}
   python:
     runs-on: ubuntu-latest
-    environment: pypi
     permissions:
       contents: read
       id-token: write
@@ -111,7 +110,8 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           sed -i "s/__version__ = \"[^\"]*\"/__version__ = \"$version\"/" clients/python/src/spruce/__init__.py
           python -m build --outdir artifacts clients/python
-      - uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
-        with: {packages-dir: artifacts}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with: {name: python-client, path: artifacts/*}
+      - uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        if: vars.PUBLISH_PYPI == 'true'
+        with: {packages-dir: artifacts}

@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Net;
 using System.Net.Http.Json;
 using Spruce;
@@ -10,10 +11,16 @@ var handler = new StubHandler(async request =>
     var body = await request.Content!.ReadAsByteArrayAsync();
     var offset = 0;
     var ids = new List<string>();
+    if (!request.Headers.TryGetValues("Spruce-Batch-Version", out var versions) || versions.Single() != "2") throw new InvalidDataException("batch v2 header missing");
     while (offset < body.Length)
     {
-        var size = IPAddress.NetworkToHostOrder(BitConverter.ToInt32(body, offset));
-        offset += 4 + size;
+        if (body.Length - offset < 2) throw new InvalidDataException("truncated key length");
+        var keySize = BinaryPrimitives.ReadUInt16BigEndian(body.AsSpan(offset, 2)); offset += 2;
+        if (body.Length - offset < keySize + 4) throw new InvalidDataException("truncated batch entry");
+        offset += keySize;
+        var size = checked((int)BinaryPrimitives.ReadUInt32BigEndian(body.AsSpan(offset, 4))); offset += 4;
+        if (body.Length - offset < size) throw new InvalidDataException("truncated payload");
+        offset += size;
         ids.Add($"id-{Interlocked.Increment(ref messages)}");
     }
     return new HttpResponseMessage(HttpStatusCode.Accepted) { Content = JsonContent.Create(new { ids }) };

@@ -99,7 +99,7 @@ public sealed class ProducerBatcher : IAsyncDisposable
                 {
                     if (next is Barrier nextBarrier) { var error = await FlushPendingAsync(pending); if (error is null) nextBarrier.Completion.TrySetResult(); else nextBarrier.Completion.TrySetException(error); goto flushed; }
                     var candidate = (Item)next;
-                    if (!Compatible(pending[0], candidate) || Bytes(pending) + candidate.Payload.Length + 4 > _options.MaxBytes) { await FlushPendingAsync(pending); pending.Add(candidate); deadline = DateTime.UtcNow + _options.MaxDelay.Value; }
+                    if (!Compatible(pending[0], candidate) || Bytes(pending) + EntryBytes(candidate) > _options.MaxBytes) { await FlushPendingAsync(pending); pending.Add(candidate); deadline = DateTime.UtcNow + _options.MaxDelay.Value; }
                     else pending.Add(candidate);
                     if (pending.Count >= _options.MaxMessages) break;
                 }
@@ -137,4 +137,5 @@ public sealed class ProducerBatcher : IAsyncDisposable
 
     private static bool Compatible(Item left, Item right) => left.Topic == right.Topic && (left.Options with { Key = null }) == (right.Options with { Key = null });
     private static int Bytes(List<Item> items) => items.Sum(x => x.Payload.Length + 6 + System.Text.Encoding.UTF8.GetByteCount(x.Options.Key ?? ""));
+    private static int EntryBytes(Item item) => item.Payload.Length + 6 + System.Text.Encoding.UTF8.GetByteCount(item.Options.Key ?? "");
 }
