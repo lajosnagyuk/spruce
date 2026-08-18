@@ -9,6 +9,7 @@ namespace Spruce;
 public sealed record PublishOptions(string? Key = null, TimeSpan? Ttl = null, string? ContentType = null, string? Ack = null, string? IdempotencyKey = null, string? ProducerId = null);
 public sealed record PublishResult([property: JsonPropertyName("id")] string Id, [property: JsonPropertyName("replicated")] bool Replicated);
 public sealed record BatchResult([property: JsonPropertyName("ids")] string[] Ids);
+public sealed record BatchEntry(ReadOnlyMemory<byte> Payload, string? Key = null);
 public sealed record Delivery(
     [property: JsonPropertyName("delivery_id")] string DeliveryId,
     [property: JsonPropertyName("message_id")] string MessageId,
@@ -70,37 +71,44 @@ public sealed partial class SpruceClient : IDisposable
     }
 
     public async Task<BatchResult> PublishBatchAsync(string topic, IReadOnlyList<ReadOnlyMemory<byte>> payloads, PublishOptions? options = null, CancellationToken cancellationToken = default)
+        => await PublishBatchAsync(topic, payloads.Select(payload => new BatchEntry(payload, options?.Key)).ToArray(), options, cancellationToken);
+
+    public async Task<BatchResult> PublishBatchAsync(string topic, IReadOnlyList<BatchEntry> entries, PublishOptions? options = null, CancellationToken cancellationToken = default)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(_requestTimeout);
-        if (payloads.Count == 0) throw new ArgumentException("Batch is empty", nameof(payloads));
-        if (payloads.Count > 4096) throw new ArgumentException("Batch exceeds 4096 messages", nameof(payloads));
+        if (entries.Count == 0) throw new ArgumentException("Batch is empty", nameof(entries));
+        if (entries.Count > 4096) throw new ArgumentException("Batch exceeds 4096 messages", nameof(entries));
         options ??= new();
         if (options.Ack is not null and not "local") throw new ArgumentException("Batch only supports local acknowledgement", nameof(options));
         if (options.IdempotencyKey is not null) throw new ArgumentException("Batch idempotency is not supported", nameof(options));
-        var total = payloads.Aggregate(0L, (sum, payload) => checked(sum + 4 + payload.Length));
-        if (payloads.Any(payload => payload.Length > 1024 * 1024)) throw new ArgumentException("A batch message exceeds 1 MiB", nameof(payloads));
-        if (total > 16 * 1024 * 1024) throw new ArgumentException("Batch exceeds 16 MiB", nameof(payloads));
+        var total = entries.Aggregate(0L, (sum, entry) => checked(sum + 6 + entry.Payload.Length + System.Text.Encoding.UTF8.GetByteCount(entry.Key ?? "")));
+        if (entries.Any(entry => entry.Payload.Length > 1024 * 1024 || System.Text.Encoding.UTF8.GetByteCount(entry.Key ?? "") > 8 * 1024)) throw new ArgumentException("A batch entry exceeds its limit", nameof(entries));
+        if (total > 16 * 1024 * 1024) throw new ArgumentException("Batch exceeds 16 MiB", nameof(entries));
         using var body = new MemoryStream(checked((int)total));
         var size = new byte[4];
-        foreach (var payload in payloads)
+        foreach (var entry in entries)
         {
-            BinaryPrimitives.WriteUInt32BigEndian(size, checked((uint)payload.Length));
+            var key = System.Text.Encoding.UTF8.GetBytes(entry.Key ?? "");
+            var keySize = new byte[2]; BinaryPrimitives.WriteUInt16BigEndian(keySize, checked((ushort)key.Length));
+            await body.WriteAsync(keySize, timeout.Token);
+            await body.WriteAsync(key, timeout.Token);
+            BinaryPrimitives.WriteUInt32BigEndian(size, checked((uint)entry.Payload.Length));
             await body.WriteAsync(size, timeout.Token);
-            await body.WriteAsync(payload, timeout.Token);
+            await body.WriteAsync(entry.Payload, timeout.Token);
         }
         body.Position = 0;
         using var request = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/v1/topics/{Uri.EscapeDataString(topic)}/batches") { Content = new StreamContent(body) };
+        request.Headers.Add("Spruce-Batch-Version", "2");
         Authorize(request);
         if (options.ContentType is not null) request.Content.Headers.ContentType = new(options.ContentType);
-        if (options.Key is not null) request.Headers.Add("Spruce-Key", options.Key);
         if (options.Ttl is not null) request.Headers.Add("Spruce-TTL", $"{options.Ttl.Value.TotalMilliseconds}ms");
         using var response = await SendAsync(request, HttpCompletionOption.ResponseContentRead, timeout.Token, "publish_batch");
         await EnsureSuccessAsync(response, timeout.Token);
         return (await response.Content.ReadFromJsonAsync<BatchResult>(timeout.Token))!;
     }
 
-    public async Task SubscribeAsync(string topic, string? group, Func<Delivery, CancellationToken, Task> handler, CancellationToken cancellationToken = default, int concurrency = 16, int maxPayloadBytes = 1024 * 1024, long since = 0, TimeSpan? drainTimeout = null)
+    public async Task SubscribeAsync(string topic, string? group, Func<Delivery, CancellationToken, Task> handler, CancellationToken cancellationToken = default, int concurrency = 16, int maxPayloadBytes = 1024 * 1024, long since = 0, TimeSpan? drainTimeout = null, bool preserveKeyOrder = false)
     {
         if (string.IsNullOrWhiteSpace(topic)) throw new ArgumentException("Topic is required", nameof(topic));
         if (concurrency <= 0) concurrency = 16;
@@ -124,16 +132,18 @@ public sealed partial class SpruceClient : IDisposable
                 using var connection = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 await using var acks = new AckBatcher(this, "ack", connection.Token);
                 await using var nacks = new AckBatcher(this, "nack", connection.Token);
-                var deliveries = Channel.CreateBounded<(Delivery Delivery, long Index)>(new BoundedChannelOptions(concurrency * 2) { FullMode = BoundedChannelFullMode.Wait, SingleWriter = true });
+                var deliveryLanes = preserveKeyOrder
+                    ? Enumerable.Range(0, concurrency).Select(_ => Channel.CreateBounded<(Delivery Delivery, long Index)>(new BoundedChannelOptions(2) { FullMode = BoundedChannelFullMode.Wait, SingleWriter = true })).ToArray()
+                    : [Channel.CreateBounded<(Delivery Delivery, long Index)>(new BoundedChannelOptions(concurrency * 2) { FullMode = BoundedChannelFullMode.Wait, SingleWriter = true })];
                 var progressLock = new object();
                 var completed = new SortedDictionary<long, long>();
                 long sequence = 0, nextProgress = 1;
                 var connectedSince = since;
-                async Task ConsumeAsync()
+                async Task ConsumeAsync(ChannelReader<(Delivery Delivery, long Index)> reader)
                 {
                     try
                     {
-                        await foreach (var work in deliveries.Reader.ReadAllAsync(connection.Token))
+                        await foreach (var work in reader.ReadAllAsync(connection.Token))
                         {
                             try { await handler(work.Delivery, connection.Token); }
                             catch when (!connection.IsCancellationRequested)
@@ -164,7 +174,9 @@ public sealed partial class SpruceClient : IDisposable
                         }
                     }
                 }
-                var workers = Enumerable.Range(0, concurrency).Select(_ => ConsumeAsync()).ToArray();
+                var workers = preserveKeyOrder
+                    ? deliveryLanes.Select(lane => ConsumeAsync(lane.Reader)).ToArray()
+                    : Enumerable.Range(0, concurrency).Select(_ => ConsumeAsync(deliveryLanes[0].Reader)).ToArray();
                 var sizes = new byte[8];
                 var gracefulEnd = false;
                 try
@@ -181,7 +193,8 @@ public sealed partial class SpruceClient : IDisposable
                         if (string.IsNullOrEmpty(delivery.DeliveryId)) continue;
                         delivery = delivery with { Payload = payload };
                         var index = Interlocked.Increment(ref sequence);
-                        await deliveries.Writer.WriteAsync((delivery, index), connection.Token);
+                        var lane = preserveKeyOrder ? StableLane(delivery.Key ?? delivery.MessageId, deliveryLanes.Length) : 0;
+                        await deliveryLanes[lane].Writer.WriteAsync((delivery, index), connection.Token);
                     }
                 }
                 catch (EndOfStreamException)
@@ -190,7 +203,7 @@ public sealed partial class SpruceClient : IDisposable
                 }
                 finally
                 {
-                    deliveries.Writer.TryComplete();
+                    foreach (var lane in deliveryLanes) lane.Writer.TryComplete();
                     if (!gracefulEnd) connection.Cancel();
                     var joined = Task.WhenAll(workers);
                     if (!joined.IsCompleted)
@@ -237,6 +250,13 @@ public sealed partial class SpruceClient : IDisposable
                 backoff = TimeSpan.FromMilliseconds(Math.Min(2000, backoff.TotalMilliseconds * 2));
             }
         }
+    }
+
+    private static int StableLane(string key, int laneCount)
+    {
+        uint hash = 2166136261;
+        foreach (var value in System.Text.Encoding.UTF8.GetBytes(key)) hash = (hash ^ value) * 16777619;
+        return (int)(hash % (uint)laneCount);
     }
 
     private async Task AckAsync(string action, IReadOnlyList<string> ids, CancellationToken cancellationToken)

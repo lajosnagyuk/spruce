@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["replicaCount", "gateway", "service", "auth", "tls", "config"],
+  "properties": {
+    "replicaCount": {"type": "integer", "minimum": 1, "maximum": 256},
+    "clusterDomain": {"type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9.-]+$"},
+    "service": {
+      "type": "object",
+      "properties": {"port": {"type": "integer", "minimum": 1, "maximum": 65535}}
+    },
+    "gateway": {
+      "type": "object",
+      "required": ["enabled", "replicaCount", "service"],
+      "properties": {
+        "enabled": {"const": true},
+        "replicaCount": {"type": "integer", "minimum": 1, "maximum": 256},
+        "terminationGracePeriodSeconds": {"type": "integer", "minimum": 1},
+        "service": {
+          "type": "object",
+          "properties": {"port": {"type": "integer", "minimum": 1, "maximum": 65535}}
+        },
+        "podDisruptionBudget": {
+          "type": "object",
+          "properties": {"maxUnavailable": {"type": "integer", "minimum": 0}}
+        }
+      }
+    },
+    "auth": {
+      "type": "object",
+      "properties": {
+        "existingSecret": {"type": "string"},
+        "requireExistingSecret": {"type": "boolean"},
+        "allowMissingExistingSecretForRender": {"type": "boolean"}
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "properties": {
+        "dns": {
+          "type": "object",
+          "required": ["serviceName", "namespace", "namespaceSelector", "podSelector"],
+          "properties": {
+            "serviceName": {"type": "string", "minLength": 1, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
+            "namespace": {"type": "string", "minLength": 1, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
+            "namespaceSelector": {"type": "object", "minProperties": 1},
+            "podSelector": {"type": "object", "minProperties": 1}
+          }
+        }
+      }
+    },
+    "config": {
+      "type": "object",
+      "properties": {
+        "cacheBytes": {"$ref": "#/definitions/positiveIntegerString"},
+        "maxMessageBytes": {"$ref": "#/definitions/positiveIntegerString"},
+        "queueDepth": {"$ref": "#/definitions/positiveIntegerString"},
+        "replicationQueueBytes": {"$ref": "#/definitions/positiveIntegerString"},
+        "actionQueueBytes": {"$ref": "#/definitions/positiveIntegerString"},
+        "maxInflightBytes": {"$ref": "#/definitions/positiveIntegerString"},
+        "maxSubscriberInflightBytes": {"$ref": "#/definitions/positiveIntegerString"},
+        "maxAttempts": {"$ref": "#/definitions/positiveIntegerString"},
+        "idempotencyEntries": {"$ref": "#/definitions/positiveIntegerString"},
+        "checkpointEntries": {"$ref": "#/definitions/positiveIntegerString"},
+        "maxConcurrentRequests": {"$ref": "#/definitions/positiveIntegerString"},
+        "maxStreams": {"$ref": "#/definitions/positiveIntegerString"},
+        "maxInternalRequests": {"$ref": "#/definitions/positiveIntegerString"},
+        "defaultTTL": {"$ref": "#/definitions/duration"},
+        "maxTTL": {"$ref": "#/definitions/duration"},
+        "ackDeadline": {"$ref": "#/definitions/duration"},
+        "drainDelay": {"$ref": "#/definitions/duration"}
+      }
+    },
+    "terminationGracePeriodSeconds": {"type": "integer", "minimum": 1},
+    "podDisruptionBudget": {
+      "type": "object",
+      "properties": {"maxUnavailable": {"type": "integer", "minimum": 0}}
+    },
+    "benchmark": {
+      "type": "object",
+      "properties": {
+        "messages": {"$ref": "#/definitions/positiveIntegerString"},
+        "messageBytes": {"$ref": "#/definitions/positiveIntegerString"},
+        "producers": {"$ref": "#/definitions/positiveIntegerString"},
+        "batchSize": {"$ref": "#/definitions/positiveIntegerString"}
+      }
+    }
+  },
+  "definitions": {
+    "positiveIntegerString": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+    "duration": {"type": "string", "pattern": "^([0-9]+(ns|us|µs|ms|s|m|h))+$", "not": {"pattern": "^([0]+(ns|us|µs|ms|s|m|h))+$"}}
+  }
+}

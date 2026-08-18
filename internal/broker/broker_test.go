@@ -30,6 +30,22 @@ func TestCacheEvictsOldestWithinBound(t *testing.T) {
 		t.Fatal("expected eviction")
 	}
 }
+
+func TestCacheSnapshotOrdersReplayByAcceptanceTime(t *testing.T) {
+	now := time.Now()
+	c := newCache(1 << 20)
+	messages := []*Message{
+		{ID: "later", Topic: "ordered", Key: "key", Payload: []byte("2"), CreatedAt: now.Add(time.Second).UnixMilli(), ExpiresAt: now.Add(time.Minute).UnixMilli()},
+		{ID: "earlier", Topic: "ordered", Key: "key", Payload: []byte("1"), CreatedAt: now.UnixMilli(), ExpiresAt: now.Add(time.Minute).UnixMilli()},
+	}
+	if _, err := c.putBatch(messages, now.UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	replay := c.snapshot("ordered", 1)
+	if len(replay) != 2 || replay[0].ID != "earlier" || replay[1].ID != "later" {
+		t.Fatalf("unexpected replay order: %v", []string{replay[0].ID, replay[1].ID})
+	}
+}
 func TestPublishAndMetrics(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.CacheBytes = 1 << 20
@@ -178,6 +194,30 @@ func TestPublishBatch(t *testing.T) {
 	}
 	if got := len(b.cache.snapshot("batch", 0)); got != 2 {
 		t.Fatalf("got %d messages", got)
+	}
+}
+
+func TestPublishBatchV2PreservesPerEntryKeys(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	var body bytes.Buffer
+	for i, payload := range [][]byte{[]byte("one"), {0, 1, 2, 255}} {
+		key := []byte([]string{"first", "second"}[i])
+		var keySize [2]byte
+		binary.BigEndian.PutUint16(keySize[:], uint16(len(key)))
+		body.Write(keySize[:]); body.Write(key)
+		var size [4]byte
+		binary.BigEndian.PutUint32(size[:], uint32(len(payload)))
+		body.Write(size[:]); body.Write(payload)
+	}
+	r := httptest.NewRequest("POST", "/v1/topics/batch-v2/batches", &body)
+	r.Header.Set("Spruce-Batch-Version", "2")
+	w := httptest.NewRecorder()
+	b.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusAccepted { t.Fatalf("status %d: %s", w.Code, w.Body.String()) }
+	messages := b.cache.snapshot("batch-v2", 0)
+	if len(messages) != 2 || messages[0].Key != "first" || messages[1].Key != "second" {
+		t.Fatalf("per-entry keys lost: %#v", messages)
 	}
 }
 
@@ -937,6 +977,87 @@ func TestGroupReplayArbitratesOneMember(t *testing.T) {
 	b.deliver(m, "workers", 1)
 	if len(a.ch)+len(c.ch) != 1 {
 		t.Fatalf("group replay fan-out: a=%d b=%d", len(a.ch), len(c.ch))
+	}
+}
+
+func TestGroupCheckpointSuppressesCompletedMessage(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	expiresAt := time.Now().Add(time.Minute).UnixMilli()
+	m := &Message{ID: "completed", Topic: "t", Payload: []byte("x"), ExpiresAt: expiresAt}
+	first := &subscriber{id: "first", topic: "t", group: "workers", ch: make(chan Delivery, 1)}
+	b.mu.Lock()
+	b.addSubscriberLocked(first)
+	b.mu.Unlock()
+	if !b.sendDelivery(first, m, 1) {
+		t.Fatal("initial delivery rejected")
+	}
+	delivery := <-first.ch
+	b.removeAcks([]string{delivery.DeliveryID})
+	b.mu.Lock()
+	b.removeSubscriberLocked(first)
+	reconnected := &subscriber{id: "reconnected", topic: "t", group: "workers", ch: make(chan Delivery, 1)}
+	otherGroup := &subscriber{id: "other", topic: "t", group: "other", ch: make(chan Delivery, 1)}
+	b.addSubscriberLocked(reconnected)
+	b.addSubscriberLocked(otherGroup)
+	b.mu.Unlock()
+	b.deliver(m, "", 1)
+	if len(reconnected.ch) != 0 {
+		t.Fatal("completed message was redelivered to the same group")
+	}
+	if len(otherGroup.ch) != 1 {
+		t.Fatal("checkpoint leaked into an unrelated group")
+	}
+}
+
+func TestGroupCheckpointBoundAndExpiry(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CheckpointEntries = 2
+	b := New(cfg)
+	defer b.Close()
+	now := time.Now()
+	b.applyCheckpoints([]groupCheckpoint{
+		{Topic: "t", Group: "g", MessageID: "one", ExpiresAt: now.Add(time.Minute).UnixMilli()},
+		{Topic: "t", Group: "g", MessageID: "two", ExpiresAt: now.Add(time.Minute).UnixMilli()},
+		{Topic: "t", Group: "g", MessageID: "three", ExpiresAt: now.Add(time.Minute).UnixMilli()},
+		{Topic: "t", Group: "g", MessageID: "expired", ExpiresAt: now.Add(-time.Second).UnixMilli()},
+	})
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.checkpointCount != 2 {
+		t.Fatalf("checkpoint count %d exceeds configured bound", b.checkpointCount)
+	}
+	if b.checkpointActiveLocked("t", "g", "one", now.UnixMilli()) {
+		t.Fatal("oldest checkpoint was not evicted")
+	}
+	if !b.checkpointActiveLocked("t", "g", "two", now.UnixMilli()) || !b.checkpointActiveLocked("t", "g", "three", now.UnixMilli()) {
+		t.Fatal("live checkpoints were not retained")
+	}
+	if b.checkpointActiveLocked("t", "g", "expired", now.UnixMilli()) {
+		t.Fatal("expired checkpoint remained active")
+	}
+}
+
+func TestCheckpointBootstrapFromPeer(t *testing.T) {
+	peerCfg := DefaultConfig()
+	peerCfg.PeerToken, peerCfg.ClusterID = "peer", "cluster"
+	peer := New(peerCfg)
+	defer peer.Close()
+	peer.applyCheckpoints([]groupCheckpoint{{Topic: "t", Group: "workers", MessageID: "completed", ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}})
+	server := httptest.NewServer(peer.Handler())
+	defer server.Close()
+	cfg := DefaultConfig()
+	cfg.Peers, cfg.PeerToken, cfg.ClusterID = []string{server.URL}, "peer", "cluster"
+	b := New(cfg)
+	defer b.Close()
+	if err := b.SyncFromPeers(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b.mu.RLock()
+	active := b.checkpointActiveLocked("t", "workers", "completed", time.Now().UnixMilli())
+	b.mu.RUnlock()
+	if !active {
+		t.Fatal("joining replica did not bootstrap the group checkpoint")
 	}
 }
 

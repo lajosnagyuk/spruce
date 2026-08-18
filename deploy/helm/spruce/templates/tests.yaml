@@ -46,7 +46,7 @@ spec:
           wait "$b" || test $? = 28
           test "$(grep -a -l 'opaque-helm-test-payload' /tmp/member-a /tmp/member-b | wc -l | tr -d ' ')" = 1
           {{- range $i := until (int .Values.replicaCount) }}
-          test "$(curl -ksS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $ADMIN_TOKEN" "{{ include "spruce.scheme" $ }}://{{ include "spruce.fullname" $ }}-{{ $i }}.{{ include "spruce.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local:{{ $.Values.service.port }}/v1/status/messages/$id")" = 204
+          test "$(curl -ksS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $ADMIN_TOKEN" "{{ include "spruce.scheme" $ }}://{{ include "spruce.fullname" $ }}-{{ $i }}.{{ include "spruce.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.clusterDomain }}:{{ $.Values.service.port }}/v1/status/messages/$id")" = 204
           {{- end }}
       volumeMounts:
         - {name: tmp, mountPath: /tmp}

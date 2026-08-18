@@ -13,7 +13,9 @@ public sealed record SubscribeOptions(
     long Since = 0,
     int Concurrency = 16,
     int MaxPayloadBytes = 1024 * 1024,
-    TimeSpan? DrainTimeout = null);
+    TimeSpan? DrainTimeout = null,
+    bool PreserveKeyOrder = false,
+    Deduper? Deduper = null);
 public sealed record BrokerStatus(
     [property: JsonPropertyName("messages")] int Messages,
     [property: JsonPropertyName("cache_accounted_bytes")] long CacheAccountedBytes,
@@ -63,12 +65,47 @@ public sealed class Deduper(int maxEntries = 65536, TimeSpan? ttl = null)
             return false;
         }
     }
+
+    public bool Contains(string id)
+    {
+        lock (_lock)
+        {
+            return _seen.TryGetValue(id, out var until) && until > DateTimeOffset.UtcNow;
+        }
+    }
+
+    public void Mark(string id)
+    {
+        lock (_lock)
+        {
+            var until = DateTimeOffset.UtcNow + _ttl;
+            _seen[id] = until;
+            _order.Enqueue((id, until));
+            while (_order.Count > _max)
+            {
+                var old = _order.Dequeue();
+                if (_seen.TryGetValue(old.Id, out var current) && current == old.Until) _seen.Remove(old.Id);
+            }
+        }
+    }
 }
 
 public sealed partial class SpruceClient
 {
-    public Task SubscribeAsync(SubscribeOptions options, Func<Delivery, CancellationToken, Task> handler, CancellationToken cancellationToken = default) =>
-        SubscribeAsync(options.Topic, options.Group, handler, cancellationToken, options.Concurrency, options.MaxPayloadBytes, options.Since, options.DrainTimeout);
+    public Task SubscribeAsync(SubscribeOptions options, Func<Delivery, CancellationToken, Task> handler, CancellationToken cancellationToken = default)
+    {
+        if (options.Deduper is null)
+            return SubscribeAsync(options.Topic, options.Group, handler, cancellationToken, options.Concurrency, options.MaxPayloadBytes, options.Since, options.DrainTimeout, options.PreserveKeyOrder);
+
+        async Task Handle(Delivery delivery, CancellationToken token)
+        {
+            if (options.Deduper.Contains(delivery.MessageId)) return;
+            await handler(delivery, token).ConfigureAwait(false);
+            options.Deduper.Mark(delivery.MessageId);
+        }
+
+        return SubscribeAsync(options.Topic, options.Group, Handle, cancellationToken, options.Concurrency, options.MaxPayloadBytes, options.Since, options.DrainTimeout, options.PreserveKeyOrder);
+    }
 
     public async IAsyncEnumerable<ConsumableDelivery> ReadAllAsync(SubscribeOptions options, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {

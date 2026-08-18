@@ -3,3 +3,8 @@ Spruce is available inside the cluster at:
 
 For local access:
   kubectl -n {{ .Release.Namespace }} port-forward service/{{ include "spruce.fullname" . }} 8080:{{ ternary .Values.gateway.service.port .Values.service.port .Values.gateway.enabled }}
+
+NetworkPolicy clients must match networkPolicy.clientIngress selectors. Newly created,
+short-lived Jobs should retry readiness because policy controllers may converge after
+the Pod starts. For alternate DNS, Ingress, or service-mesh components, configure the
+networkPolicy DNS/ingress selectors and clusterDomain values explicitly.

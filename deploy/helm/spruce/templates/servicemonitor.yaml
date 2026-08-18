@@ -23,6 +23,6 @@ spec:
           secret:
             name: {{ .Values.tls.existingSecret }}
             key: {{ .Values.tls.caKey }}
-        serverName: {{ include "spruce.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local
+        serverName: {{ include "spruce.fullname" . }}-headless.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}
       {{- end }}
 {{- end }}

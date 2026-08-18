@@ -2,14 +2,15 @@
 
 Spruce is a small, leaderless, in-memory event bus for service-to-service glue where Kafka is operationally excessive and rare message loss is acceptable.
 
-It provides opaque binary messages over HTTPS, N producers and consumers, broadcast and consumer-group delivery, bounded replay, Go and C# clients, Prometheus metrics, and a Kubernetes deployment.
+It provides opaque binary messages over HTTPS, N producers and consumers, broadcast and consumer-group delivery, bounded replay, Go, C#, and Python clients, Prometheus metrics, and a Kubernetes deployment.
 
 ## Delivery contract
 
 - Delivery is at least once while a message remains in a replica's bounded cache.
 - Messages are not persisted. Restarting every replica can lose all cached messages.
-- ACK and NACK are replica-local by default; retry is best effort.
+- Group ACK checkpoints are propagated and bootstrapped between replicas on a best-effort basis; NACK retry remains best effort.
 - Consumer groups deliver to one healthy member. Ungrouped subscribers receive broadcasts.
+- Reconnecting consumer groups skip acknowledged messages while their bounded in-memory checkpoints and messages remain cached.
 - Duplicate delivery is expected. First-party clients provide bounded client-side deduplication.
 - Payloads are opaque bytes. Spruce does not inspect schemas or formats.
 
@@ -118,6 +119,9 @@ helm upgrade --install spruce deploy/helm/spruce \
   --set ingress.tls[0].hosts[0]=spruce.example.com
 ```
 
+With these defaults the public Service is `spruce`, the headless Service is
+`spruce-headless`, and the namespace is `spruce`.
+
 Allow the Ingress controller through the default NetworkPolicy by labeling its
 namespace once, for example:
 
@@ -167,6 +171,12 @@ credential-safety contracts as Go and C#.
 
 All libraries use the public HTTPS API. They are conveniences, not protocol requirements.
 
+Tagged releases always build and retain the Python distributions. Publishing them to
+PyPI is opt-in: set the repository variable `PUBLISH_PYPI=true` only after configuring
+the repository as a PyPI trusted publisher. C#, image, and Helm release
+failures remain release-blocking and are not suppressed by this switch. Client package
+versions are derived from the `vMAJOR.MINOR.PATCH` release tag.
+
 ## Operations
 
 - `GET /health/live` reports process health.
@@ -195,7 +205,7 @@ make image
 make helm-lint
 ```
 
-Performance results and methodology are documented in [docs/PERFORMANCE.md](docs/PERFORMANCE.md). CI runs correctness, race, C# conformance, build, and Kubernetes render checks.
+Performance results and methodology are documented in [docs/PERFORMANCE.md](docs/PERFORMANCE.md). CI runs correctness, race, all-client conformance, Helm validation, and verified public/internal TLS rotation checks; a scheduled full-cache soak enforces the bounded memory envelope.
 
 ## Repository guide
 
@@ -206,6 +216,7 @@ Performance results and methodology are documented in [docs/PERFORMANCE.md](docs
 - `internal/broker`: cache, routing, replay, replication, and metrics.
 - `pkg/spruce`: Go client.
 - `clients/csharp`: C# client and conformance tests.
+- `clients/python`: Python client, packaging, and conformance tests.
 - `deploy/helm/spruce`: Kubernetes Helm chart.
 
 ## License

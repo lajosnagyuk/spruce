@@ -31,6 +31,7 @@ func main() {
 	cfg.MaxSubscriberInflightBytes = envInt64("SPRUCE_MAX_SUBSCRIBER_INFLIGHT_BYTES", cfg.MaxSubscriberInflightBytes)
 	cfg.MaxAttempts = int(envInt64("SPRUCE_MAX_ATTEMPTS", int64(cfg.MaxAttempts)))
 	cfg.IdempotencyEntries = int(envInt64("SPRUCE_IDEMPOTENCY_ENTRIES", int64(cfg.IdempotencyEntries)))
+	cfg.CheckpointEntries = int(envInt64("SPRUCE_CHECKPOINT_ENTRIES", int64(cfg.CheckpointEntries)))
 	cfg.MaxConcurrentRequests = int(envInt64("SPRUCE_MAX_CONCURRENT_REQUESTS", int64(cfg.MaxConcurrentRequests)))
 	cfg.MaxStreams = int(envInt64("SPRUCE_MAX_STREAMS", int64(cfg.MaxStreams)))
 	cfg.MaxInternalRequests = int(envInt64("SPRUCE_MAX_INTERNAL_REQUESTS", int64(cfg.MaxInternalRequests)))
@@ -67,7 +68,7 @@ func main() {
 			}
 		}
 	}
-	if cfg.CacheBytes <= 0 || cfg.MaxMessage <= 0 || cfg.QueueDepth <= 0 || cfg.DefaultTTL <= 0 || cfg.MaxTTL <= 0 || cfg.AckDeadline <= 0 || cfg.ReplicationQueueBytes <= 0 || cfg.ActionQueueBytes <= 0 || cfg.MaxInflightBytes <= 0 || cfg.MaxSubscriberInflightBytes <= 0 || cfg.MaxAttempts <= 0 || cfg.IdempotencyEntries <= 0 || cfg.MaxConcurrentRequests <= 0 || cfg.MaxStreams <= 0 || cfg.MaxInternalRequests <= 0 || cfg.DefaultTTL > cfg.MaxTTL {
+	if cfg.CacheBytes <= 0 || cfg.MaxMessage <= 0 || cfg.QueueDepth <= 0 || cfg.DefaultTTL <= 0 || cfg.MaxTTL <= 0 || cfg.AckDeadline <= 0 || cfg.ReplicationQueueBytes <= 0 || cfg.ActionQueueBytes <= 0 || cfg.MaxInflightBytes <= 0 || cfg.MaxSubscriberInflightBytes <= 0 || cfg.MaxAttempts <= 0 || cfg.IdempotencyEntries <= 0 || cfg.CheckpointEntries <= 0 || cfg.MaxConcurrentRequests <= 0 || cfg.MaxStreams <= 0 || cfg.MaxInternalRequests <= 0 || cfg.DefaultTTL > cfg.MaxTTL {
 		fmt.Fprintln(os.Stderr, "SPRUCE configuration limits must be positive and default TTL must not exceed max TTL")
 		os.Exit(2)
 	}
@@ -99,12 +100,29 @@ func main() {
 		}
 	}()
 	syncCtx, syncCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	if err := b.SyncFromPeers(syncCtx); err != nil && len(cfg.Peers) > 0 {
-		if !errors.Is(err, broker.ErrNoPeerSnapshot) {
-			log.Error("peer cache bootstrap failed", "error", err)
+	var syncErr error
+	for len(cfg.Peers) > 0 {
+		syncErr = b.SyncFromPeers(syncCtx)
+		if syncErr == nil || !errors.Is(syncErr, broker.ErrNoPeerSnapshot) {
+			break
+		}
+		timer := time.NewTimer(250 * time.Millisecond)
+		select {
+		case <-syncCtx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			goto bootstrapComplete
+		case <-timer.C:
+		}
+	}
+bootstrapComplete:
+	if syncErr != nil && len(cfg.Peers) > 0 {
+		if !errors.Is(syncErr, broker.ErrNoPeerSnapshot) {
+			log.Error("peer cache bootstrap failed", "error", syncErr)
 			os.Exit(1)
 		}
-		log.Warn("no peer cache available; starting with an empty cache", "error", err)
+		log.Warn("no peer cache available after bootstrap deadline; starting with an empty cache", "error", syncErr)
 	}
 	syncCancel()
 	b.Ready()

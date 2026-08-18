@@ -72,7 +72,7 @@ func (b *ProducerBatcher) Publish(ctx context.Context, topic string, payload []b
 	if topic == "" {
 		return PublishResult{}, errors.New("topic is required")
 	}
-	if len(payload)+4 > b.opts.MaxBytes || len(payload) > 1<<20 {
+	if batchEntrySize(payload, options.Key) > b.opts.MaxBytes || len(payload) > 1<<20 || len(options.Key) > 8<<10 {
 		return PublishResult{}, errors.New("payload exceeds batcher limits")
 	}
 	if options.IdempotencyKey != "" || (options.Ack != "" && options.Ack != "local") {
@@ -132,15 +132,19 @@ func (b *ProducerBatcher) run() {
 		if len(pending) == 0 {
 			return nil
 		}
-		payloads := make([][]byte, len(pending))
+		entries := make([]BatchEntry, 0, len(pending))
+		active := make([]*batchPublish, 0, len(pending))
 		for i := range pending {
-			payloads[i] = pending[i].payload
+			if pending[i].ctx.Err() == nil { entries = append(entries, BatchEntry{Payload: pending[i].payload, Key: pending[i].options.Key}); active = append(active, pending[i])
+			} else { pending[i].done <- batchPublishResult{err: pending[i].ctx.Err()} }
 		}
-		result, err := b.client.PublishBatch(b.ctx, pending[0].topic, payloads, pending[0].options)
-		if err == nil && len(result.IDs) != len(pending) {
+		if len(entries) == 0 { pending = pending[:0]; return nil }
+		shared := pending[0].options; shared.Key = ""
+		result, err := b.client.PublishBatchEntries(b.ctx, pending[0].topic, entries, shared)
+		if err == nil && len(result.IDs) != len(active) {
 			err = errors.New("spruce: invalid batch result count")
 		}
-		for i, item := range pending {
+		for i, item := range active {
 			logical := PublishResult{}
 			if err == nil && i < len(result.IDs) {
 				logical.ID = result.IDs[i]
@@ -159,11 +163,11 @@ func (b *ProducerBatcher) run() {
 		}
 		return err
 	}
-	compatible := func(a, c *batchPublish) bool { return a.topic == c.topic && a.options == c.options }
+	compatible := func(a, c *batchPublish) bool { ao, co := a.options, c.options; ao.Key, co.Key = "", ""; return a.topic == c.topic && ao == co }
 	bytes := func(items []*batchPublish) int {
 		n := 0
 		for _, item := range items {
-			n += 4 + len(item.payload)
+			n += 6 + len(item.options.Key) + len(item.payload)
 		}
 		return n
 	}
@@ -195,7 +199,7 @@ func (b *ProducerBatcher) run() {
 				item.done <- batchPublishResult{err: item.ctx.Err()}
 				continue
 			}
-			if len(pending) > 0 && (!compatible(pending[0], item) || len(pending) >= b.opts.MaxMessages || bytes(pending)+4+len(item.payload) > b.opts.MaxBytes) {
+			if len(pending) > 0 && (!compatible(pending[0], item) || len(pending) >= b.opts.MaxMessages || bytes(pending)+batchEntrySize(item.payload, item.options.Key) > b.opts.MaxBytes) {
 				_ = flush()
 			}
 			pending = append(pending, item)
@@ -209,3 +213,5 @@ func (b *ProducerBatcher) run() {
 		}
 	}
 }
+
+func batchEntrySize(payload []byte, key string) int { return 6 + len(key) + len(payload) }

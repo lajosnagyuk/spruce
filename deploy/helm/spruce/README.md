@@ -1,6 +1,8 @@
 # Spruce Helm chart
 
 This chart deploys bounded, interchangeable Spruce brokers and a stateless Nginx gateway.
+Release charts are published as `oci://ghcr.io/lajosnagyuk/charts/spruce` with the
+release semantic version as the OCI tag.
 
 ```sh
 helm upgrade --install spruce deploy/helm/spruce \
@@ -16,6 +18,10 @@ helm upgrade --install spruce deploy/helm/spruce \
   --set ingress.tls[0].hosts[0]=spruce.example.com
 ```
 
+The default release produces `spruce`, `spruce-headless`, and `spruce-admin`
+Services in the `spruce` namespace. `nameOverride` and `fullnameOverride` remain
+available when platform naming policy requires different resource names.
+
 Label the Ingress controller namespace before installation so the default NetworkPolicy
 admits it: `kubectl label namespace ingress-nginx spruce.io/ingress-access=true`.
 
@@ -29,15 +35,32 @@ admits it: `kubectl label namespace ingress-nginx spruce.io/ingress-access=true`
 | `image.repository` | `ghcr.io/lajosnagyuk/spruce` | Broker image |
 | `image.digest` | empty | Immutable broker digest; required outside local `pullPolicy=Never` development |
 | `auth.existingSecret` | empty | Secret containing peer, cluster, client, and admin credentials |
+| `auth.requireExistingSecret` | `false` | Fail rendering unless externally managed credentials are selected |
+| `clusterDomain` | `cluster.local` | Kubernetes cluster DNS suffix |
 | `tls.enabled` | `false` | Gateway-to-broker and peer HTTPS; plaintext requires explicit opt-in |
 | `tls.existingSecret` | empty | TLS Secret with `tls.crt`, `tls.key`, and `ca.crt` |
 | `config.cacheBytes` | `67108864` | Per-broker payload and metadata cache budget |
 | `resources.requests.memory` | `96Mi` | Broker memory request |
 | `resources.limits.memory` | `256Mi` | Broker memory hard limit |
 
-When `auth.existingSecret` is empty, Helm generates and preserves credentials. Production
-installations should use an externally managed Secret. See `docs/OPERATIONS.md` for the
-three-stage current/previous token rotation protocol.
+When `auth.existingSecret` is empty, Helm generates credentials and preserves them only
+during a live Helm upgrade where `lookup` can read the existing Secret. Offline/GitOps
+rendering cannot preserve generated values. Production and GitOps installations should
+set `auth.requireExistingSecret=true` and use an externally managed Secret. See
+`docs/OPERATIONS.md` for the three-stage current/previous token rotation protocol.
+
+The default NetworkPolicy expects CoreDNS at `kube-dns.kube-system` with label
+`k8s-app=kube-dns`, and permits clients selected by `spruce.io/client-access=true`.
+Override `networkPolicy.dns`, `networkPolicy.ingressControllerIngress`, and
+`clusterDomain` for other DNS, Ingress, or service-mesh layouts. Short-lived Jobs should
+retry the readiness endpoint before publishing because policy selectors can converge
+after Pod startup.
+
+`scripts/k3s-soak.sh` requires `SPRUCE_TOOLS_IMAGE` to name an image pullable by every
+node, preferably by immutable digest. A node-local `spruce:tools` image is suitable only
+when explicitly supplied with `SPRUCE_TOOLS_PULL_POLICY=Never` and preloaded everywhere.
+The soak defaults to verified broker HTTPS using `SPRUCE_TLS_SECRET`; plaintext gateway
+testing requires the explicit local-only `SPRUCE_ALLOW_INSECURE=1` override.
 
 ## Why the gateway exists
 

@@ -19,7 +19,12 @@
 {{- if .Values.fullnameOverride }}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
 {{- else }}
-{{- printf "%s-%s" .Release.Name (include "spruce.name" .) | trunc 63 | trimSuffix "-" }}
+{{- $name := include "spruce.name" . }}
+{{- if contains $name .Release.Name }}
+{{- .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- end }}
 {{- end }}
 {{- end }}
 
@@ -43,6 +48,17 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- define "spruce.scheme" -}}{{ ternary "https" "http" .Values.tls.enabled }}{{- end }}
 
 {{- define "spruce.validate" -}}
+{{- if lt (int .Values.replicaCount) 1 -}}{{- fail "replicaCount must be at least 1" -}}{{- end -}}
+{{- if lt (int .Values.gateway.replicaCount) 1 -}}{{- fail "gateway.replicaCount must be at least 1" -}}{{- end -}}
+{{- if or (lt (int .Values.service.port) 1) (gt (int .Values.service.port) 65535) -}}{{- fail "service.port must be between 1 and 65535" -}}{{- end -}}
+{{- if or (lt (int .Values.gateway.service.port) 1) (gt (int .Values.gateway.service.port) 65535) -}}{{- fail "gateway.service.port must be between 1 and 65535" -}}{{- end -}}
+{{- range $name, $duration := dict "config.defaultTTL" .Values.config.defaultTTL "config.maxTTL" .Values.config.maxTTL "config.ackDeadline" .Values.config.ackDeadline "config.drainDelay" .Values.config.drainDelay -}}
+{{- if regexMatch "^([0]+(ns|us|µs|ms|s|m|h))+$" $duration -}}{{- fail (printf "%s must be greater than zero" $name) -}}{{- end -}}
+{{- end -}}
+{{- if and .Values.podDisruptionBudget.enabled (ge (int .Values.podDisruptionBudget.maxUnavailable) (int .Values.replicaCount)) -}}
+{{- fail "podDisruptionBudget.maxUnavailable must be less than replicaCount" -}}{{- end -}}
+{{- if and .Values.gateway.podDisruptionBudget.enabled (ge (int .Values.gateway.podDisruptionBudget.maxUnavailable) (int .Values.gateway.replicaCount)) -}}
+{{- fail "gateway.podDisruptionBudget.maxUnavailable must be less than gateway.replicaCount" -}}{{- end -}}
 {{- if and (not .Values.image.digest) (ne .Values.image.pullPolicy "Never") -}}
 {{- fail "image.digest is required for deployable releases; mutable tags are allowed only with image.pullPolicy=Never for local development" -}}
 {{- end -}}
@@ -57,6 +73,9 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- if not .Values.gateway.enabled -}}
 {{- fail "gateway.enabled=false is unsupported because it bypasses public/admin/internal route separation" -}}
+{{- end -}}
+{{- if and .Values.auth.requireExistingSecret (not .Values.auth.existingSecret) -}}
+{{- fail "auth.requireExistingSecret=true requires auth.existingSecret; generated credentials are unsafe for offline/GitOps rendering" -}}
 {{- end -}}
 {{- if and .Values.benchmark.enabled (or (not .Values.benchmark.image.repository) (and (not .Values.benchmark.image.digest) (not .Values.benchmark.image.tag))) -}}
 {{- fail "benchmark.enabled requires a separately built benchmark.image (Docker target: tools)" -}}

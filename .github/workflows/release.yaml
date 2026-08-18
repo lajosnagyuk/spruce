@@ -8,6 +8,21 @@ permissions:
   id-token: write
   attestations: write
 jobs:
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: azure/setup-helm@bf6a7d304bc2fdb57e0331155b7ebf2c504acf0a # v4
+      - run: |
+          version="${GITHUB_REF_NAME#v}"
+          helm lint deploy/helm/spruce --set image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --set tls.allowInsecureTransport=true --set gateway.allowInsecureClientTransport=true
+          helm package deploy/helm/spruce --version "$version" --app-version "$version" --destination artifacts
+          echo "$GITHUB_TOKEN" | helm registry login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          helm push "artifacts/spruce-$version.tgz" "oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with: {name: helm-chart, path: 'artifacts/*.tgz'}
   image:
     runs-on: ubuntu-latest
     outputs:
@@ -26,18 +41,21 @@ jobs:
           outputs: type=oci,dest=/tmp/spruce.oci.tar
           provenance: mode=max
           sbom: true
+      - run: |
+          mkdir -p /tmp/spruce-oci
+          tar -xf /tmp/spruce.oci.tar -C /tmp/spruce-oci
       - uses: aquasecurity/trivy-action@2736533278103862a861f4a35ebac3e97854d956
         env:
           TRIVY_PLATFORM: linux/amd64
         with:
-          input: /tmp/spruce.oci.tar
+          input: /tmp/spruce-oci
           severity: CRITICAL,HIGH
           exit-code: '1'
       - uses: aquasecurity/trivy-action@2736533278103862a861f4a35ebac3e97854d956
         env:
           TRIVY_PLATFORM: linux/arm64
         with:
-          input: /tmp/spruce.oci.tar
+          input: /tmp/spruce-oci
           severity: CRITICAL,HIGH
           exit-code: '1'
       - run: sudo apt-get update && sudo apt-get install -y skopeo
@@ -82,7 +100,6 @@ jobs:
         with: {name: csharp-client, path: 'artifacts/*.nupkg'}
   python:
     runs-on: ubuntu-latest
-    environment: pypi
     permissions:
       contents: read
       id-token: write
@@ -96,7 +113,8 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           sed -i "s/__version__ = \"[^\"]*\"/__version__ = \"$version\"/" clients/python/src/spruce/__init__.py
           python -m build --outdir artifacts clients/python
-      - uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
-        with: {packages-dir: artifacts}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with: {name: python-client, path: artifacts/*}
+      - uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        if: vars.PUBLISH_PYPI == 'true'
+        with: {packages-dir: artifacts}

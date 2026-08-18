@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := build
-.PHONY: build test test-race benchmark perf-test csharp csharp-pack python python-pack image image-tools image-python-probe compose-up compose-down smoke validate-local helm-lint helm-render helm-install clean
+.PHONY: build test test-race benchmark perf-test csharp csharp-pack python python-pack image image-tools image-python-probe compose-up compose-down smoke validate-local helm-lint helm-render helm-test helm-install clean
 
 BIN := bin
 GOCACHE ?= $(CURDIR)/.cache/go-build
@@ -70,6 +70,9 @@ helm-lint:
 
 helm-render:
 	helm template spruce deploy/helm/spruce --set image.repository=spruce --set image.tag=dev --set image.pullPolicy=Never --set tls.allowInsecureTransport=true --set gateway.allowInsecureClientTransport=true
+
+helm-test:
+	sh scripts/test-helm-validation.sh
 
 helm-install:
 	helm upgrade --install spruce deploy/helm/spruce --namespace spruce --create-namespace --set image.repository=spruce --set image.tag=dev --set image.pullPolicy=Never --set tls.allowInsecureTransport=true --set gateway.allowInsecureClientTransport=true
