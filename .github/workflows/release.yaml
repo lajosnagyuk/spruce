@@ -115,6 +115,6 @@ jobs:
           python -m build --outdir artifacts clients/python
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with: {name: python-client, path: artifacts/*}
-      - uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         if: vars.PUBLISH_PYPI == 'true'
         with: {packages-dir: artifacts}
