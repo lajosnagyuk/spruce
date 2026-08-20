@@ -21,7 +21,7 @@ jobs:
           helm push "artifacts/spruce-$version.tgz" "oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with: {name: helm-chart, path: 'artifacts/*.tgz'}
   image:
     runs-on: ubuntu-latest
@@ -77,7 +77,7 @@ jobs:
           output-file: spruce.spdx.json
       - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
       - run: cosign sign --yes ghcr.io/${{ github.repository }}@${{ steps.digest.outputs.digest }}
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: supply-chain
           path: |
@@ -96,7 +96,7 @@ jobs:
           dotnet nuget push 'artifacts/*.nupkg' --source "https://nuget.pkg.github.com/${GITHUB_REPOSITORY_OWNER}/index.json" --api-key "$GITHUB_TOKEN" --skip-duplicate
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with: {name: csharp-client, path: 'artifacts/*.nupkg'}
   python:
     runs-on: ubuntu-latest
@@ -113,7 +113,7 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           sed -i "s/__version__ = \"[^\"]*\"/__version__ = \"$version\"/" clients/python/src/spruce/__init__.py
           python -m build --outdir artifacts clients/python
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with: {name: python-client, path: artifacts/*}
       - uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
         if: vars.PUBLISH_PYPI == 'true'
