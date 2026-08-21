@@ -9,6 +9,10 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule: {interval: weekly}
+    # Workflow actions are commit-SHA pinned and release-sensitive. Upgrade
+    # them deliberately with the full CI and publication path rather than as
+    # independent automated pull requests.
+    open-pull-requests-limit: 0
   - package-ecosystem: docker
     directory: /
     schedule: {interval: weekly}
