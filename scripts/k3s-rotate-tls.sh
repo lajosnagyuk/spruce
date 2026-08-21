@@ -17,7 +17,9 @@ work=${TMPDIR:-/tmp}/spruce-tls-rotation-$$
 mkdir -m 700 "$work"
 kubectl --context "$context" -n "$namespace" get secret "$secret" -o yaml >"$work/original-secret.yaml"
 committed=0
+forward_pid=
 cleanup() {
+  if test -n "$forward_pid"; then kill "$forward_pid" 2>/dev/null || true; fi
   if test "$committed" -ne 1; then
     kubectl --context "$context" apply -f "$work/original-secret.yaml" >/dev/null 2>&1 || true
     helm --kube-context "$context" -n "$namespace" upgrade "$release" deploy/helm/spruce --reuse-values --set benchmark.enabled=false --wait --timeout 8m >/dev/null 2>&1 || true
@@ -59,18 +61,38 @@ apply_tls() {
 }
 roll() { helm --kube-context "$context" -n "$namespace" upgrade "$release" deploy/helm/spruce --reuse-values --set benchmark.enabled=false --wait --timeout 8m >/dev/null; }
 token=$(kubectl --context "$context" -n "$namespace" get secret "$auth" -o jsonpath='{.data.client-token}' | base64 -d)
-publish() {
-  pod=$(kubectl --context "$context" -n "$namespace" get pod -l app.kubernetes.io/component=broker -o jsonpath='{.items[0].metadata.name}')
-  url="https://$pod.$fullname-headless.$namespace.svc.$cluster_domain:$service_port/v1/topics/tls-rotation/messages"
-  kubectl --context "$context" -n "$namespace" exec deploy/"$fullname-gateway" -- \
-    wget -qO- --header="Authorization: Bearer $token" --ca-certificate=/tls/ca.crt --post-data=tls-rotation "$url" >/dev/null
+forward_curl() {
+  pod=$1 ca=$2 path=$3 credential=$4 data=${5-}
+  host="$pod.$fullname-headless.$namespace.svc.$cluster_domain"
+  local_port=$((20000 + $$ % 20000))
+  kubectl --context "$context" -n "$namespace" port-forward pod/"$pod" "$local_port:$service_port" >"$work/port-forward.log" 2>&1 &
+  forward_pid=$!
+  ready=0
+  for _ in $(seq 1 30); do
+    if curl --cacert "$ca" --resolve "$host:$local_port:127.0.0.1" -fsS "https://$host:$local_port/health/ready" >/dev/null 2>&1; then ready=1; break; fi
+    sleep 1
+  done
+  test "$ready" = 1
+  if test -n "$data"; then
+    curl --cacert "$ca" --resolve "$host:$local_port:127.0.0.1" -fsS -H "Authorization: Bearer $credential" --data-binary "$data" "https://$host:$local_port$path"
+  else
+    curl --cacert "$ca" --resolve "$host:$local_port:127.0.0.1" -fsS -H "Authorization: Bearer $credential" "https://$host:$local_port$path"
+  fi
+  kill "$forward_pid" 2>/dev/null || true
+  wait "$forward_pid" 2>/dev/null || true
+  forward_pid=
 }
-apply_tls "$work/old.crt" "$work/old.key" "$work/bundle.crt"; roll; publish
-apply_tls "$work/new.crt" "$work/new.key" "$work/bundle.crt"; roll; publish
-apply_tls "$work/new.crt" "$work/new.key" "$work/new-ca.crt"; roll; publish
+publish() {
+  ca=$1
+  pod=$(kubectl --context "$context" -n "$namespace" get pod -l app.kubernetes.io/component=broker -o jsonpath='{.items[0].metadata.name}')
+  forward_curl "$pod" "$ca" /v1/topics/tls-rotation/messages "$token" tls-rotation >/dev/null
+}
+apply_tls "$work/old.crt" "$work/old.key" "$work/bundle.crt"; roll; publish "$work/bundle.crt"
+apply_tls "$work/new.crt" "$work/new.key" "$work/bundle.crt"; roll; publish "$work/bundle.crt"
+apply_tls "$work/new.crt" "$work/new.key" "$work/new-ca.crt"; roll; publish "$work/new-ca.crt"
 admin=$(kubectl --context "$context" -n "$namespace" get secret "$auth" -o jsonpath='{.data.admin-token}' | base64 -d)
 for pod in $(kubectl --context "$context" -n "$namespace" get pod -l app.kubernetes.io/component=broker -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}'); do
-  metrics=$(kubectl --context "$context" -n "$namespace" exec deploy/"$fullname-gateway" -- wget -qO- --header="Authorization: Bearer $admin" --ca-certificate=/tls/ca.crt "https://$pod.$fullname-headless.$namespace.svc.$cluster_domain:$service_port/metrics")
+  metrics=$(forward_curl "$pod" "$work/new-ca.crt" /metrics "$admin")
   test "$(printf '%s\n' "$metrics" | awk '/^spruce_replication_errors_total / {print $2}')" = 0
   test "$(printf '%s\n' "$metrics" | awk '/^spruce_replication_dropped_messages_total / {print $2}')" = 0
 done

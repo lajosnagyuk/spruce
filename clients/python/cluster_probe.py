@@ -15,6 +15,7 @@ client = Client(url, token=token, ssl_context=context)
 topic = "python-probe-" + uuid.uuid4().hex
 stop = threading.Event()
 received = set()
+subscriber_errors = []
 
 
 def consume(delivery):
@@ -23,9 +24,15 @@ def consume(delivery):
         stop.set()
 
 
+def subscribe():
+    try:
+        client.subscribe(SubscribeOptions(topic, group="python", concurrency=16), consume, stop)
+    except BaseException as exc:
+        subscriber_errors.append(exc)
+
+
 subscriber = threading.Thread(
-    target=client.subscribe,
-    args=(SubscribeOptions(topic, group="python", concurrency=16), consume, stop),
+    target=subscribe,
     daemon=True,
 )
 subscriber.start()
@@ -37,6 +44,8 @@ stop.set()
 subscriber.join(2)
 if subscriber.is_alive():
     raise RuntimeError("Python subscriber did not stop cooperatively")
+if subscriber_errors:
+    raise RuntimeError("Python subscriber failed") from subscriber_errors[0]
 if len(received) != 100:
     raise RuntimeError(f"expected 100 unique messages, received {len(received)}")
 print("Python live cluster probe passed: 100/100 unique group messages")

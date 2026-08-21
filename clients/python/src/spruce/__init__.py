@@ -317,7 +317,7 @@ class Client:
                           if future.done():
                               raise
                           raise HandlerDrainTimeoutError("Spruce handlers did not stop before drain timeout") from exc
-                  if stream_error is not None:
+                  if stream_error is not None and not stop.is_set():
                       raise stream_error
                 finally:
                     accept_completions.clear()
