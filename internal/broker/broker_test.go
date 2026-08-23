@@ -6,10 +6,14 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -82,7 +86,7 @@ func TestReplicationDeduplicates(t *testing.T) {
 	cfg.ClusterID = "test-cluster"
 	b := New(cfg)
 	defer b.Close()
-	m := &Message{ID: "same", Topic: "test", Payload: []byte("hi"), CreatedAt: time.Now().UnixMilli(), ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
+	m := &Message{ID: "same", Topic: "test", Payload: []byte("hi"), CreatedAt: time.Now().UnixMilli(), ExpiresAt: time.Now().Add(time.Minute).UnixMilli(), Origin: "origin", Sequence: 1}
 	var body bytes.Buffer
 	if err := writePeerBatch(&body, []*Message{m}); err != nil {
 		t.Fatal(err)
@@ -91,6 +95,7 @@ func TestReplicationDeduplicates(t *testing.T) {
 		r := httptest.NewRequest("POST", "/internal/replicate", bytes.NewReader(body.Bytes()))
 		r.Header.Set("Spruce-Peer-Token", cfg.PeerToken)
 		r.Header.Set("Spruce-Cluster-ID", cfg.ClusterID)
+		r.Header.Set("Spruce-Peer-Version", "2")
 		w := httptest.NewRecorder()
 		b.Handler().ServeHTTP(w, r)
 		if w.Code != 204 {
@@ -205,16 +210,20 @@ func TestPublishBatchV2PreservesPerEntryKeys(t *testing.T) {
 		key := []byte([]string{"first", "second"}[i])
 		var keySize [2]byte
 		binary.BigEndian.PutUint16(keySize[:], uint16(len(key)))
-		body.Write(keySize[:]); body.Write(key)
+		body.Write(keySize[:])
+		body.Write(key)
 		var size [4]byte
 		binary.BigEndian.PutUint32(size[:], uint32(len(payload)))
-		body.Write(size[:]); body.Write(payload)
+		body.Write(size[:])
+		body.Write(payload)
 	}
 	r := httptest.NewRequest("POST", "/v1/topics/batch-v2/batches", &body)
 	r.Header.Set("Spruce-Batch-Version", "2")
 	w := httptest.NewRecorder()
 	b.Handler().ServeHTTP(w, r)
-	if w.Code != http.StatusAccepted { t.Fatalf("status %d: %s", w.Code, w.Body.String()) }
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
 	messages := b.cache.snapshot("batch-v2", 0)
 	if len(messages) != 2 || messages[0].Key != "first" || messages[1].Key != "second" {
 		t.Fatalf("per-entry keys lost: %#v", messages)
@@ -1173,6 +1182,72 @@ func TestInvalidSinceIsRejected(t *testing.T) {
 	}
 }
 
+func TestLegacyTimestampSinceReplaysCleanTopic(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	now := time.Now()
+	if _, err := b.accept(&Message{ID: "legacy", Topic: "t", CreatedAt: now.UnixMilli(), ExpiresAt: now.Add(time.Minute).UnixMilli()}); err != nil {
+		t.Fatal(err)
+	}
+	s := httptest.NewServer(b.Handler())
+	defer s.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, s.URL+"/v1/subscriptions/stream?topic=t&since=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+	var sizes [8]byte
+	_, err = io.ReadFull(resp.Body, sizes[:])
+	var d Delivery
+	if err == nil {
+		meta := make([]byte, binary.BigEndian.Uint32(sizes[:4]))
+		_, err = io.ReadFull(resp.Body, meta)
+		if err == nil {
+			err = json.Unmarshal(meta, &d)
+		}
+	}
+	if err != nil || d.MessageID != "legacy" {
+		t.Fatalf("delivery=%+v err=%v", d, err)
+	}
+}
+
+func TestLegacyTimestampSinceFailsClosedAfterTopicLoss(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CacheBytes = 300
+	b := New(cfg)
+	defer b.Close()
+	now := time.Now()
+	for i := range 4 {
+		_, _ = b.accept(&Message{ID: fmt.Sprintf("loss-%d", i), Topic: "t", Payload: make([]byte, 100), CreatedAt: now.Add(time.Duration(i) * time.Millisecond).UnixMilli(), ExpiresAt: now.Add(time.Minute).UnixMilli()})
+	}
+	r := httptest.NewRequest(http.MethodGet, "/v1/subscriptions/stream?topic=t&since=1", nil)
+	w := httptest.NewRecorder()
+	b.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "cursor_expired") {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestOpaqueCursorPathRemainsAvailableOnCleanTopic(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r := httptest.NewRequest(http.MethodGet, "/v1/subscriptions/stream?topic=t&cursor="+url.QueryEscape(encodeReplayCursor(map[string]uint64{})), nil).WithContext(ctx)
+	w := httptest.NewRecorder()
+	b.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestClientTokenProtectsPublicAPI(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ClientToken = "secret"
@@ -1236,6 +1311,60 @@ func TestHealthBypassesPublicAdmissionLimit(t *testing.T) {
 	}
 }
 
+func TestPublishAdmissionRejectsWithRetryHint(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PublishAdmissionWait = time.Millisecond
+	b := New(cfg)
+	defer b.Close()
+	b.publishAdmissionBytes.Store(cfg.PublishAdmissionBytes)
+	r := httptest.NewRequest("POST", "/v1/topics/t/messages", bytes.NewReader([]byte("x")))
+	w := httptest.NewRecorder()
+	b.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusTooManyRequests || w.Header().Get("Retry-After") != "1" {
+		t.Fatalf("status=%d retry-after=%q body=%s", w.Code, w.Header().Get("Retry-After"), w.Body.String())
+	}
+}
+
+func TestPublishAdmissionReleasesBudget(t *testing.T) {
+	cfg := DefaultConfig()
+	b := New(cfg)
+	defer b.Close()
+	r := httptest.NewRequest("POST", "/v1/topics/t/messages", bytes.NewReader([]byte("payload")))
+	w := httptest.NewRecorder()
+	b.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if got := b.publishAdmissionBytes.Load(); got != 0 {
+		t.Fatalf("admission bytes=%d", got)
+	}
+}
+
+func TestStreamRejectsCursorBehindEvictionWatermark(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CacheBytes = 300
+	b := New(cfg)
+	defer b.Close()
+	now := time.Now()
+	first := &Message{ID: "first", Topic: "t", Payload: make([]byte, 100), CreatedAt: now.UnixMilli(), ExpiresAt: now.Add(time.Minute).UnixMilli(), Origin: "origin", Sequence: 1}
+	second := &Message{ID: "second", Topic: "t", Payload: make([]byte, 100), CreatedAt: now.Add(time.Millisecond).UnixMilli(), ExpiresAt: now.Add(time.Minute).UnixMilli(), Origin: "origin", Sequence: 2}
+	if _, err := b.cache.put(first, now.UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.cache.put(second, now.UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest("GET", "/v1/subscriptions/stream?topic=t&cursor="+url.QueryEscape(encodeReplayCursor(map[string]uint64{"origin": 0})), nil)
+	w := httptest.NewRecorder()
+	b.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "cursor_expired") {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if got := b.metrics.CursorExpired.Load(); got != 1 {
+		t.Fatalf("cursor expired metric=%d", got)
+	}
+}
+
 func TestCacheRejectsAggregateOversizedBatch(t *testing.T) {
 	c := newCache(180)
 	messages := []*Message{
@@ -1247,6 +1376,199 @@ func TestCacheRejectsAggregateOversizedBatch(t *testing.T) {
 	}
 	if c.has("one") || c.has("two") {
 		t.Fatal("rejected batch partially mutated the cache")
+	}
+}
+
+func TestOpaqueReplayCursorIgnoresWallClockOrdering(t *testing.T) {
+	c := newCache(1 << 20)
+	now := time.Now()
+	messages := []*Message{
+		{ID: "first", Topic: "t", Origin: "a", Sequence: 1, CreatedAt: now.UnixMilli(), ExpiresAt: now.Add(time.Minute).UnixMilli()},
+		{ID: "equal-time", Topic: "t", Origin: "a", Sequence: 2, CreatedAt: now.UnixMilli(), ExpiresAt: now.Add(time.Minute).UnixMilli()},
+		{ID: "late-skewed-origin", Topic: "t", Origin: "b", Sequence: 1, CreatedAt: now.Add(-time.Hour).UnixMilli(), ExpiresAt: now.Add(time.Minute).UnixMilli()},
+	}
+	if _, err := c.putBatch(messages, now.UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	replay := c.replayLocked("t", map[string]uint64{"a": 1})
+	c.mu.Unlock()
+	if len(replay) != 2 || replay[0].ID != "equal-time" || replay[1].ID != "late-skewed-origin" {
+		t.Fatalf("unexpected replay: %#v", replay)
+	}
+}
+
+func TestOpaqueReplayCursorRoundTripAndPressureFrontier(t *testing.T) {
+	cursor := map[string]uint64{"origin-a": 7, "origin-b": 3}
+	decoded, err := decodeReplayCursor(encodeReplayCursor(cursor))
+	if err != nil || decoded["origin-a"] != 7 || decoded["origin-b"] != 3 {
+		t.Fatalf("decoded=%v err=%v", decoded, err)
+	}
+	frontier := &topicFrontier{Sequences: map[string]uint64{"origin-a": 8}}
+	if !frontierBehind(decoded, frontier) {
+		t.Fatal("cursor behind pressure frontier was accepted")
+	}
+	decoded["origin-a"] = 8
+	if frontierBehind(decoded, frontier) {
+		t.Fatal("cursor at pressure frontier was rejected")
+	}
+}
+
+func TestConcurrentAcceptanceSequencesMatchDeliveryOrder(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	s := &subscriber{id: "s", topic: "t", ch: make(chan Delivery, 128)}
+	b.mu.Lock()
+	b.addSubscriberLocked(s)
+	b.mu.Unlock()
+	var started sync.WaitGroup
+	started.Add(64)
+	for i := range 64 {
+		go func(i int) {
+			defer started.Done()
+			_, _ = b.accept(&Message{ID: fmt.Sprintf("m-%d", i), Topic: "t", ExpiresAt: time.Now().Add(time.Minute).UnixMilli()})
+		}(i)
+	}
+	started.Wait()
+	var previous uint64
+	for range 64 {
+		d := <-s.ch
+		if d.sequence != previous+1 {
+			t.Fatalf("delivery sequence jumped from %d to %d", previous, d.sequence)
+		}
+		previous = d.sequence
+	}
+}
+
+func TestReplayingConsumerGroupDefersToOneOwner(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	a := &subscriber{id: "a", topic: "t", group: "g", replaying: true, ch: make(chan Delivery, 1)}
+	c := &subscriber{id: "c", topic: "t", group: "g", replaying: true, ch: make(chan Delivery, 1)}
+	b.mu.Lock()
+	b.addSubscriberLocked(a)
+	b.addSubscriberLocked(c)
+	b.mu.Unlock()
+	b.deliver(&Message{ID: "m", Topic: "t", ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}, "", 1)
+	if len(a.deferred)+len(c.deferred) != 1 {
+		t.Fatalf("group replay fanout: a=%d c=%d", len(a.deferred), len(c.deferred))
+	}
+}
+
+func TestCursorAndLegacyPeerBounds(t *testing.T) {
+	tooMany := make(map[string]uint64, 257)
+	for i := range 257 {
+		tooMany[fmt.Sprint(i)] = 1
+	}
+	if encodeReplayCursor(tooMany) != "" {
+		t.Fatal("oversized origin vector encoded")
+	}
+	m := &Message{ID: "m", Topic: "t", Payload: []byte("opaque"), CreatedAt: 1, ExpiresAt: 2, Origin: "ignored", Sequence: 9}
+	var body bytes.Buffer
+	if err := writePeerBatchV1(&body, []*Message{m}); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := readPeerBatchV1(&body, 1<<20)
+	if err != nil || len(decoded) != 1 || decoded[0].Origin != "" || string(decoded[0].Payload) != "opaque" {
+		t.Fatalf("decoded=%v err=%v", decoded, err)
+	}
+}
+
+func TestReplicationHoldsSequenceGapUntilContiguous(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	s := &subscriber{id: "s", topic: "t", ch: make(chan Delivery, 2)}
+	b.mu.Lock()
+	b.addSubscriberLocked(s)
+	b.mu.Unlock()
+	expires := time.Now().Add(time.Minute).UnixMilli()
+	second := &Message{ID: "second", Topic: "t", Origin: "origin.t", Sequence: 2, ExpiresAt: expires}
+	if err := b.acceptReplicatedBatch([]*Message{second}); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.ch) != 0 || b.cache.has(second.ID) {
+		t.Fatal("out-of-order message was exposed")
+	}
+	b.cache.mu.Lock()
+	if !b.cache.topicUnsafeLocked("t", time.Now().UnixMilli()) {
+		t.Fatal("gap topic was not rejected")
+	}
+	if b.cache.topicUnsafeLocked("unrelated", time.Now().UnixMilli()) {
+		t.Fatal("gap contaminated unrelated topic")
+	}
+	b.cache.mu.Unlock()
+	first := &Message{ID: "first", Topic: "t", Origin: "origin.t", Sequence: 1, ExpiresAt: expires}
+	if err := b.acceptReplicatedBatch([]*Message{first}); err != nil {
+		t.Fatal(err)
+	}
+	for want := uint64(1); want <= 2; want++ {
+		if got := (<-s.ch).sequence; got != want {
+			t.Fatalf("sequence=%d want=%d", got, want)
+		}
+	}
+	b.cache.mu.Lock()
+	if b.cache.topicUnsafeLocked("t", time.Now().UnixMilli()) {
+		t.Fatal("resolved gap remained unsafe")
+	}
+	b.cache.mu.Unlock()
+}
+
+func TestReplicationGapOverflowRemainsTopicScopedUnsafe(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	b.cache.reorderLimit = 0
+	m := &Message{ID: "overflow", Topic: "a", Origin: "origin.a", Sequence: 2, ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
+	if err := b.acceptReplicatedBatch([]*Message{m}); err != nil {
+		t.Fatal(err)
+	}
+	b.cache.mu.Lock()
+	defer b.cache.mu.Unlock()
+	if !b.cache.topicUnsafeLocked("a", time.Now().UnixMilli()) {
+		t.Fatal("overflow topic was not rejected")
+	}
+	if b.cache.topicUnsafeLocked("b", time.Now().UnixMilli()) {
+		t.Fatal("overflow contaminated unrelated topic")
+	}
+}
+
+func TestReplayFrontierAndGapStateExpire(t *testing.T) {
+	c := newCache(1 << 20)
+	now := time.Now().UnixMilli()
+	c.frontiers["old"] = &topicFrontier{Sequences: map[string]uint64{"o": 1}, ExpiresAt: now - 1}
+	c.reorder["o"] = map[uint64]*Message{2: {ID: "gap", Topic: "old", Origin: "o", Sequence: 2, ExpiresAt: now - 1}}
+	c.reorderBytes = messageSize(c.reorder["o"][2])
+	c.expire(now)
+	if len(c.frontiers) != 0 || len(c.reorder) != 0 || c.reorderBytes != 0 {
+		t.Fatalf("frontiers=%d reorder=%d bytes=%d", len(c.frontiers), len(c.reorder), c.reorderBytes)
+	}
+}
+
+func TestLegacyFrontierEndpointFailsClosedAndV2Reprobes(t *testing.T) {
+	legacy := httptest.NewServer(http.NotFoundHandler())
+	defer legacy.Close()
+	cfg := DefaultConfig()
+	cfg.PeerToken = "peer"
+	cfg.ClusterID = "cluster"
+	b := New(cfg)
+	defer b.Close()
+	p := &peer{url: legacy.URL}
+	before := time.Now().Add(cfg.MaxTTL - time.Second).UnixMilli()
+	if err := b.syncReplayFrontiersFromPeer(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	if entries := b.cache.unsafe["*"]; entries == nil || entries["legacy-frontier:"+legacy.URL] < before {
+		t.Fatal("legacy peer did not fail replay closed")
+	}
+	v2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Spruce-Peer-Version", "2")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer v2.Close()
+	p.url = v2.URL
+	p.lastV2Probe.Store(0)
+	b.probePeerV2(context.Background(), p)
+	if !p.v2.Load() {
+		t.Fatal("v2 capability was not renegotiated")
 	}
 }
 

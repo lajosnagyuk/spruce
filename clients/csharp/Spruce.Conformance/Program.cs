@@ -18,6 +18,7 @@ await Run("subscription duplicate suppression", SubscriptionDuplicateSuppression
 await Run("retry diagnostics and telemetry", RetryDiagnosticsTelemetry, failures);
 await Run("explicit stream completion", ExplicitStreamCompletion, failures);
 await Run("key ordered subscription", KeyOrderedSubscription, failures);
+await Run("bounded ordered completion window", BoundedOrderedCompletionWindow, failures);
 if (failures.Count > 0) throw new Exception(string.Join(Environment.NewLine, failures));
 Console.WriteLine("C# conformance passed");
 
@@ -262,6 +263,28 @@ static async Task KeyOrderedSubscription()
     }
     catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
     Assert(completed.SequenceEqual(new byte[] { 1, 2 }), $"same-key deliveries completed out of order: {string.Join(',', completed)}");
+}
+
+static async Task BoundedOrderedCompletionWindow()
+{
+    using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+    var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var started = 0;
+    var stream = Frames(Enumerable.Range(0, 32).Select(i => ($"d{i}", $"m{i}", $"k{i}", (byte)i)).ToArray());
+    var client = new SpruceClient("https://spruce.invalid", new HttpClient(new StubHandler(request =>
+    {
+        if (request.RequestUri!.AbsolutePath.StartsWith("/v1/deliveries/")) return new(HttpStatusCode.NoContent);
+        return new(HttpStatusCode.OK) { Content = new StreamContent(stream) };
+    })));
+    var subscription = client.SubscribeAsync("t", null, async (delivery, _) =>
+    {
+        if (Interlocked.Increment(ref started) == 32) cancellation.Cancel();
+        if (delivery.DeliveryId == "d0") await release.Task;
+    }, cancellation.Token, concurrency: 2, drainTimeout: TimeSpan.FromMilliseconds(100));
+    await Task.Delay(50);
+    Assert(started <= 4, $"ordered completion window admitted {started} handlers with capacity 4");
+    release.SetResult();
+    try { await subscription; } catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
 }
 
 static Stream Frames(params (string Delivery, string Message, string Key, byte Payload)[] deliveries)

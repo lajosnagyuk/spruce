@@ -47,6 +47,17 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 
 {{- define "spruce.scheme" -}}{{ ternary "https" "http" .Values.tls.enabled }}{{- end }}
 
+{{- define "spruce.memoryBytes" -}}
+{{- $value := toString . -}}
+{{- if not (regexMatch "^[0-9]+([.][0-9]+)?(KiB|MiB|GiB|TiB|PiB|EiB|Ki|Mi|Gi|Ti|Pi|Ei|K|M|G|T|P|E)?$" $value) -}}
+{{- fail (printf "unsupported memory quantity %q; use bytes, decimal SI (for example 300M), or binary SI (for example 0.5Gi)" $value) -}}
+{{- end -}}
+{{- $number := float64 (regexFind "^[0-9]+([.][0-9]+)?" $value) -}}
+{{- $suffix := regexFind "(KiB|MiB|GiB|TiB|PiB|EiB|Ki|Mi|Gi|Ti|Pi|Ei|K|M|G|T|P|E)$" $value -}}
+{{- $factors := dict "" 1.0 "K" 1000.0 "M" 1000000.0 "G" 1000000000.0 "T" 1000000000000.0 "P" 1000000000000000.0 "E" 1000000000000000000.0 "Ki" 1024.0 "KiB" 1024.0 "Mi" 1048576.0 "MiB" 1048576.0 "Gi" 1073741824.0 "GiB" 1073741824.0 "Ti" 1099511627776.0 "TiB" 1099511627776.0 "Pi" 1125899906842624.0 "PiB" 1125899906842624.0 "Ei" 1152921504606846976.0 "EiB" 1152921504606846976.0 -}}
+{{- int64 (mulf $number (index $factors $suffix)) -}}
+{{- end }}
+
 {{- define "spruce.validate" -}}
 {{- if lt (int .Values.replicaCount) 1 -}}{{- fail "replicaCount must be at least 1" -}}{{- end -}}
 {{- if lt (int .Values.gateway.replicaCount) 1 -}}{{- fail "gateway.replicaCount must be at least 1" -}}{{- end -}}
@@ -55,6 +66,14 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- range $name, $duration := dict "config.defaultTTL" .Values.config.defaultTTL "config.maxTTL" .Values.config.maxTTL "config.ackDeadline" .Values.config.ackDeadline "config.drainDelay" .Values.config.drainDelay -}}
 {{- if regexMatch "^([0]+(ns|us|µs|ms|s|m|h))+$" $duration -}}{{- fail (printf "%s must be greater than zero" $name) -}}{{- end -}}
 {{- end -}}
+{{- $memoryLimit := int64 (include "spruce.memoryBytes" .Values.resources.limits.memory) -}}
+{{- $goMemoryLimit := int64 (include "spruce.memoryBytes" .Values.config.goMemoryLimit) -}}
+{{- $memoryMargin := int64 .Values.config.memorySafetyMarginBytes -}}
+{{- if gt (add $goMemoryLimit $memoryMargin) $memoryLimit -}}
+{{- fail "config.goMemoryLimit plus config.memorySafetyMarginBytes must not exceed resources.limits.memory" -}}{{- end -}}
+{{- $boundedMemory := add (int64 .Values.config.cacheBytes) (int64 .Values.config.replicationQueueBytes) (int64 .Values.config.actionQueueBytes) (int64 .Values.config.maxInflightBytes) (int64 .Values.config.publishAdmissionBytes) $memoryMargin -}}
+{{- if gt $boundedMemory $memoryLimit -}}
+{{- fail "cache, replication queue, action queue, inflight, publish admission, and memory safety margin budgets must fit resources.limits.memory" -}}{{- end -}}
 {{- if and .Values.podDisruptionBudget.enabled (ge (int .Values.podDisruptionBudget.maxUnavailable) (int .Values.replicaCount)) -}}
 {{- fail "podDisruptionBudget.maxUnavailable must be less than replicaCount" -}}{{- end -}}
 {{- if and .Values.gateway.podDisruptionBudget.enabled (ge (int .Values.gateway.podDisruptionBudget.maxUnavailable) (int .Values.gateway.replicaCount)) -}}

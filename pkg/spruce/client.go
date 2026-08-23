@@ -34,7 +34,9 @@ type ClientEvent struct {
 	Err        error
 }
 type HandlerPanicError struct{ Value any }
+
 func (e *HandlerPanicError) Error() string { return fmt.Sprintf("spruce: handler panic: %v", e.Value) }
+
 type PublishOptions struct {
 	Key, ContentType, ProducerID, IdempotencyKey, Ack string
 	TTL                                               time.Duration
@@ -47,7 +49,10 @@ type PublishResult struct {
 type BatchResult struct {
 	IDs []string `json:"ids"`
 }
-type BatchEntry struct { Payload []byte; Key string }
+type BatchEntry struct {
+	Payload []byte
+	Key     string
+}
 type Delivery struct {
 	DeliveryID string            `json:"delivery_id"`
 	MessageID  string            `json:"message_id"`
@@ -55,6 +60,7 @@ type Delivery struct {
 	Key        string            `json:"key,omitempty"`
 	Headers    map[string]string `json:"headers,omitempty"`
 	CreatedAt  int64             `json:"created_at"`
+	Cursor     string            `json:"cursor,omitempty"`
 	Attempt    int               `json:"attempt"`
 	Payload    []byte            `json:"-"`
 }
@@ -110,6 +116,7 @@ func (c *Client) emit(operation string, started time.Time, status int, err error
 type Error struct {
 	StatusCode         int
 	Status, Code, Body string
+	RetryAfter         time.Duration
 }
 
 func (e *Error) Error() string {
@@ -124,7 +131,28 @@ func responseError(resp *http.Response) error {
 		Error string `json:"error"`
 	}
 	_ = json.Unmarshal(body, &problem)
-	return &Error{StatusCode: resp.StatusCode, Status: resp.Status, Code: problem.Error, Body: strings.TrimSpace(string(body))}
+	return &Error{StatusCode: resp.StatusCode, Status: resp.Status, Code: problem.Error, Body: strings.TrimSpace(string(body)), RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())}
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	if seconds, err := time.ParseDuration(strings.TrimSpace(value) + "s"); err == nil && seconds > 0 {
+		return seconds
+	}
+	if deadline, err := http.ParseTime(value); err == nil && deadline.After(now) {
+		return deadline.Sub(now)
+	}
+	return 0
+}
+
+func retryDelay(backoff, maximum, retryAfter time.Duration) time.Duration {
+	delay := backoff/2 + time.Duration(rand.Int64N(max(1, int64(backoff))))
+	if delay > maximum {
+		delay = maximum
+	}
+	if delay < retryAfter {
+		delay = retryAfter
+	}
+	return delay
 }
 func (c *Client) Publish(ctx context.Context, topic string, payload []byte, o PublishOptions) (PublishResult, error) {
 	started := time.Now()
@@ -207,7 +235,11 @@ func (c *Client) PublishRetry(ctx context.Context, topic string, payload []byte,
 		if attempt+1 == retry.MaxAttempts {
 			break
 		}
-		t := time.NewTimer(backoff)
+		retryAfter := time.Duration(0)
+		if apiErr != nil {
+			retryAfter = apiErr.RetryAfter
+		}
+		t := time.NewTimer(retryDelay(backoff, retry.MaxBackoff, retryAfter))
 		select {
 		case <-ctx.Done():
 			t.Stop()
@@ -223,9 +255,11 @@ func (c *Client) PublishRetry(ctx context.Context, topic string, payload []byte,
 }
 
 func (c *Client) PublishBatch(ctx context.Context, topic string, payloads [][]byte, o PublishOptions) (BatchResult, error) {
-    entries := make([]BatchEntry, len(payloads))
-    for i, payload := range payloads { entries[i] = BatchEntry{Payload: payload, Key: o.Key} }
-    return c.PublishBatchEntries(ctx, topic, entries, o)
+	entries := make([]BatchEntry, len(payloads))
+	for i, payload := range payloads {
+		entries[i] = BatchEntry{Payload: payload, Key: o.Key}
+	}
+	return c.PublishBatchEntries(ctx, topic, entries, o)
 }
 
 func (c *Client) PublishBatchEntries(ctx context.Context, topic string, entries []BatchEntry, o PublishOptions) (BatchResult, error) {
@@ -256,7 +290,9 @@ func (c *Client) PublishBatchEntries(ctx context.Context, topic string, entries 
 			return out, errors.New("payload is too large")
 		}
 		var keySize [2]byte
-		binary.BigEndian.PutUint16(keySize[:], uint16(len(key))); _, _ = body.Write(keySize[:]); _, _ = body.Write(key)
+		binary.BigEndian.PutUint16(keySize[:], uint16(len(key)))
+		_, _ = body.Write(keySize[:])
+		_, _ = body.Write(key)
 		var size [4]byte
 		binary.BigEndian.PutUint32(size[:], uint32(len(payload)))
 		_, _ = body.Write(size[:])
@@ -301,7 +337,8 @@ func (c *Client) PublishBatchEntries(ctx context.Context, topic string, entries 
 
 type SubscribeOptions struct {
 	Topic, Group    string
-	Since           int64
+	Cursor          string
+	Since           int64 // Deprecated: timestamp cursors are rejected.
 	Concurrency     int
 	MaxPayloadBytes int
 	DrainTimeout    time.Duration
@@ -392,17 +429,29 @@ func (c *Client) Subscribe(ctx context.Context, o SubscribeOptions, handler Hand
 	if o.Topic == "" {
 		return errors.New("topic is required")
 	}
+	if o.Since != 0 {
+		return errors.New("timestamp subscription cursors are no longer supported; use Cursor")
+	}
 	backoff := 50 * time.Millisecond
-	since := o.Since
+	cursor := o.Cursor
 	for ctx.Err() == nil {
-		o.Since = since
+		o.Cursor = cursor
 		connectedAt := time.Now()
 		last, err := c.subscribeOnce(ctx, o, handler)
-		if last > since || time.Since(connectedAt) >= 5*time.Second {
+		status := 0
+		var apiErr *Error
+		if errors.As(err, &apiErr) {
+			status = apiErr.StatusCode
+			if apiErr.Code == "cursor_expired" {
+				c.emit("subscription_cursor_expired", connectedAt, status, err)
+			}
+		}
+		c.emit("subscription_disconnected", connectedAt, status, err)
+		if last != cursor || time.Since(connectedAt) >= 5*time.Second {
 			backoff = 50 * time.Millisecond
 		}
-		if last > since {
-			since = last
+		if last != "" {
+			cursor = last
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -414,11 +463,15 @@ func (c *Client) Subscribe(ctx context.Context, o SubscribeOptions, handler Hand
 		if errors.As(err, &panicErr) {
 			return err
 		}
-		var apiErr *Error
-		if errors.As(err, &apiErr) && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 {
+		if apiErr != nil && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 && apiErr.StatusCode != http.StatusRequestTimeout && apiErr.StatusCode != http.StatusTooManyRequests {
 			return err
 		}
-		wait := backoff/2 + time.Duration(rand.Int64N(int64(backoff)))
+		retryAfter := time.Duration(0)
+		if apiErr != nil {
+			retryAfter = apiErr.RetryAfter
+		}
+		wait := retryDelay(backoff, 2*time.Second, retryAfter)
+		c.emit("subscription_reconnecting", time.Now(), 0, err)
 		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
@@ -538,18 +591,18 @@ func (c *Client) Deliveries(ctx context.Context, o SubscribeOptions) (<-chan *Co
 	return deliveries, errs
 }
 
-func (c *Client) subscribeOnce(ctx context.Context, o SubscribeOptions, handler Handler) (int64, error) {
+func (c *Client) subscribeOnce(ctx context.Context, o SubscribeOptions, handler Handler) (string, error) {
 	if o.Concurrency <= 0 {
 		o.Concurrency = 16
 	}
 	if o.Concurrency > 1024 {
-		return o.Since, errors.New("subscription concurrency exceeds 1024")
+		return o.Cursor, errors.New("subscription concurrency exceeds 1024")
 	}
 	if o.MaxPayloadBytes <= 0 {
 		o.MaxPayloadBytes = 1 << 20
 	}
 	if o.MaxPayloadBytes > 64<<20 {
-		return o.Since, errors.New("subscription payload limit exceeds 64 MiB")
+		return o.Cursor, errors.New("subscription payload limit exceeds 64 MiB")
 	}
 	if o.DrainTimeout <= 0 {
 		o.DrainTimeout = time.Second
@@ -560,49 +613,60 @@ func (c *Client) subscribeOnce(ctx context.Context, o SubscribeOptions, handler 
 	if o.Group != "" {
 		v.Set("group", o.Group)
 	}
-	if o.Since > 0 {
-		v.Set("since", fmt.Sprint(o.Since))
+	if o.Cursor != "" {
+		v.Set("cursor", o.Cursor)
 	}
 	req, _ := http.NewRequestWithContext(streamCtx, http.MethodGet, c.BaseURL+"/v1/subscriptions/stream?"+v.Encode(), nil)
 	if err := c.authorize(req); err != nil {
-		return o.Since, err
+		return o.Cursor, err
 	}
 	streamHTTP := *c.httpClient()
 	streamHTTP.Timeout = 0
 	resp, err := c.doWith(&streamHTTP, req)
 	if err != nil {
-		return o.Since, err
+		return o.Cursor, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return o.Since, responseError(resp)
+		return o.Cursor, responseError(resp)
 	}
+	c.emit("subscription_connected", time.Now(), http.StatusOK, nil)
 	br := bufio.NewReaderSize(resp.Body, 32<<10)
-	var cursor atomic.Int64
-	cursor.Store(o.Since)
+	var cursor atomic.Value
+	initial := resp.Header.Get("Spruce-Cursor")
+	if initial == "" {
+		initial = o.Cursor
+	}
+	cursor.Store(initial)
 	var sequence atomic.Uint64
 	sem := make(chan struct{}, o.Concurrency)
+	progressWindow := make(chan struct{}, o.Concurrency)
 	workerErrors := make(chan error, 1)
 	acks := newAckBatcher(streamCtx, c, "ack")
 	nacks := newAckBatcher(streamCtx, c, "nack")
 	var progressMu sync.Mutex
 	nextProgress := uint64(1)
-	completed := make(map[uint64]int64)
-	markComplete := func(index uint64, createdAt int64) {
+	completed := make(map[uint64]string)
+	markComplete := func(index uint64, value string) {
 		progressMu.Lock()
-		completed[index] = createdAt
+		completed[index] = value
+		advanced := 0
 		for {
-			created, ok := completed[nextProgress]
+			value, ok := completed[nextProgress]
 			if !ok {
 				break
 			}
 			delete(completed, nextProgress)
-			if created > cursor.Load() {
-				cursor.Store(created)
+			if value != "" {
+				cursor.Store(value)
 			}
 			nextProgress++
+			advanced++
 		}
 		progressMu.Unlock()
+		for range advanced {
+			<-progressWindow
+		}
 	}
 	drainWorkers := func() bool {
 		deadline := time.NewTimer(o.DrainTimeout)
@@ -626,32 +690,42 @@ func (c *Client) subscribeOnce(ctx context.Context, o SubscribeOptions, handler 
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				if !drainWorkers() {
-					return cursor.Load(), ErrHandlerDrainTimeout
+					return cursor.Load().(string), ErrHandlerDrainTimeout
 				}
 			} else {
 				cancel()
 				if !drainWorkers() {
-					return cursor.Load(), ErrHandlerDrainTimeout
+					return cursor.Load().(string), ErrHandlerDrainTimeout
 				}
 			}
 			select {
 			case workerErr := <-workerErrors:
-				return cursor.Load(), workerErr
+				return cursor.Load().(string), workerErr
 			default:
-				return cursor.Load(), err
+				return cursor.Load().(string), err
 			}
 		}
 		if d.DeliveryID == "" {
 			continue
 		}
 		select {
-		case sem <- struct{}{}:
+		case progressWindow <- struct{}{}:
 		case <-streamCtx.Done():
 			cancel()
 			if !drainWorkers() {
-				return cursor.Load(), ErrHandlerDrainTimeout
+				return cursor.Load().(string), ErrHandlerDrainTimeout
 			}
-			return cursor.Load(), streamCtx.Err()
+			return cursor.Load().(string), streamCtx.Err()
+		}
+		select {
+		case sem <- struct{}{}:
+		case <-streamCtx.Done():
+			<-progressWindow
+			cancel()
+			if !drainWorkers() {
+				return cursor.Load().(string), ErrHandlerDrainTimeout
+			}
+			return cursor.Load().(string), streamCtx.Err()
 		}
 		index := sequence.Add(1)
 		go func() {
@@ -676,10 +750,14 @@ func (c *Client) subscribeOnce(ctx context.Context, o SubscribeOptions, handler 
 				}
 				var panicErr *HandlerPanicError
 				if errors.As(handlerErr, &panicErr) {
-					select { case workerErrors <- handlerErr: cancel(); default: }
+					select {
+					case workerErrors <- handlerErr:
+						cancel()
+					default:
+					}
 					return
 				}
-				markComplete(index, d.CreatedAt)
+				markComplete(index, d.Cursor)
 				return
 			}
 			if e := acks.submit(streamCtx, d.DeliveryID); e != nil {
@@ -690,7 +768,7 @@ func (c *Client) subscribeOnce(ctx context.Context, o SubscribeOptions, handler 
 				}
 				return
 			}
-			markComplete(index, d.CreatedAt)
+			markComplete(index, d.Cursor)
 		}()
 	}
 }

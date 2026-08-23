@@ -35,6 +35,8 @@ func main() {
 	cfg.MaxConcurrentRequests = int(envInt64("SPRUCE_MAX_CONCURRENT_REQUESTS", int64(cfg.MaxConcurrentRequests)))
 	cfg.MaxStreams = int(envInt64("SPRUCE_MAX_STREAMS", int64(cfg.MaxStreams)))
 	cfg.MaxInternalRequests = int(envInt64("SPRUCE_MAX_INTERNAL_REQUESTS", int64(cfg.MaxInternalRequests)))
+	cfg.PublishAdmissionBytes = envInt64("SPRUCE_PUBLISH_ADMISSION_BYTES", cfg.PublishAdmissionBytes)
+	cfg.PublishAdmissionWait = envDuration("SPRUCE_PUBLISH_ADMISSION_WAIT", cfg.PublishAdmissionWait)
 	cfg.PeerToken = os.Getenv("SPRUCE_PEER_TOKEN")
 	cfg.PreviousPeerToken = os.Getenv("SPRUCE_PREVIOUS_PEER_TOKEN")
 	cfg.ClusterID = os.Getenv("SPRUCE_CLUSTER_ID")
@@ -68,7 +70,7 @@ func main() {
 			}
 		}
 	}
-	if cfg.CacheBytes <= 0 || cfg.MaxMessage <= 0 || cfg.QueueDepth <= 0 || cfg.DefaultTTL <= 0 || cfg.MaxTTL <= 0 || cfg.AckDeadline <= 0 || cfg.ReplicationQueueBytes <= 0 || cfg.ActionQueueBytes <= 0 || cfg.MaxInflightBytes <= 0 || cfg.MaxSubscriberInflightBytes <= 0 || cfg.MaxAttempts <= 0 || cfg.IdempotencyEntries <= 0 || cfg.CheckpointEntries <= 0 || cfg.MaxConcurrentRequests <= 0 || cfg.MaxStreams <= 0 || cfg.MaxInternalRequests <= 0 || cfg.DefaultTTL > cfg.MaxTTL {
+	if cfg.CacheBytes <= 0 || cfg.MaxMessage <= 0 || cfg.QueueDepth <= 0 || cfg.DefaultTTL <= 0 || cfg.MaxTTL <= 0 || cfg.AckDeadline <= 0 || cfg.ReplicationQueueBytes <= 0 || cfg.ActionQueueBytes <= 0 || cfg.MaxInflightBytes <= 0 || cfg.MaxSubscriberInflightBytes <= 0 || cfg.MaxAttempts <= 0 || cfg.IdempotencyEntries <= 0 || cfg.CheckpointEntries <= 0 || cfg.MaxConcurrentRequests <= 0 || cfg.MaxStreams <= 0 || cfg.MaxInternalRequests <= 0 || cfg.PublishAdmissionBytes < cfg.MaxMessage || cfg.PublishAdmissionBytes < 16<<20 || cfg.PublishAdmissionWait <= 0 || cfg.DefaultTTL > cfg.MaxTTL {
 		fmt.Fprintln(os.Stderr, "SPRUCE configuration limits must be positive and default TTL must not exceed max TTL")
 		os.Exit(2)
 	}

@@ -26,6 +26,15 @@ reject --set gateway.replicaCount=0
 reject --set service.port=0
 reject --set config.cacheBytes=0
 reject --set config.defaultTTL=0s
+reject --set config.publishAdmissionBytes=0
+reject --set config.publishAdmissionWait=0s
+reject --set config.goMemoryLimit=0MiB
+reject --set config.goMemoryLimit=224MiB
+reject --set-string config.memorySafetyMarginBytes=134217728
+render --set resources.limits.memory=512Mi --set config.goMemoryLimit=384MiB --set-string config.memorySafetyMarginBytes=134217728
+render --set resources.limits.memory=300M --set config.goMemoryLimit=192MiB
+render --set resources.limits.memory=0.5Gi --set config.goMemoryLimit=384MiB --set-string config.memorySafetyMarginBytes=67108864
+reject --set resources.limits.memory=watts
 reject --set replicaCount=3 --set podDisruptionBudget.maxUnavailable=3
 reject --set gateway.replicaCount=2 --set gateway.podDisruptionBudget.maxUnavailable=2
 reject --set replicaCount=1 --set podDisruptionBudget.maxUnavailable=1
@@ -33,6 +42,9 @@ reject --set gateway.replicaCount=1 --set gateway.podDisruptionBudget.maxUnavail
 reject --set networkPolicy.dns.namespaceSelector=null
 reject --set auth.requireExistingSecret=true
 render --set auth.requireExistingSecret=true --set auth.existingSecret=spruce-auth --set auth.allowMissingExistingSecretForRender=true
+
+spread=$(helm template spruce "$chart" $base)
+printf '%s\n' "$spread" | grep -q 'whenUnsatisfiable: DoNotSchedule'
 
 target=$(SPRUCE_RELEASE=platform SPRUCE_NAMESPACE=events SPRUCE_CLUSTER_DOMAIN=corp.internal SPRUCE_PRINT_TARGETS=1 sh scripts/k3s-rotate-tls.sh)
 test "$target" = 'publish_url=https://platform-spruce-0.platform-spruce-headless.events.svc.corp.internal:8080'

@@ -15,9 +15,9 @@ class Handler(BaseHTTPRequestHandler):
             Handler.stream_paths.append(self.path)
             body=b""
             for index in range(Handler.stream_count):
-                metadata=json.dumps({"delivery_id":f"delivery-{index}","message_id":f"message-{index}","topic":"stream","created_at":index+1,"attempt":1}).encode(); payload=b"opaque"
+                metadata=json.dumps({"delivery_id":f"delivery-{index}","message_id":f"message-{index}","topic":"stream","created_at":index+1,"attempt":1,"cursor":f"cursor-{index}"}).encode(); payload=b"opaque"
                 body+=struct.pack(">II",len(metadata),len(payload))+metadata+payload
-            self.send_response(200); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
+            self.send_response(200); self.send_header("Content-Length",str(len(body))); self.send_header("Spruce-Cursor","initial-cursor"); self.end_headers(); self.wfile.write(body)
         else: self.send_response(204); self.end_headers()
     def do_POST(self):
         size = int(self.headers.get("Content-Length", 0)); body = self.rfile.read(size); Handler.requests += 1
@@ -68,6 +68,9 @@ class Conformance(unittest.TestCase):
         with self.assertRaises(ValueError): Client("http://example",token="secret")
         with self.assertRaises(ValueError): self.client.publish_with_retry("t",b"x",PublishOptions())
         with self.assertRaises(ValueError): self.client.publish_batch("t",[])
+    def test_retry_after_delay_is_capped_and_never_undercut(self):
+        self.assertEqual(Client._retry_delay(.01, .2, 1.0), 1.0)
+        self.assertGreaterEqual(Client._retry_delay(.01, .2, .1), .1)
     def test_auth_telemetry_and_structured_error(self):
         events=[]
         client=Client(f"http://127.0.0.1:{self.server.server_port}",token="secret",allow_insecure_credentials=True,on_event=lambda event: (events.append(event), (_ for _ in ()).throw(RuntimeError())))
@@ -152,7 +155,22 @@ class Conformance(unittest.TestCase):
             self.client._ack=original; Handler.stream_count=1
         self.assertGreaterEqual(len(Handler.stream_paths),2)
         query=urllib.parse.parse_qs(urllib.parse.urlsplit(Handler.stream_paths[1]).query)
-        self.assertEqual(query.get("since"), ["1"])
+        self.assertEqual(query.get("cursor"), ["cursor-0"])
+
+    def test_stuck_early_handler_bounds_ordered_completion_window(self):
+        stop=threading.Event(); release=threading.Event(); Handler.stream_count=32
+        started=[]
+        try:
+            def consume(delivery):
+                started.append(delivery.delivery_id)
+                if delivery.delivery_id == "delivery-0": release.wait(2)
+            thread=threading.Thread(target=lambda: self.client.subscribe(__import__('spruce').SubscribeOptions("stream", concurrency=2, drain_timeout=.2), consume, stop))
+            thread.start(); time.sleep(.1)
+            self.assertLessEqual(len(started),4)
+            stop.set(); release.set(); thread.join(1)
+            self.assertFalse(thread.is_alive())
+        finally:
+            Handler.stream_count=1; stop.set(); release.set()
 
     def test_deduper_evicts_oldest_entry(self):
         deduper=Deduper(2,60)

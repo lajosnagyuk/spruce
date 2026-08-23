@@ -93,10 +93,10 @@ uses the conspicuous development override.
 Consume a streaming response:
 
 ```text
-GET /v1/subscriptions/stream?topic={topic}&group={group}&since={unix-ms}
+GET /v1/subscriptions/stream?topic={topic}&group={group}&cursor={opaque-resume-token}
 ```
 
-The stream uses length-delimited binary frames. ACK and NACK endpoints accept batched message IDs. The Go and C# clients handle framing, reconnects, acknowledgement batching, bounded concurrency, and optional deduplication.
+The stream uses length-delimited binary frames. ACK and NACK endpoints accept batched message IDs. Resume cursors are opaque and must be returned unchanged; timestamp cursors are not supported. The Go, C#, and Python clients handle framing, reconnects, acknowledgement batching, bounded concurrency, and optional deduplication.
 
 ## Kubernetes
 

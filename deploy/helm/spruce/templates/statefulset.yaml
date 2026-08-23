@@ -38,7 +38,7 @@ spec:
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
+          whenUnsatisfiable: DoNotSchedule
           labelSelector:
             matchLabels:
               {{- include "spruce.selectorLabels" . | nindent 14 }}
@@ -117,6 +117,9 @@ spec:
             - {name: SPRUCE_MAX_CONCURRENT_REQUESTS, value: {{ .Values.config.maxConcurrentRequests | quote }}}
             - {name: SPRUCE_MAX_STREAMS, value: {{ .Values.config.maxStreams | quote }}}
             - {name: SPRUCE_MAX_INTERNAL_REQUESTS, value: {{ .Values.config.maxInternalRequests | quote }}}
+            - {name: SPRUCE_PUBLISH_ADMISSION_BYTES, value: {{ .Values.config.publishAdmissionBytes | quote }}}
+            - {name: SPRUCE_PUBLISH_ADMISSION_WAIT, value: {{ .Values.config.publishAdmissionWait | quote }}}
+            - {name: GOMEMLIMIT, value: {{ .Values.config.goMemoryLimit | quote }}}
           readinessProbe:
             httpGet: {path: /health/ready, port: broker, scheme: {{ ternary "HTTPS" "HTTP" .Values.tls.enabled }}}
             periodSeconds: 2

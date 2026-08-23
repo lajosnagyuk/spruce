@@ -19,6 +19,11 @@ client.publish("orders", b"opaque bytes", PublishOptions(content_type="applicati
 client.subscribe(SubscribeOptions("orders", group="billing"), lambda delivery: handle(delivery.payload))
 ```
 
+Reconnect progress uses the opaque `Delivery.cursor` token. Pass a previously stored
+token as `SubscribeOptions(cursor=...)` without parsing or modifying it. Timestamp
+subscription cursors are not supported. A `cursor_expired` response is terminal and
+means the bounded in-memory replay window no longer contains all requested history.
+
 Credentials are rejected over plaintext HTTP unless `allow_insecure_credentials=True`
 is explicitly selected for isolated development. Pass an `ssl.SSLContext` through
 `ssl_context` to trust a private CA or apply a stricter server-certificate policy. The

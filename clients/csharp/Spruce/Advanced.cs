@@ -10,7 +10,8 @@ public sealed record RetryOptions(int MaxAttempts = 3, TimeSpan? MinBackoff = nu
 public sealed record SubscribeOptions(
     string Topic,
     string? Group = null,
-    long Since = 0,
+	long Since = 0,
+	string? Cursor = null,
     int Concurrency = 16,
     int MaxPayloadBytes = 1024 * 1024,
     TimeSpan? DrainTimeout = null,
@@ -32,12 +33,13 @@ public sealed class ConsumableDelivery(Delivery delivery)
     internal Task<Exception?> WaitAsync(CancellationToken cancellationToken) => _completion.Task.WaitAsync(cancellationToken);
 }
 
-public sealed class SpruceException(int statusCode, string status, string? code, string body) : Exception($"Spruce {statusCode} {status}: {code ?? body}")
+public sealed class SpruceException(int statusCode, string status, string? code, string body, TimeSpan? retryAfter = null) : Exception($"Spruce {statusCode} {status}: {code ?? body}")
 {
     public int StatusCode { get; } = statusCode;
     public string Status { get; } = status;
     public string? Code { get; } = code;
     public string Body { get; } = body;
+    public TimeSpan RetryAfter { get; } = retryAfter ?? TimeSpan.Zero;
 }
 
 public sealed class Deduper(int maxEntries = 65536, TimeSpan? ttl = null)
@@ -95,7 +97,7 @@ public sealed partial class SpruceClient
     public Task SubscribeAsync(SubscribeOptions options, Func<Delivery, CancellationToken, Task> handler, CancellationToken cancellationToken = default)
     {
         if (options.Deduper is null)
-            return SubscribeAsync(options.Topic, options.Group, handler, cancellationToken, options.Concurrency, options.MaxPayloadBytes, options.Since, options.DrainTimeout, options.PreserveKeyOrder);
+            return SubscribeAsync(options.Topic, options.Group, handler, cancellationToken, options.Concurrency, options.MaxPayloadBytes, options.Since, options.DrainTimeout, options.PreserveKeyOrder, options.Cursor);
 
         async Task Handle(Delivery delivery, CancellationToken token)
         {
@@ -104,7 +106,7 @@ public sealed partial class SpruceClient
             options.Deduper.Mark(delivery.MessageId);
         }
 
-        return SubscribeAsync(options.Topic, options.Group, Handle, cancellationToken, options.Concurrency, options.MaxPayloadBytes, options.Since, options.DrainTimeout, options.PreserveKeyOrder);
+        return SubscribeAsync(options.Topic, options.Group, Handle, cancellationToken, options.Concurrency, options.MaxPayloadBytes, options.Since, options.DrainTimeout, options.PreserveKeyOrder, options.Cursor);
     }
 
     public async IAsyncEnumerable<ConsumableDelivery> ReadAllAsync(SubscribeOptions options, [EnumeratorCancellation] CancellationToken cancellationToken = default)
@@ -140,10 +142,13 @@ public sealed partial class SpruceClient
         var maximum = retry.MaxBackoff ?? TimeSpan.FromSeconds(2);
         for (var attempt = 1; ; attempt++)
         {
+            var retryAfter = TimeSpan.Zero;
             try { return await PublishAsync(topic, payload, options, cancellationToken); }
-            catch (SpruceException ex) when (attempt < retry.MaxAttempts && ex.StatusCode is 408 or 429 or 503) { }
+            catch (SpruceException ex) when (attempt < retry.MaxAttempts && (ex.StatusCode is 408 or 429 || ex.StatusCode >= 500)) { retryAfter = ex.RetryAfter; }
             catch (HttpRequestException) when (attempt < retry.MaxAttempts) { }
-            await Task.Delay(delay, cancellationToken);
+            var jittered = TimeSpan.FromMilliseconds(delay.TotalMilliseconds * (0.5 + Random.Shared.NextDouble()));
+            var clientDelay = Math.Min(maximum.TotalMilliseconds, jittered.TotalMilliseconds);
+            await Task.Delay(TimeSpan.FromMilliseconds(Math.Max(retryAfter.TotalMilliseconds, clientDelay)), cancellationToken);
             delay = TimeSpan.FromMilliseconds(Math.Min(maximum.TotalMilliseconds, delay.TotalMilliseconds * 2));
         }
     }

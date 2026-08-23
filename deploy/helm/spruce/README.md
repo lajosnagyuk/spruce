@@ -40,14 +40,26 @@ admits it: `kubectl label namespace ingress-nginx spruce.io/ingress-access=true`
 | `tls.enabled` | `false` | Gateway-to-broker and peer HTTPS; plaintext requires explicit opt-in |
 | `tls.existingSecret` | empty | TLS Secret with `tls.crt`, `tls.key`, and `ca.crt` |
 | `config.cacheBytes` | `67108864` | Per-broker payload and metadata cache budget |
+| `config.goMemoryLimit` | `192MiB` | Go runtime soft memory limit; must leave the safety margin below the pod limit |
+| `config.memorySafetyMarginBytes` | `67108864` | Space reserved for stacks, executable mappings, allocator overhead, TLS, and other non-heap memory |
 | `resources.requests.memory` | `96Mi` | Broker memory request |
 | `resources.limits.memory` | `256Mi` | Broker memory hard limit |
+| `topologySpreadConstraints` | `true` | Require brokers on distinct nodes; disable explicitly only when reduced failure isolation is acceptable |
 
 When `auth.existingSecret` is empty, Helm generates credentials and preserves them only
 during a live Helm upgrade where `lookup` can read the existing Secret. Offline/GitOps
 rendering cannot preserve generated values. Production and GitOps installations should
 set `auth.requireExistingSecret=true` and use an externally managed Secret. See
 `docs/OPERATIONS.md` for the three-stage current/previous token rotation protocol.
+
+The chart rejects memory configurations where `config.goMemoryLimit` plus
+`config.memorySafetyMarginBytes` exceeds the pod limit. It also requires the cache,
+replication queue, action queue, inflight delivery, publish admission, and safety-margin
+budgets to fit inside that limit. These are conservative simultaneous upper bounds, not
+a prediction of steady-state RSS. Re-measure peak RSS after changing message sizes or
+concurrency. The default broker spread is strict: a three-replica release needs three
+eligible Kubernetes nodes. Set `topologySpreadConstraints=false` only for development
+or when scheduling availability is deliberately preferred over replica failure isolation.
 
 The default NetworkPolicy expects CoreDNS at `kube-dns.kube-system` with label
 `k8s-app=kube-dns`, and permits clients selected by `spruce.io/client-access=true`.

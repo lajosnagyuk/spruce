@@ -67,6 +67,8 @@ type Config struct {
 	MaxConcurrentRequests      int
 	MaxStreams                 int
 	MaxInternalRequests        int
+	PublishAdmissionBytes      int64
+	PublishAdmissionWait       time.Duration
 	Logger                     *slog.Logger
 }
 
@@ -74,7 +76,8 @@ func DefaultConfig() Config {
 	return Config{CacheBytes: 256 << 20, DefaultTTL: time.Minute, MaxTTL: 24 * time.Hour,
 		MaxMessage: 1 << 20, QueueDepth: 4096, ReplicationQueueBytes: 64 << 20, ActionQueueBytes: 4 << 20,
 		MaxInflightBytes: 64 << 20, MaxSubscriberInflightBytes: 16 << 20, AckDeadline: 30 * time.Second, MaxAttempts: 8,
-		IdempotencyEntries: 65536, CheckpointEntries: 65536, MaxConcurrentRequests: 4096, MaxStreams: 1024, MaxInternalRequests: 1024}
+		IdempotencyEntries: 65536, CheckpointEntries: 65536, MaxConcurrentRequests: 4096, MaxStreams: 1024, MaxInternalRequests: 1024,
+		PublishAdmissionBytes: 32 << 20, PublishAdmissionWait: 100 * time.Millisecond}
 }
 
 type Message struct {
@@ -85,6 +88,8 @@ type Message struct {
 	Payload       []byte            `json:"-"`
 	CreatedAt     int64             `json:"created_at"`
 	ExpiresAt     int64             `json:"expires_at"`
+	Origin        string            `json:"origin,omitempty"`
+	Sequence      uint64            `json:"sequence,omitempty"`
 	expiry        *expiryItem
 	expiryPrev    *Message
 	expiryNext    *Message
@@ -101,7 +106,10 @@ type Delivery struct {
 	Headers    map[string]string `json:"headers,omitempty"`
 	CreatedAt  int64             `json:"created_at"`
 	Attempt    int               `json:"attempt"`
+	Cursor     string            `json:"cursor,omitempty"`
 	Payload    []byte            `json:"-"`
+	origin     string
+	sequence   uint64
 }
 
 type cache struct {
@@ -114,10 +122,33 @@ type cache struct {
 	tombstones      int
 	topics          map[string][]*Message
 	topicTombstones map[string]int
+	frontiers       map[string]*topicFrontier
+	frontierLimit   int
+	unsafe          map[string]map[string]int64
+	topicSequences  map[string]*topicSequence
+	receivedThrough map[string]uint64
+	reorder         map[string]map[uint64]*Message
+	reorderBytes    int64
+	reorderLimit    int
 	bytes           int64
 	maxBytes        int64
 	evicted         atomic.Uint64
 	expired         atomic.Uint64
+}
+
+type topicSequence struct {
+	origin    string
+	next      uint64
+	expiresAt int64
+}
+
+type topicFrontier struct {
+	Sequences map[string]uint64 `json:"sequences"`
+	ExpiresAt int64             `json:"expires_at"`
+}
+
+type replayCursor struct {
+	Sequences map[string]uint64 `json:"sequences"`
 }
 
 type expiryItem struct {
@@ -147,7 +178,111 @@ func (h *expiryHeap) Pop() any {
 }
 
 func newCache(max int64) *cache {
-	return &cache{items: make(map[string]*Message), expiryItems: make(map[int64]*expiryItem), topics: make(map[string][]*Message), topicTombstones: make(map[string]int), maxBytes: max}
+	limit := int(max / 128)
+	if limit < 1024 {
+		limit = 1024
+	}
+	return &cache{items: make(map[string]*Message), expiryItems: make(map[int64]*expiryItem), topics: make(map[string][]*Message), topicTombstones: make(map[string]int), frontiers: make(map[string]*topicFrontier), frontierLimit: limit, unsafe: make(map[string]map[string]int64), topicSequences: make(map[string]*topicSequence), receivedThrough: make(map[string]uint64), reorder: make(map[string]map[uint64]*Message), reorderLimit: 4096, maxBytes: max}
+}
+
+func (c *cache) markUnsafeLocked(topic, source string, until int64) {
+	if until <= 0 {
+		return
+	}
+	entries := c.unsafe[topic]
+	if entries == nil {
+		if len(c.unsafe) >= c.frontierLimit {
+			topic, source = "*", "capacity"
+			entries = c.unsafe[topic]
+		}
+		if entries == nil {
+			entries = make(map[string]int64)
+			c.unsafe[topic] = entries
+		}
+	}
+	if len(entries) >= 256 {
+		source = "capacity"
+	}
+	entries[source] = max(entries[source], until)
+}
+
+func (c *cache) clearUnsafeLocked(topic, source string) {
+	if entries := c.unsafe[topic]; entries != nil {
+		delete(entries, source)
+		if len(entries) == 0 {
+			delete(c.unsafe, topic)
+		}
+	}
+}
+
+func (c *cache) topicUnsafeLocked(topic string, now int64) bool {
+	unsafe := false
+	for _, key := range []string{"*", topic} {
+		if entries := c.unsafe[key]; entries != nil {
+			for source, until := range entries {
+				if until <= now {
+					delete(entries, source)
+				} else {
+					unsafe = true
+				}
+			}
+			if len(entries) == 0 {
+				delete(c.unsafe, key)
+			}
+		}
+	}
+	return unsafe
+}
+
+func encodeReplayCursor(sequences map[string]uint64) string {
+	if len(sequences) > 256 {
+		return ""
+	}
+	b, _ := json.Marshal(replayCursor{Sequences: sequences})
+	if len(b) > 12<<10 {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func decodeReplayCursor(value string) (map[string]uint64, error) {
+	if value == "" {
+		return make(map[string]uint64), nil
+	}
+	b, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil || len(b) > 16<<10 {
+		return nil, errors.New("invalid cursor")
+	}
+	var cursor replayCursor
+	if json.Unmarshal(b, &cursor) != nil || cursor.Sequences == nil || len(cursor.Sequences) > 256 {
+		return nil, errors.New("invalid cursor")
+	}
+	for origin := range cursor.Sequences {
+		if origin == "" || len(origin) > 64 {
+			return nil, errors.New("invalid cursor")
+		}
+	}
+	return cursor.Sequences, nil
+}
+
+func cloneFrontier(in map[string]uint64) map[string]uint64 {
+	out := make(map[string]uint64, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func frontierBehind(cursor map[string]uint64, frontier *topicFrontier) bool {
+	if frontier == nil {
+		return false
+	}
+	for origin, sequence := range frontier.Sequences {
+		if cursor[origin] < sequence {
+			return true
+		}
+	}
+	return false
 }
 
 func messageSize(m *Message) int64 {
@@ -209,6 +344,10 @@ func (c *cache) insertLocked(m *Message) (bool, error) {
 func (c *cache) putBatch(messages []*Message, now int64) ([]bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.putBatchLocked(messages, now)
+}
+
+func (c *cache) putBatchLocked(messages []*Message, now int64) ([]bool, error) {
 	c.expireLocked(now)
 	var total int64
 	for _, m := range messages {
@@ -244,6 +383,34 @@ func (c *cache) dropOldestLocked() {
 
 func (c *cache) removeLocked(m *Message, pressure bool) {
 	if _, ok := c.items[m.ID]; ok {
+		if pressure && m.Origin != "" {
+			frontier := c.frontiers[m.Topic]
+			if frontier == nil {
+				if len(c.frontiers) >= c.frontierLimit {
+					for topic, candidate := range c.frontiers {
+						if candidate.ExpiresAt <= time.Now().UnixMilli() {
+							delete(c.frontiers, topic)
+						}
+					}
+				}
+				if len(c.frontiers) >= c.frontierLimit {
+					c.markUnsafeLocked(m.Topic, "frontier-capacity", m.ExpiresAt)
+				} else {
+					frontier = &topicFrontier{Sequences: make(map[string]uint64)}
+					c.frontiers[m.Topic] = frontier
+				}
+			}
+			if frontier != nil {
+				if _, exists := frontier.Sequences[m.Origin]; !exists && len(frontier.Sequences) >= 256 {
+					c.markUnsafeLocked(m.Topic, "frontier-origins", m.ExpiresAt)
+					frontier = nil
+				}
+			}
+			if frontier != nil {
+				frontier.Sequences[m.Origin] = max(frontier.Sequences[m.Origin], m.Sequence)
+				frontier.ExpiresAt = max(frontier.ExpiresAt, m.ExpiresAt)
+			}
+		}
 		delete(c.items, m.ID)
 		if m.orderIndex >= 0 && m.orderIndex < len(c.order) && c.order[m.orderIndex] == m {
 			c.order[m.orderIndex] = nil
@@ -313,6 +480,35 @@ func (c *cache) unlinkExpiryLocked(m *Message) {
 
 func (c *cache) expire(now int64) { c.mu.Lock(); c.expireLocked(now); c.mu.Unlock() }
 func (c *cache) expireLocked(now int64) {
+	for topic, frontier := range c.frontiers {
+		if frontier.ExpiresAt <= now {
+			delete(c.frontiers, topic)
+		}
+	}
+	for topic := range c.unsafe {
+		c.topicUnsafeLocked(topic, now)
+	}
+	for topic, sequence := range c.topicSequences {
+		if sequence.expiresAt <= now && len(c.topics[topic]) == 0 {
+			delete(c.topicSequences, topic)
+		}
+	}
+	for origin, gaps := range c.reorder {
+		topic := ""
+		for sequence, m := range gaps {
+			topic = m.Topic
+			if m.ExpiresAt <= now {
+				c.reorderBytes -= messageSize(m)
+				delete(gaps, sequence)
+			}
+		}
+		if len(gaps) == 0 {
+			delete(c.reorder, origin)
+			if topic != "" {
+				c.clearUnsafeLocked(topic, "gap:"+origin)
+			}
+		}
+	}
 	for c.expiry.Len() > 0 && c.expiry[0].at <= now {
 		item := heap.Pop(&c.expiry).(*expiryItem)
 		delete(c.expiryItems, item.at)
@@ -357,6 +553,27 @@ func (c *cache) snapshot(topic string, since int64) []*Message {
 			continue
 		}
 		if m.Topic == topic && m.CreatedAt >= since && m.ExpiresAt > now {
+			out = append(out, m)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt < out[j].CreatedAt })
+	return out
+}
+
+func (c *cache) replayLocked(topic string, cursor map[string]uint64) []*Message {
+	out := make([]*Message, 0, len(c.topics[topic]))
+	for _, m := range c.topics[topic] {
+		if m != nil && m.Sequence > cursor[m.Origin] {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func (c *cache) replaySinceLocked(topic string, since int64) []*Message {
+	out := make([]*Message, 0, len(c.topics[topic]))
+	for _, m := range c.topics[topic] {
+		if m != nil && m.CreatedAt >= since {
 			out = append(out, m)
 		}
 	}
@@ -415,6 +632,8 @@ type subscriber struct {
 	inflightBytes    int64
 	cancel           context.CancelFunc
 	detached         bool
+	replaying        bool
+	deferred         []*Message
 }
 
 type deliveryCandidate struct {
@@ -499,6 +718,108 @@ type peer struct {
 	actionBytes atomic.Int64
 	acks        chan actionBatch
 	nacks       chan actionBatch
+	v2          atomic.Bool
+	lastV2Probe atomic.Int64
+}
+
+func writePeerBatchV1(w io.Writer, messages []*Message) error {
+	if len(messages) == 0 || len(messages) > maxBatchMessages {
+		return errors.New("invalid peer batch size")
+	}
+	var count [4]byte
+	binary.BigEndian.PutUint32(count[:], uint32(len(messages)))
+	if _, err := w.Write(count[:]); err != nil {
+		return err
+	}
+	for _, m := range messages {
+		if err := writePeerString(w, m.ID); err != nil {
+			return err
+		}
+		if err := writePeerString(w, m.Topic); err != nil {
+			return err
+		}
+		if err := writePeerString(w, m.Key); err != nil {
+			return err
+		}
+		var fixed [22]byte
+		binary.BigEndian.PutUint16(fixed[:2], uint16(len(m.Headers)))
+		binary.BigEndian.PutUint32(fixed[2:6], uint32(len(m.Payload)))
+		binary.BigEndian.PutUint64(fixed[6:14], uint64(m.CreatedAt))
+		binary.BigEndian.PutUint64(fixed[14:22], uint64(m.ExpiresAt))
+		if _, err := w.Write(fixed[:]); err != nil {
+			return err
+		}
+		for k, v := range m.Headers {
+			if err := writePeerString(w, k); err != nil {
+				return err
+			}
+			if err := writePeerString(w, v); err != nil {
+				return err
+			}
+		}
+		if _, err := w.Write(m.Payload); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func readPeerBatchV1(r io.Reader, maxMessage int64) ([]*Message, error) {
+	var countBytes [4]byte
+	if _, err := io.ReadFull(r, countBytes[:]); err != nil {
+		return nil, err
+	}
+	count := int(binary.BigEndian.Uint32(countBytes[:]))
+	if count == 0 || count > maxBatchMessages {
+		return nil, errors.New("invalid peer batch size")
+	}
+	messages := make([]*Message, 0, count)
+	for range count {
+		id, err := readPeerString(r, 64)
+		if err != nil {
+			return nil, err
+		}
+		topic, err := readPeerString(r, 255)
+		if err != nil {
+			return nil, err
+		}
+		key, err := readPeerString(r, maxHeaders)
+		if err != nil {
+			return nil, err
+		}
+		var fixed [22]byte
+		if _, err = io.ReadFull(r, fixed[:]); err != nil {
+			return nil, err
+		}
+		headerCount := int(binary.BigEndian.Uint16(fixed[:2]))
+		payloadSize := int64(binary.BigEndian.Uint32(fixed[2:6]))
+		if headerCount > 256 || payloadSize > maxMessage {
+			return nil, errors.New("peer message exceeds limit")
+		}
+		headers := make(map[string]string, headerCount)
+		headerBytes := 0
+		for range headerCount {
+			k, e := readPeerString(r, maxHeaders)
+			if e != nil {
+				return nil, e
+			}
+			v, e := readPeerString(r, maxHeaders)
+			if e != nil {
+				return nil, e
+			}
+			headerBytes += len(k) + len(v)
+			if headerBytes > maxHeaders {
+				return nil, errors.New("peer headers exceed limit")
+			}
+			headers[k] = v
+		}
+		payload := make([]byte, payloadSize)
+		if _, err = io.ReadFull(r, payload); err != nil {
+			return nil, err
+		}
+		messages = append(messages, &Message{ID: id, Topic: topic, Key: key, Headers: headers, Payload: payload, CreatedAt: int64(binary.BigEndian.Uint64(fixed[6:14])), ExpiresAt: int64(binary.BigEndian.Uint64(fixed[14:22]))})
+	}
+	return messages, nil
 }
 
 type actionBatch struct {
@@ -533,43 +854,55 @@ type idempotencyEntry struct {
 type idempotencyOrderEntry struct{ key, id string }
 
 type Metrics struct {
-	Published, PublishBytes, Rejected, Replicated, ReplicationErrors atomic.Uint64
-	ReplicationDropped                                               atomic.Uint64
-	AckActionDropped, NackActionDropped                              atomic.Uint64
-	Delivered, Redelivered, Acked, Dropped, Duplicate                atomic.Uint64
-	PublishLatency, ReplicationLatency, AckLatency                   durationHistogram
-	PublicAuthRejected, AdminAuthRejected, PeerAuthRejected          atomic.Uint64
+	Published, PublishBytes, Rejected, OverloadRejected, CursorExpired, Replicated, ReplicationErrors atomic.Uint64
+	ReplicationDropped                                                                                atomic.Uint64
+	AckActionDropped, NackActionDropped                                                               atomic.Uint64
+	Delivered, Redelivered, Acked, Dropped, Duplicate                                                 atomic.Uint64
+	PublishLatency, ReplicationLatency, AckLatency                                                    durationHistogram
+	PublicAuthRejected, AdminAuthRejected, PeerAuthRejected                                           atomic.Uint64
 }
 
 type Broker struct {
-	cfg              Config
-	cache            *cache
-	mux              *http.ServeMux
-	client           *http.Client
-	boot             [8]byte
-	seq              atomic.Uint64
-	metrics          Metrics
-	mu               sync.RWMutex
-	subs             map[string]*subscriber
-	topicBroadcast   map[string]map[string]*subscriber
-	topicGroups      map[string]map[string]map[string]*subscriber
-	pending          map[string]*pending
-	pendingBytes     int64
-	pendingDeadlines pendingHeap
-	idempotency      map[string]*idempotencyEntry
-	idempotencyOrder []idempotencyOrderEntry
-	checkpoints      map[checkpointScope]map[string]int64
-	checkpointOrder  []checkpointOrderEntry
-	checkpointHead   int
-	checkpointCount  int
-	peers            []*peer
-	stop             chan struct{}
-	closeOnce        sync.Once
-	requestSlots     chan struct{}
-	streamSlots      chan struct{}
-	internalSlots    chan struct{}
-	digestSlot       chan struct{}
-	ready            atomic.Bool
+	cfg                   Config
+	cache                 *cache
+	mux                   *http.ServeMux
+	client                *http.Client
+	boot                  [8]byte
+	seq                   atomic.Uint64
+	messageSeq            atomic.Uint64
+	origin                string
+	metrics               Metrics
+	mu                    sync.RWMutex
+	subs                  map[string]*subscriber
+	topicBroadcast        map[string]map[string]*subscriber
+	topicGroups           map[string]map[string]map[string]*subscriber
+	pending               map[string]*pending
+	pendingBytes          int64
+	pendingDeadlines      pendingHeap
+	idempotency           map[string]*idempotencyEntry
+	idempotencyOrder      []idempotencyOrderEntry
+	checkpoints           map[checkpointScope]map[string]int64
+	checkpointOrder       []checkpointOrderEntry
+	checkpointHead        int
+	checkpointCount       int
+	peers                 []*peer
+	stop                  chan struct{}
+	closeOnce             sync.Once
+	requestSlots          chan struct{}
+	publishAdmissionBytes atomic.Int64
+	admissionMu           sync.Mutex
+	admissionWaiters      []*publishAdmissionWaiter
+	streamSlots           chan struct{}
+	internalSlots         chan struct{}
+	digestSlot            chan struct{}
+	ready                 atomic.Bool
+}
+
+type publishAdmissionWaiter struct {
+	bytes    int64
+	ready    chan struct{}
+	granted  bool
+	bypassed uint8
 }
 
 func New(cfg Config) *Broker {
@@ -630,6 +963,15 @@ func New(cfg Config) *Broker {
 	if cfg.MaxInternalRequests <= 0 {
 		cfg.MaxInternalRequests = DefaultConfig().MaxInternalRequests
 	}
+	if cfg.PublishAdmissionBytes <= 0 {
+		cfg.PublishAdmissionBytes = DefaultConfig().PublishAdmissionBytes
+	}
+	if cfg.PublishAdmissionWait <= 0 {
+		cfg.PublishAdmissionWait = DefaultConfig().PublishAdmissionWait
+	}
+	if cfg.PublishAdmissionBytes < cfg.MaxMessage || cfg.PublishAdmissionBytes < maxBatchBytes {
+		panic("spruce: publish admission budget must fit the maximum message and batch")
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -654,10 +996,13 @@ func New(cfg Config) *Broker {
 	if _, err := rand.Read(b.boot[:]); err != nil {
 		panic("spruce: generate boot identity: " + err.Error())
 	}
+	b.origin = base64.RawURLEncoding.EncodeToString(b.boot[:])
 	for _, u := range cfg.Peers {
 		u = strings.TrimRight(strings.TrimSpace(u), "/")
 		if u != "" {
-			b.peers = append(b.peers, &peer{url: u, ch: make(chan []*Message, cfg.QueueDepth), acks: make(chan actionBatch, 1024), nacks: make(chan actionBatch, 1024)})
+			p := &peer{url: u, ch: make(chan []*Message, cfg.QueueDepth), acks: make(chan actionBatch, 1024), nacks: make(chan actionBatch, 1024)}
+			p.lastV2Probe.Store(time.Now().UnixMilli())
+			b.peers = append(b.peers, p)
 		}
 	}
 	if len(b.peers) > 0 && (cfg.PeerToken == "" || cfg.ClusterID == "") {
@@ -677,6 +1022,83 @@ func (b *Broker) Handler() http.Handler { return http.HandlerFunc(b.serveHTTP) }
 func (b *Broker) Close()                { b.closeOnce.Do(func() { close(b.stop) }) }
 func (b *Broker) BeginDrain()           { b.ready.Store(false) }
 func (b *Broker) Ready()                { b.ready.Store(true) }
+
+func (b *Broker) acquirePublishAdmission(ctx context.Context, bytes int64) bool {
+	if bytes <= 0 || bytes > b.cfg.PublishAdmissionBytes {
+		return false
+	}
+	b.admissionMu.Lock()
+	if len(b.admissionWaiters) == 0 && b.publishAdmissionBytes.Load()+bytes <= b.cfg.PublishAdmissionBytes {
+		b.publishAdmissionBytes.Add(bytes)
+		b.admissionMu.Unlock()
+		return true
+	}
+	waiter := &publishAdmissionWaiter{bytes: bytes, ready: make(chan struct{})}
+	b.admissionWaiters = append(b.admissionWaiters, waiter)
+	b.admissionMu.Unlock()
+	timer := time.NewTimer(b.cfg.PublishAdmissionWait)
+	defer timer.Stop()
+	select {
+	case <-waiter.ready:
+		return true
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+	b.admissionMu.Lock()
+	if waiter.granted {
+		b.admissionMu.Unlock()
+		return true
+	}
+	for i, queued := range b.admissionWaiters {
+		if queued == waiter {
+			copy(b.admissionWaiters[i:], b.admissionWaiters[i+1:])
+			b.admissionWaiters[len(b.admissionWaiters)-1] = nil
+			b.admissionWaiters = b.admissionWaiters[:len(b.admissionWaiters)-1]
+			break
+		}
+	}
+	b.grantPublishAdmissionLocked()
+	b.admissionMu.Unlock()
+	return false
+}
+
+func (b *Broker) grantPublishAdmissionLocked() {
+	for len(b.admissionWaiters) > 0 {
+		available := b.cfg.PublishAdmissionBytes - b.publishAdmissionBytes.Load()
+		selected := -1
+		for i, waiter := range b.admissionWaiters {
+			if waiter.bytes <= available {
+				selected = i
+				break
+			}
+			if i == 0 && waiter.bypassed >= 8 {
+				break
+			}
+		}
+		if selected < 0 {
+			return
+		}
+		waiter := b.admissionWaiters[selected]
+		for i := 0; i < selected; i++ {
+			if b.admissionWaiters[i].bypassed < 8 {
+				b.admissionWaiters[i].bypassed++
+			}
+		}
+		copy(b.admissionWaiters[selected:], b.admissionWaiters[selected+1:])
+		b.admissionWaiters[len(b.admissionWaiters)-1] = nil
+		b.admissionWaiters = b.admissionWaiters[:len(b.admissionWaiters)-1]
+		b.publishAdmissionBytes.Add(waiter.bytes)
+		waiter.granted = true
+		close(waiter.ready)
+	}
+}
+
+func (b *Broker) releasePublishAdmission(bytes int64) {
+	b.admissionMu.Lock()
+	b.publishAdmissionBytes.Add(-bytes)
+	b.grantPublishAdmissionLocked()
+	b.admissionMu.Unlock()
+}
 
 func (b *Broker) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, "/health/") {
@@ -742,6 +1164,8 @@ func (b *Broker) routes() {
 	b.mux.HandleFunc("POST /internal/replicate", b.replicate)
 	b.mux.HandleFunc("GET /internal/snapshot", b.snapshot)
 	b.mux.HandleFunc("GET /internal/checkpoints", b.checkpointSnapshot)
+	b.mux.HandleFunc("GET /internal/replay-frontiers", b.replayFrontierSnapshot)
+	b.mux.HandleFunc("GET /internal/capabilities", b.peerCapabilities)
 	b.mux.HandleFunc("GET /internal/cache-digest", b.cacheDigest)
 	b.mux.HandleFunc("POST /internal/ack", b.internalAck)
 	b.mux.HandleFunc("POST /internal/nack", b.internalNack)
@@ -773,6 +1197,18 @@ var batchReaders = sync.Pool{New: func() any {
 func (b *Broker) publishBatch(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	defer func() { b.metrics.PublishLatency.observe(time.Since(started)) }()
+	reserved := r.ContentLength
+	if reserved <= 0 {
+		reserved = maxBatchBytes
+	}
+	if !b.acquirePublishAdmission(r.Context(), reserved) {
+		b.metrics.Rejected.Add(1)
+		b.metrics.OverloadRejected.Add(1)
+		w.Header().Set("Retry-After", "1")
+		problem(w, http.StatusTooManyRequests, "overloaded")
+		return
+	}
+	defer b.releasePublishAdmission(reserved)
 	if r.ContentLength > maxBatchBytes {
 		problem(w, 413, "batch_too_large")
 		return
@@ -818,13 +1254,24 @@ func (b *Broker) publishBatch(w http.ResponseWriter, r *http.Request) {
 		if version == "2" {
 			var keySize [2]byte
 			_, err := io.ReadFull(reader, keySize[:])
-			if errors.Is(err, io.EOF) { break }
-			if err != nil { problem(w, 400, "invalid_batch"); return }
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				problem(w, 400, "invalid_batch")
+				return
+			}
 			kn := int64(binary.BigEndian.Uint16(keySize[:]))
 			total += 2 + kn
-			if kn > maxHeaders || total > maxBatchBytes { problem(w, 413, "batch_too_large"); return }
+			if kn > maxHeaders || total > maxBatchBytes {
+				problem(w, 413, "batch_too_large")
+				return
+			}
 			keyBytes := make([]byte, kn)
-			if _, err = io.ReadFull(reader, keyBytes); err != nil { problem(w, 400, "invalid_batch"); return }
+			if _, err = io.ReadFull(reader, keyBytes); err != nil {
+				problem(w, 400, "invalid_batch")
+				return
+			}
 			key = string(keyBytes)
 		}
 		var size [4]byte
@@ -869,7 +1316,9 @@ func (b *Broker) publishBatch(w http.ResponseWriter, r *http.Request) {
 	sharedKey, contentType := r.Header.Get("Spruce-Key"), r.Header.Get("Content-Type")
 	for i, payload := range payloads {
 		key := sharedKey
-		if version == "2" { key = keys[i] }
+		if version == "2" {
+			key = keys[i]
+		}
 		m := &Message{ID: b.nextID(), Topic: topic, Key: key, Payload: payload,
 			CreatedAt: now.UnixMilli(), ExpiresAt: now.Add(ttl).UnixMilli()}
 		if contentType != "" {
@@ -1024,6 +1473,18 @@ func (b *Broker) idempotencyReplicated(entry *idempotencyEntry) bool {
 func (b *Broker) publish(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	defer func() { b.metrics.PublishLatency.observe(time.Since(started)) }()
+	reserved := r.ContentLength
+	if reserved <= 0 {
+		reserved = b.cfg.MaxMessage
+	}
+	if !b.acquirePublishAdmission(r.Context(), reserved) {
+		b.metrics.Rejected.Add(1)
+		b.metrics.OverloadRejected.Add(1)
+		w.Header().Set("Retry-After", "1")
+		problem(w, http.StatusTooManyRequests, "overloaded")
+		return
+	}
+	defer b.releasePublishAdmission(reserved)
 	if r.ContentLength > b.cfg.MaxMessage {
 		problem(w, 413, "message_too_large")
 		return
@@ -1132,7 +1593,24 @@ func (b *Broker) publish(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *Broker) accept(m *Message) (bool, error) {
-	inserted, err := b.cache.put(m, time.Now().UnixMilli())
+	b.cache.mu.Lock()
+	defer b.cache.mu.Unlock()
+	if m.Origin == "" {
+		state := b.cache.topicSequences[m.Topic]
+		if state == nil {
+			if len(b.cache.topicSequences) >= b.cache.frontierLimit {
+				b.cache.markUnsafeLocked(m.Topic, "sequence-capacity", m.ExpiresAt)
+				return false, errors.New("topic sequence capacity")
+			}
+			state = &topicSequence{origin: b.origin + "." + strconv.FormatUint(b.seq.Add(1), 36)}
+			b.cache.topicSequences[m.Topic] = state
+		}
+		state.next++
+		state.expiresAt = max(state.expiresAt, m.ExpiresAt)
+		m.Origin, m.Sequence = state.origin, state.next
+		b.cache.receivedThrough[m.Origin] = m.Sequence
+	}
+	inserted, err := b.cache.putLocked(m, time.Now().UnixMilli())
 	if err != nil || !inserted {
 		if !inserted && err == nil {
 			b.metrics.Duplicate.Add(1)
@@ -1144,7 +1622,28 @@ func (b *Broker) accept(m *Message) (bool, error) {
 }
 
 func (b *Broker) acceptBatch(messages []*Message) error {
-	inserted, err := b.cache.putBatch(messages, time.Now().UnixMilli())
+	b.cache.mu.Lock()
+	defer b.cache.mu.Unlock()
+	for _, m := range messages {
+		if m.Origin == "" {
+			state := b.cache.topicSequences[m.Topic]
+			if state == nil {
+				if len(b.cache.topicSequences) >= b.cache.frontierLimit {
+					b.cache.markUnsafeLocked(m.Topic, "sequence-capacity", m.ExpiresAt)
+					return errors.New("topic sequence capacity")
+				}
+				state = &topicSequence{origin: b.origin + "." + strconv.FormatUint(b.seq.Add(1), 36)}
+				b.cache.topicSequences[m.Topic] = state
+			}
+			state.next++
+			state.expiresAt = max(state.expiresAt, m.ExpiresAt)
+			m.Origin, m.Sequence = state.origin, state.next
+			b.cache.receivedThrough[m.Origin] = m.Sequence
+		} else {
+			b.cache.receivedThrough[m.Origin] = max(b.cache.receivedThrough[m.Origin], m.Sequence)
+		}
+	}
+	inserted, err := b.cache.putBatchLocked(messages, time.Now().UnixMilli())
 	if err != nil {
 		return err
 	}
@@ -1153,6 +1652,76 @@ func (b *Broker) acceptBatch(messages []*Message) error {
 			b.deliver(m, "", 1)
 		} else {
 			b.metrics.Duplicate.Add(1)
+		}
+	}
+	return nil
+}
+
+func (b *Broker) acceptReplicatedBatch(messages []*Message) error {
+	b.cache.mu.Lock()
+	defer b.cache.mu.Unlock()
+	now := time.Now().UnixMilli()
+	b.cache.expireLocked(now)
+	for _, m := range messages {
+		if m.Origin == "" || m.Sequence == 0 || messageSize(m) > b.cache.maxBytes {
+			return errors.New("invalid replicated sequence")
+		}
+	}
+	sort.SliceStable(messages, func(i, j int) bool {
+		if messages[i].Origin == messages[j].Origin {
+			return messages[i].Sequence < messages[j].Sequence
+		}
+		return messages[i].Origin < messages[j].Origin
+	})
+	for _, m := range messages {
+		through := b.cache.receivedThrough[m.Origin]
+		if m.Sequence <= through {
+			if _, exists := b.cache.items[m.ID]; exists {
+				b.metrics.Duplicate.Add(1)
+			}
+			continue
+		}
+		if m.Sequence > through+1 {
+			gaps := b.cache.reorder[m.Origin]
+			if gaps == nil {
+				gaps = make(map[uint64]*Message)
+				b.cache.reorder[m.Origin] = gaps
+			}
+			if _, exists := gaps[m.Sequence]; exists {
+				b.metrics.Duplicate.Add(1)
+				continue
+			}
+			if len(gaps) >= b.cache.reorderLimit || b.cache.reorderBytes+messageSize(m) > b.cache.maxBytes/4 {
+				b.cache.markUnsafeLocked(m.Topic, "overflow:"+m.Origin, m.ExpiresAt)
+				b.metrics.ReplicationDropped.Add(1)
+				continue
+			}
+			gaps[m.Sequence] = m
+			b.cache.reorderBytes += messageSize(m)
+			b.cache.markUnsafeLocked(m.Topic, "gap:"+m.Origin, m.ExpiresAt)
+			continue
+		}
+		for current := m; current != nil; {
+			inserted, err := b.cache.insertLocked(current)
+			if err != nil {
+				return err
+			}
+			b.cache.receivedThrough[current.Origin] = current.Sequence
+			if inserted {
+				b.deliver(current, "", 1)
+			} else {
+				b.metrics.Duplicate.Add(1)
+			}
+			next := b.cache.reorder[current.Origin][current.Sequence+1]
+			if next != nil {
+				delete(b.cache.reorder[current.Origin], current.Sequence+1)
+				b.cache.reorderBytes -= messageSize(next)
+			}
+			if len(b.cache.reorder[current.Origin]) == 0 {
+				delete(b.cache.reorder, current.Origin)
+				b.cache.clearUnsafeLocked(current.Topic, "gap:"+current.Origin)
+			}
+			current = next
 		}
 	}
 	return nil
@@ -1228,14 +1797,18 @@ func writePeerBatch(w io.Writer, messages []*Message) error {
 		if err := writePeerString(w, m.Key); err != nil {
 			return err
 		}
+		if err := writePeerString(w, m.Origin); err != nil {
+			return err
+		}
 		if len(m.Headers) > 65535 || len(m.Payload) > int(^uint32(0)) {
 			return errors.New("peer message too large")
 		}
-		var fixed [22]byte
+		var fixed [30]byte
 		binary.BigEndian.PutUint16(fixed[:2], uint16(len(m.Headers)))
 		binary.BigEndian.PutUint32(fixed[2:6], uint32(len(m.Payload)))
 		binary.BigEndian.PutUint64(fixed[6:14], uint64(m.CreatedAt))
 		binary.BigEndian.PutUint64(fixed[14:22], uint64(m.ExpiresAt))
+		binary.BigEndian.PutUint64(fixed[22:30], m.Sequence)
 		if _, err := w.Write(fixed[:]); err != nil {
 			return err
 		}
@@ -1270,6 +1843,9 @@ func appendPeerBatch(out []byte, messages []*Message) ([]byte, error) {
 		if out, err = appendPeerString(out, m.Key); err != nil {
 			return out, err
 		}
+		if out, err = appendPeerString(out, m.Origin); err != nil {
+			return out, err
+		}
 		if len(m.Headers) > 65535 || len(m.Payload) > int(^uint32(0)) {
 			return out, errors.New("peer message too large")
 		}
@@ -1277,6 +1853,7 @@ func appendPeerBatch(out []byte, messages []*Message) ([]byte, error) {
 		out = binary.BigEndian.AppendUint32(out, uint32(len(m.Payload)))
 		out = binary.BigEndian.AppendUint64(out, uint64(m.CreatedAt))
 		out = binary.BigEndian.AppendUint64(out, uint64(m.ExpiresAt))
+		out = binary.BigEndian.AppendUint64(out, m.Sequence)
 		for key, value := range m.Headers {
 			if out, err = appendPeerString(out, key); err != nil {
 				return out, err
@@ -1337,7 +1914,11 @@ func readPeerBatch(r io.Reader, maxMessage int64) ([]*Message, error) {
 		if err != nil {
 			return nil, err
 		}
-		var fixed [22]byte
+		origin, err := readPeerString(r, 64)
+		if err != nil {
+			return nil, err
+		}
+		var fixed [30]byte
 		if _, err = io.ReadFull(r, fixed[:]); err != nil {
 			return nil, err
 		}
@@ -1371,7 +1952,7 @@ func readPeerBatch(r io.Reader, maxMessage int64) ([]*Message, error) {
 			return nil, err
 		}
 		messages = append(messages, &Message{ID: id, Topic: topic, Key: key, Headers: headers, Payload: payload,
-			CreatedAt: int64(binary.BigEndian.Uint64(fixed[6:14])), ExpiresAt: int64(binary.BigEndian.Uint64(fixed[14:22]))})
+			CreatedAt: int64(binary.BigEndian.Uint64(fixed[6:14])), ExpiresAt: int64(binary.BigEndian.Uint64(fixed[14:22])), Origin: origin, Sequence: binary.BigEndian.Uint64(fixed[22:30])})
 	}
 	return messages, nil
 }
@@ -1381,8 +1962,15 @@ func (b *Broker) sendPeer(ctx context.Context, p *peer, m *Message) bool {
 }
 
 func (b *Broker) sendPeerBatch(ctx context.Context, p *peer, messages []*Message) bool {
+	b.probePeerV2(ctx, p)
 	var body bytes.Buffer
-	if err := writePeerBatch(&body, messages); err != nil {
+	var err error
+	if p.v2.Load() {
+		err = writePeerBatch(&body, messages)
+	} else {
+		err = writePeerBatchV1(&body, messages)
+	}
+	if err != nil {
 		b.metrics.ReplicationErrors.Add(uint64(len(messages)))
 		return false
 	}
@@ -1396,6 +1984,9 @@ func (b *Broker) sendPeerBody(ctx context.Context, p *peer, body []byte, count i
 	req.Header.Set("Content-Type", "application/vnd.spruce.peer")
 	req.Header.Set("Spruce-Peer-Token", b.cfg.PeerToken)
 	req.Header.Set("Spruce-Cluster-ID", b.cfg.ClusterID)
+	if p.v2.Load() {
+		req.Header.Set("Spruce-Peer-Version", "2")
+	}
 	resp, err := b.client.Do(req)
 	if err != nil {
 		b.metrics.ReplicationErrors.Add(1)
@@ -1418,8 +2009,15 @@ func (b *Broker) peerLoop(p *peer) {
 		case <-b.stop:
 			return
 		case batch := <-p.ch:
+			b.probePeerV2(context.Background(), p)
 			encoded.Reset()
-			if err := writePeerBatch(&encoded, batch); err != nil {
+			var err error
+			if p.v2.Load() {
+				err = writePeerBatch(&encoded, batch)
+			} else {
+				err = writePeerBatchV1(&encoded, batch)
+			}
+			if err != nil {
 				b.metrics.ReplicationErrors.Add(uint64(len(batch)))
 				p.queuedBytes.Add(-batchBytes(batch))
 				continue
@@ -1452,6 +2050,30 @@ func (b *Broker) peerLoop(p *peer) {
 				encoded = bytes.Buffer{}
 			}
 		}
+	}
+}
+
+func (b *Broker) probePeerV2(ctx context.Context, p *peer) {
+	if p.v2.Load() {
+		return
+	}
+	now := time.Now().UnixMilli()
+	previous := p.lastV2Probe.Load()
+	if now-previous < 30000 || !p.lastV2Probe.CompareAndSwap(previous, now) {
+		return
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(probeCtx, http.MethodGet, p.url+"/internal/capabilities", nil)
+	req.Header.Set("Spruce-Peer-Token", b.cfg.PeerToken)
+	req.Header.Set("Spruce-Cluster-ID", b.cfg.ClusterID)
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent && resp.Header.Get("Spruce-Peer-Version") == "2" {
+		p.v2.Store(true)
 	}
 }
 
@@ -1509,9 +2131,21 @@ func (b *Broker) snapshot(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	w.Header().Set("Content-Type", "application/vnd.spruce.peer")
+	v2 := r.Header.Get("Spruce-Peer-Version") == "2"
+	if v2 {
+		w.Header().Set("Content-Type", "application/vnd.spruce.peer.v2")
+		w.Header().Set("Spruce-Peer-Version", "2")
+	} else {
+		w.Header().Set("Content-Type", "application/vnd.spruce.peer")
+	}
 	w.Header().Set("Spruce-Next-Cursor", next)
-	if err := writePeerBatch(w, messages); err != nil {
+	var err error
+	if v2 {
+		err = writePeerBatch(w, messages)
+	} else {
+		err = writePeerBatchV1(w, messages)
+	}
+	if err != nil {
 		b.cfg.Logger.Error("encode snapshot", "error", err)
 	}
 }
@@ -1534,6 +2168,132 @@ func (b *Broker) checkpointSnapshot(w http.ResponseWriter, r *http.Request) {
 	b.mu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(checkpoints)
+}
+
+type replayFrontierSnapshot struct {
+	Topics      map[string]*topicFrontier   `json:"topics"`
+	UnsafeUntil int64                       `json:"unsafe_until,omitempty"`
+	Unsafe      map[string]map[string]int64 `json:"unsafe,omitempty"`
+}
+
+func (b *Broker) peerCapabilities(w http.ResponseWriter, r *http.Request) {
+	if !b.peerAllowed(r) {
+		problem(w, http.StatusUnauthorized, "invalid_peer")
+		return
+	}
+	w.Header().Set("Spruce-Peer-Version", "2")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (b *Broker) replayFrontierSnapshot(w http.ResponseWriter, r *http.Request) {
+	if !b.peerAllowed(r) {
+		problem(w, http.StatusUnauthorized, "invalid_peer")
+		return
+	}
+	b.cache.mu.Lock()
+	now := time.Now().UnixMilli()
+	snapshot := replayFrontierSnapshot{Topics: make(map[string]*topicFrontier, len(b.cache.frontiers)), Unsafe: make(map[string]map[string]int64, len(b.cache.unsafe))}
+	for topic, frontier := range b.cache.frontiers {
+		snapshot.Topics[topic] = &topicFrontier{Sequences: cloneFrontier(frontier.Sequences), ExpiresAt: frontier.ExpiresAt}
+	}
+	for topic, entries := range b.cache.unsafe {
+		copied := make(map[string]int64, len(entries))
+		for source, until := range entries {
+			if until > now {
+				copied[source] = until
+			}
+		}
+		if len(copied) > 0 {
+			snapshot.Unsafe[topic] = copied
+		}
+	}
+	b.cache.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(snapshot)
+}
+
+func (b *Broker) syncReplayFrontiersFromPeer(ctx context.Context, p *peer) error {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, p.url+"/internal/replay-frontiers", nil)
+	req.Header.Set("Spruce-Peer-Token", b.cfg.PeerToken)
+	req.Header.Set("Spruce-Cluster-ID", b.cfg.ClusterID)
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		p.v2.Store(false)
+		b.cache.mu.Lock()
+		b.cache.markUnsafeLocked("*", "legacy-frontier:"+p.url, time.Now().Add(b.cfg.MaxTTL).UnixMilli())
+		b.cache.mu.Unlock()
+		return nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("replay frontier peer returned %s", resp.Status)
+	}
+	p.v2.Store(true)
+	var snapshot replayFrontierSnapshot
+	if json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(&snapshot) != nil || len(snapshot.Topics) > b.cache.frontierLimit || len(snapshot.Unsafe) > b.cache.frontierLimit {
+		return errors.New("invalid replay frontier snapshot")
+	}
+	now := time.Now().UnixMilli()
+	maxExpiry := now + int64(b.cfg.MaxTTL/time.Millisecond)
+	if snapshot.UnsafeUntil < 0 || snapshot.UnsafeUntil > maxExpiry {
+		return errors.New("invalid replay frontier snapshot")
+	}
+	for topic, entries := range snapshot.Unsafe {
+		if (topic != "*" && !validTopic(topic)) || len(entries) > 256 {
+			return errors.New("invalid replay frontier snapshot")
+		}
+		for source, until := range entries {
+			if source == "" || until < 0 || until > maxExpiry {
+				return errors.New("invalid replay frontier snapshot")
+			}
+		}
+	}
+	for topic, incoming := range snapshot.Topics {
+		if !validTopic(topic) || incoming == nil || len(incoming.Sequences) > 256 || incoming.ExpiresAt > maxExpiry {
+			return errors.New("invalid replay frontier snapshot")
+		}
+		for origin := range incoming.Sequences {
+			if origin == "" || len(origin) > 64 {
+				return errors.New("invalid replay frontier snapshot")
+			}
+		}
+	}
+	b.cache.mu.Lock()
+	defer b.cache.mu.Unlock()
+	if snapshot.UnsafeUntil > 0 {
+		b.cache.markUnsafeLocked("*", "legacy-snapshot", snapshot.UnsafeUntil)
+	}
+	for topic, entries := range snapshot.Unsafe {
+		for source, until := range entries {
+			b.cache.markUnsafeLocked(topic, "peer:"+source, until)
+		}
+	}
+	for topic, incoming := range snapshot.Topics {
+		if incoming.ExpiresAt <= now {
+			continue
+		}
+		current := b.cache.frontiers[topic]
+		if current == nil {
+			current = &topicFrontier{Sequences: make(map[string]uint64)}
+			b.cache.frontiers[topic] = current
+		}
+		combined := cloneFrontier(current.Sequences)
+		for origin, sequence := range incoming.Sequences {
+			combined[origin] = max(combined[origin], sequence)
+		}
+		if encodeReplayCursor(combined) == "" {
+			b.cache.markUnsafeLocked(topic, "frontier-merge", incoming.ExpiresAt)
+			continue
+		}
+		for origin, sequence := range incoming.Sequences {
+			current.Sequences[origin] = max(current.Sequences[origin], sequence)
+		}
+		current.ExpiresAt = max(current.ExpiresAt, incoming.ExpiresAt)
+	}
+	return nil
 }
 
 func (b *Broker) syncCheckpointsFromPeer(ctx context.Context, p *peer) error {
@@ -1583,6 +2343,7 @@ func (b *Broker) SyncFromPeers(ctx context.Context) error {
 			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, p.url+"/internal/snapshot?after="+url.QueryEscape(cursor), nil)
 			req.Header.Set("Spruce-Peer-Token", b.cfg.PeerToken)
 			req.Header.Set("Spruce-Cluster-ID", b.cfg.ClusterID)
+			req.Header.Set("Spruce-Peer-Version", "2")
 			resp, err := b.client.Do(req)
 			if err != nil {
 				lastErr, peerErr = err, err
@@ -1599,11 +2360,24 @@ func (b *Broker) SyncFromPeers(ctx context.Context) error {
 				resp.Body.Close()
 				break
 			}
-			messages, err := readPeerBatch(io.LimitReader(resp.Body, 25<<20), b.cfg.MaxMessage)
+			v2 := resp.Header.Get("Spruce-Peer-Version") == "2"
+			var messages []*Message
+			if v2 {
+				messages, err = readPeerBatch(io.LimitReader(resp.Body, 25<<20), b.cfg.MaxMessage)
+			} else {
+				messages, err = readPeerBatchV1(io.LimitReader(resp.Body, 25<<20), b.cfg.MaxMessage)
+			}
 			resp.Body.Close()
 			if err != nil {
 				lastErr, peerErr = err, err
 				break
+			}
+			if !v2 {
+				for _, m := range messages {
+					b.cache.mu.Lock()
+					b.cache.markUnsafeLocked(m.Topic, "legacy-bootstrap:"+p.url, m.ExpiresAt)
+					b.cache.mu.Unlock()
+				}
 			}
 			if err := b.acceptBatch(messages); err != nil {
 				return err
@@ -1618,6 +2392,9 @@ func (b *Broker) SyncFromPeers(ctx context.Context) error {
 			return peerErr
 		}
 		if peerAvailable {
+			if err := b.syncReplayFrontiersFromPeer(ctx, p); err != nil {
+				return err
+			}
 			if err := b.syncCheckpointsFromPeer(ctx, p); err != nil {
 				return err
 			}
@@ -1634,12 +2411,26 @@ func (b *Broker) replicate(w http.ResponseWriter, r *http.Request) {
 		problem(w, 401, "invalid_peer")
 		return
 	}
-	messages, err := readPeerBatch(io.LimitReader(r.Body, 32<<20), b.cfg.MaxMessage)
+	v2 := r.Header.Get("Spruce-Peer-Version") == "2"
+	var messages []*Message
+	var err error
+	if v2 {
+		messages, err = readPeerBatch(io.LimitReader(r.Body, 32<<20), b.cfg.MaxMessage)
+	} else {
+		messages, err = readPeerBatchV1(io.LimitReader(r.Body, 32<<20), b.cfg.MaxMessage)
+	}
 	if err != nil {
 		problem(w, 400, "invalid_message")
 		return
 	}
 	now := time.Now().UnixMilli()
+	if !v2 {
+		b.cache.mu.Lock()
+		for _, m := range messages {
+			b.cache.markUnsafeLocked(m.Topic, "legacy-live", m.ExpiresAt)
+		}
+		b.cache.mu.Unlock()
+	}
 	for _, m := range messages {
 		if !validTopic(m.Topic) || m.ExpiresAt > time.Now().Add(b.cfg.MaxTTL).UnixMilli() || messageSize(m) > b.cfg.CacheBytes {
 			problem(w, 400, "invalid_message")
@@ -1652,7 +2443,13 @@ func (b *Broker) replicate(w http.ResponseWriter, r *http.Request) {
 			live = append(live, m)
 		}
 	}
-	if err := b.acceptBatch(live); err != nil {
+	var acceptErr error
+	if v2 {
+		acceptErr = b.acceptReplicatedBatch(live)
+	} else {
+		acceptErr = b.acceptBatch(live)
+	}
+	if acceptErr != nil {
 		problem(w, 507, "cache_capacity")
 		return
 	}
@@ -1673,14 +2470,22 @@ func hashValue(parts ...string) uint64 {
 }
 
 func (b *Broker) deliver(m *Message, onlyGroup string, attempt int) {
-	b.mu.RLock()
+	b.mu.Lock()
 	if len(b.topicBroadcast[m.Topic]) == 0 && len(b.topicGroups[m.Topic]) == 0 {
-		b.mu.RUnlock()
+		b.mu.Unlock()
 		return
 	}
 	candidates := deliveryCandidates.Get().([]deliveryCandidate)[:0]
 	if onlyGroup == "" {
 		for _, s := range b.topicBroadcast[m.Topic] {
+			if s.replaying {
+				if len(s.deferred) >= 256 {
+					s.cancel()
+					continue
+				}
+				s.deferred = append(s.deferred, m)
+				continue
+			}
 			candidates = append(candidates, deliveryCandidate{subscriber: s})
 		}
 	}
@@ -1692,11 +2497,32 @@ func (b *Broker) deliver(m *Message, onlyGroup string, attempt int) {
 		if b.checkpointActiveLocked(m.Topic, group, m.ID, now) {
 			continue
 		}
-		for _, s := range indexed {
-			candidates = append(candidates, deliveryCandidate{subscriber: s, group: group, score: hashValue(m.ID, s.id)})
+		var selected *subscriber
+		var selectedScore uint64
+		for _, candidate := range indexed {
+			score := hashValue(m.ID, candidate.id)
+			if selected == nil || score > selectedScore {
+				selected, selectedScore = candidate, score
+			}
+		}
+		if selected == nil {
+			continue
+		}
+		if selected.replaying {
+			if len(selected.deferred) >= 256 {
+				selected.cancel()
+				continue
+			}
+			selected.deferred = append(selected.deferred, m)
+			continue
+		}
+		for _, candidate := range indexed {
+			if !candidate.replaying {
+				candidates = append(candidates, deliveryCandidate{subscriber: candidate, group: group, score: hashValue(m.ID, candidate.id)})
+			}
 		}
 	}
-	b.mu.RUnlock()
+	b.mu.Unlock()
 	if len(candidates) > 1 {
 		sort.Slice(candidates, func(i, j int) bool {
 			if candidates[i].group != candidates[j].group {
@@ -1767,7 +2593,7 @@ func (b *Broker) removeSubscriberLocked(s *subscriber) {
 
 func (b *Broker) sendDelivery(s *subscriber, m *Message, attempt int) bool {
 	deliveryID := b.nextID()
-	d := Delivery{DeliveryID: deliveryID, MessageID: m.ID, Topic: m.Topic, Key: m.Key, Headers: m.Headers, CreatedAt: m.CreatedAt, Attempt: attempt, Payload: m.Payload}
+	d := Delivery{DeliveryID: deliveryID, MessageID: m.ID, Topic: m.Topic, Key: m.Key, Headers: m.Headers, CreatedAt: m.CreatedAt, Attempt: attempt, Payload: m.Payload, origin: m.Origin, sequence: m.Sequence}
 	bytes := messageSize(m)
 	now := time.Now()
 	p := acquirePending()
@@ -1858,6 +2684,9 @@ func appendDeliveryJSON(out []byte, d Delivery) []byte {
 	out = strconv.AppendInt(out, d.CreatedAt, 10)
 	out = append(out, ',', '"', 'a', 't', 't', 'e', 'm', 'p', 't', '"', ':')
 	out = strconv.AppendInt(out, int64(d.Attempt), 10)
+	if d.Cursor != "" {
+		out = appendJSONField(out, "cursor", d.Cursor, true)
+	}
 	return append(out, '}')
 }
 
@@ -1880,14 +2709,24 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 		problem(w, 400, "invalid_group")
 		return
 	}
-	var since int64
-	if value := r.URL.Query().Get("since"); value != "" {
-		parsed, err := strconv.ParseInt(value, 10, 64)
-		if err != nil || parsed < 0 {
+	legacy := r.URL.Query().Has("since")
+	if legacy && r.URL.Query().Has("cursor") {
+		problem(w, 400, "ambiguous_cursor")
+		return
+	}
+	var legacySince int64
+	if legacy {
+		parsed, parseErr := strconv.ParseInt(r.URL.Query().Get("since"), 10, 64)
+		if parseErr != nil || parsed < 0 {
 			problem(w, 400, "invalid_since")
 			return
 		}
-		since = parsed
+		legacySince = parsed
+	}
+	cursor, err := decodeReplayCursor(r.URL.Query().Get("cursor"))
+	if err != nil {
+		problem(w, 400, "invalid_cursor")
+		return
 	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -1896,21 +2735,32 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 	}
 	streamCtx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	s := &subscriber{id: b.nextID(), topic: topic, group: group, ch: make(chan Delivery, 256), cancel: cancel}
+	s := &subscriber{id: b.nextID(), topic: topic, group: group, ch: make(chan Delivery, 256), cancel: cancel, replaying: true}
 	b.cache.mu.Lock()
 	b.cache.expireLocked(time.Now().UnixMilli())
-	replay := make([]*Message, 0)
-	for _, m := range b.cache.topics[topic] {
-		if m == nil {
-			continue
-		}
-		if m.Topic == topic && m.CreatedAt >= since {
-			replay = append(replay, m)
-		}
+	frontier := b.cache.frontiers[topic]
+	unsafe := b.cache.topicUnsafeLocked(topic, time.Now().UnixMilli())
+	legacyLost := legacy && (unsafe || (frontier != nil && len(frontier.Sequences) > 0))
+	if legacyLost || (!legacy && r.URL.Query().Get("cursor") != "" && (unsafe || frontierBehind(cursor, frontier))) {
+		b.cache.mu.Unlock()
+		b.metrics.CursorExpired.Add(1)
+		problem(w, http.StatusConflict, "cursor_expired")
+		return
+	}
+	var replay []*Message
+	if legacy {
+		replay = b.cache.replaySinceLocked(topic, legacySince)
+	} else {
+		replay = b.cache.replayLocked(topic, cursor)
 	}
 	b.mu.Lock()
+	groupReplayOwner := group == "" || len(b.topicGroups[topic][group]) == 0
+	if !groupReplayOwner {
+		replay = replay[:0]
+		s.replaying = false
+	}
 	b.addSubscriberLocked(s)
-	if group != "" {
+	if group != "" && groupReplayOwner {
 		kept := replay[:0]
 		now := time.Now().UnixMilli()
 		for _, m := range replay {
@@ -1922,8 +2772,10 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 	}
 	b.mu.Unlock()
 	b.cache.mu.Unlock()
+	w.Header().Set("Spruce-Cursor", encodeReplayCursor(cursor))
 	defer func() {
 		b.mu.Lock()
+		takeover := s.replaying && s.group != ""
 		b.removeSubscriberLocked(s)
 		for _, p := range b.pending {
 			if p.subscriberID == s.id {
@@ -1933,14 +2785,12 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		b.mu.Unlock()
-	}()
-	for _, m := range replay {
-		if group == "" {
-			b.sendDelivery(s, m, 1)
-		} else {
-			b.deliver(m, group, 1)
+		if takeover {
+			for _, m := range b.cache.snapshot(s.topic, 0) {
+				b.deliver(m, s.group, 1)
+			}
 		}
-	}
+	}()
 	w.Header().Set("Content-Type", "application/vnd.spruce.stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(200)
@@ -1948,11 +2798,68 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
 	bw := bufio.NewWriterSize(w, 32<<10)
+	writeReplay := func(m *Message) bool {
+		if !b.sendDelivery(s, m, 1) {
+			return false
+		}
+		var d Delivery
+		select {
+		case d = <-s.ch:
+		case <-streamCtx.Done():
+			return false
+		}
+		nextCursor := cloneFrontier(cursor)
+		nextCursor[d.origin] = max(nextCursor[d.origin], d.sequence)
+		encoded := encodeReplayCursor(nextCursor)
+		if encoded == "" {
+			b.cache.mu.Lock()
+			b.cache.markUnsafeLocked(m.Topic, "cursor-capacity", m.ExpiresAt)
+			b.cache.mu.Unlock()
+			return false
+		}
+		cursor, d.Cursor = nextCursor, encoded
+		if err := writeFrame(bw, d); err != nil {
+			return false
+		}
+		if err := bw.Flush(); err != nil {
+			return false
+		}
+		flusher.Flush()
+		return true
+	}
+	for _, m := range replay {
+		if !writeReplay(m) {
+			return
+		}
+	}
+	for {
+		b.mu.Lock()
+		deferred := append([]*Message(nil), s.deferred...)
+		s.deferred = nil
+		if len(deferred) == 0 {
+			s.replaying = false
+			b.mu.Unlock()
+			break
+		}
+		b.mu.Unlock()
+		for _, m := range deferred {
+			if !writeReplay(m) {
+				return
+			}
+		}
+	}
 	for {
 		select {
 		case <-streamCtx.Done():
 			return
 		case d := <-s.ch:
+			nextCursor := cloneFrontier(cursor)
+			nextCursor[d.origin] = max(nextCursor[d.origin], d.sequence)
+			d.Cursor = encodeReplayCursor(nextCursor)
+			if d.Cursor == "" {
+				return
+			}
+			cursor = nextCursor
 			_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := writeFrame(bw, d); err != nil {
 				return
@@ -1960,6 +2867,13 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 			for range 63 {
 				select {
 				case next := <-s.ch:
+					nextCursor := cloneFrontier(cursor)
+					nextCursor[next.origin] = max(nextCursor[next.origin], next.sequence)
+					next.Cursor = encodeReplayCursor(nextCursor)
+					if next.Cursor == "" {
+						return
+					}
+					cursor = nextCursor
 					if err := writeFrame(bw, next); err != nil {
 						return
 					}
@@ -2480,10 +3394,10 @@ func (b *Broker) prometheus(w http.ResponseWriter, _ *http.Request) {
 	vals := []struct {
 		name  string
 		value uint64
-	}{{"spruce_publish_total", b.metrics.Published.Load()}, {"spruce_publish_bytes_total", b.metrics.PublishBytes.Load()}, {"spruce_publish_rejected_total", b.metrics.Rejected.Load()}, {"spruce_public_auth_rejected_total", b.metrics.PublicAuthRejected.Load()}, {"spruce_admin_auth_rejected_total", b.metrics.AdminAuthRejected.Load()}, {"spruce_peer_auth_rejected_total", b.metrics.PeerAuthRejected.Load()}, {"spruce_replication_total", b.metrics.Replicated.Load()}, {"spruce_replication_errors_total", b.metrics.ReplicationErrors.Load()}, {"spruce_replication_dropped_messages_total", b.metrics.ReplicationDropped.Load()}, {"spruce_ack_propagation_dropped_ids_total", b.metrics.AckActionDropped.Load()}, {"spruce_nack_propagation_dropped_ids_total", b.metrics.NackActionDropped.Load()}, {"spruce_deliveries_total", b.metrics.Delivered.Load()}, {"spruce_redeliveries_total", b.metrics.Redelivered.Load()}, {"spruce_acks_total", b.metrics.Acked.Load()}, {"spruce_delivery_dropped_total", b.metrics.Dropped.Load()}, {"spruce_cache_evictions_total", evicted}, {"spruce_cache_expired_total", expired}, {"spruce_cache_messages", uint64(entries)}, {"spruce_cache_accounted_bytes", uint64(bytes)}, {"spruce_consumers", uint64(consumers)}, {"spruce_consumer_checkpoints", uint64(checkpoints)}, {"spruce_consumer_inflight", uint64(inflight)}, {"spruce_consumer_inflight_bytes", uint64(pendingBytes)}, {"spruce_replication_queue_bytes", uint64(replicationQueueBytes)}, {"spruce_action_queue_bytes", uint64(actionQueueBytes)}}
+	}{{"spruce_publish_total", b.metrics.Published.Load()}, {"spruce_publish_bytes_total", b.metrics.PublishBytes.Load()}, {"spruce_publish_rejected_total", b.metrics.Rejected.Load()}, {"spruce_publish_overload_rejected_total", b.metrics.OverloadRejected.Load()}, {"spruce_subscription_cursor_expired_total", b.metrics.CursorExpired.Load()}, {"spruce_publish_admission_bytes", uint64(b.publishAdmissionBytes.Load())}, {"spruce_publish_admission_capacity_bytes", uint64(b.cfg.PublishAdmissionBytes)}, {"spruce_public_auth_rejected_total", b.metrics.PublicAuthRejected.Load()}, {"spruce_admin_auth_rejected_total", b.metrics.AdminAuthRejected.Load()}, {"spruce_peer_auth_rejected_total", b.metrics.PeerAuthRejected.Load()}, {"spruce_replication_total", b.metrics.Replicated.Load()}, {"spruce_replication_errors_total", b.metrics.ReplicationErrors.Load()}, {"spruce_replication_dropped_messages_total", b.metrics.ReplicationDropped.Load()}, {"spruce_ack_propagation_dropped_ids_total", b.metrics.AckActionDropped.Load()}, {"spruce_nack_propagation_dropped_ids_total", b.metrics.NackActionDropped.Load()}, {"spruce_deliveries_total", b.metrics.Delivered.Load()}, {"spruce_redeliveries_total", b.metrics.Redelivered.Load()}, {"spruce_acks_total", b.metrics.Acked.Load()}, {"spruce_delivery_dropped_total", b.metrics.Dropped.Load()}, {"spruce_cache_evictions_total", evicted}, {"spruce_cache_expired_total", expired}, {"spruce_cache_messages", uint64(entries)}, {"spruce_cache_accounted_bytes", uint64(bytes)}, {"spruce_consumers", uint64(consumers)}, {"spruce_consumer_checkpoints", uint64(checkpoints)}, {"spruce_consumer_inflight", uint64(inflight)}, {"spruce_consumer_inflight_bytes", uint64(pendingBytes)}, {"spruce_replication_queue_bytes", uint64(replicationQueueBytes)}, {"spruce_action_queue_bytes", uint64(actionQueueBytes)}}
 	for _, v := range vals {
 		kind := "counter"
-		if v.name == "spruce_cache_messages" || v.name == "spruce_cache_accounted_bytes" || v.name == "spruce_consumers" || v.name == "spruce_consumer_checkpoints" || v.name == "spruce_consumer_inflight" || strings.HasSuffix(v.name, "_queue_bytes") || v.name == "spruce_consumer_inflight_bytes" {
+		if v.name == "spruce_cache_messages" || v.name == "spruce_cache_accounted_bytes" || v.name == "spruce_consumers" || v.name == "spruce_consumer_checkpoints" || v.name == "spruce_consumer_inflight" || strings.HasSuffix(v.name, "_queue_bytes") || strings.Contains(v.name, "_admission_") || v.name == "spruce_publish_admission_bytes" || v.name == "spruce_consumer_inflight_bytes" {
 			kind = "gauge"
 		}
 		_, _ = fmt.Fprintf(w, "# TYPE %s %s\n%s %d\n", v.name, kind, v.name, v.value)

@@ -75,6 +75,10 @@ config:
   maxConcurrentRequests: "1024"
   maxStreams: "4096"
   maxInternalRequests: "256"
+  publishAdmissionBytes: "33554432"
+  publishAdmissionWait: 100ms
+  goMemoryLimit: 192MiB
+  memorySafetyMarginBytes: "67108864"
 
 podAnnotations: {}
 podLabels: {}

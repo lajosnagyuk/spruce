@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := build
-.PHONY: build test test-race benchmark perf-test csharp csharp-pack python python-pack image image-tools image-python-probe compose-up compose-down smoke validate-local helm-lint helm-render helm-test helm-install clean
+.PHONY: build test test-race benchmark perf-test csharp csharp-pack python python-pack image image-tools image-python-probe compose-up compose-down smoke validate-local helm-lint helm-render helm-test helm-install binary-curve clean
 
 BIN := bin
 GOCACHE ?= $(CURDIR)/.cache/go-build
@@ -14,6 +14,10 @@ build:
 	go build -trimpath -o $(BIN)/spruce-consumer ./cmd/spruce-consumer
 	go build -trimpath -o $(BIN)/spruce-bench ./cmd/spruce-bench
 	go build -trimpath -o $(BIN)/spruce-integration ./cmd/spruce-integration
+	go build -trimpath -o $(BIN)/spruce-binary-soak ./cmd/spruce-binary-soak
+
+binary-curve: build
+	sh scripts/k3s-binary-curve.sh
 
 test:
 	go test ./...

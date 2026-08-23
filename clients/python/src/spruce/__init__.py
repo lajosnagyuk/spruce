@@ -12,7 +12,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from email.utils import parsedate_to_datetime
 from dataclasses import dataclass, field, replace
 from typing import Callable, Iterator, Mapping, Sequence
 
@@ -24,9 +25,10 @@ _DEFAULT_TIMEOUT = object()
 
 
 class SpruceError(Exception):
-    def __init__(self, status_code: int, status: str, code: str = "", body: str = "") -> None:
+    def __init__(self, status_code: int, status: str, code: str = "", body: str = "", retry_after: float = 0.0) -> None:
         super().__init__(f"Spruce {status_code} {status}: {code or body}")
         self.status_code, self.status, self.code, self.body = status_code, status, code, body
+        self.retry_after = retry_after
 
 
 class HandlerPanicError(RuntimeError):
@@ -76,6 +78,7 @@ class Delivery:
     headers: Mapping[str, str] = field(default_factory=dict)
     created_at: int = 0
     attempt: int = 0
+    cursor: str = ""
 
 
 @dataclass(frozen=True)
@@ -83,6 +86,7 @@ class SubscribeOptions:
     topic: str
     group: str = ""
     since: int = 0
+    cursor: str = ""
     concurrency: int = 16
     max_payload_bytes: int = MAX_MESSAGE_BYTES
     drain_timeout: float = 1.0
@@ -156,12 +160,24 @@ class Client:
             raw = exc.read(4096).decode("utf-8", "replace")
             try: code = json.loads(raw).get("error", "")
             except json.JSONDecodeError: code = ""
-            error = SpruceError(exc.code, exc.reason, code, raw.strip())
+            retry_after = self._parse_retry_after(exc.headers.get("Retry-After", ""))
+            error = SpruceError(exc.code, exc.reason, code, raw.strip(), retry_after)
             self._emit(operation, started, status, error)
             raise error from exc
         except BaseException as exc:
             self._emit(operation, started, status, exc)
             raise
+
+    @staticmethod
+    def _parse_retry_after(value: str) -> float:
+        try: return max(0.0, float(value))
+        except (TypeError, ValueError):
+            try: return max(0.0, parsedate_to_datetime(value).timestamp() - time.time())
+            except (TypeError, ValueError, OverflowError): return 0.0
+
+    @staticmethod
+    def _retry_delay(backoff: float, maximum: float, retry_after: float = 0.0) -> float:
+        return max(retry_after, min(maximum, random.uniform(backoff / 2, backoff * 1.5)))
 
     @staticmethod
     def _option_headers(options: PublishOptions) -> dict[str, str]:
@@ -181,12 +197,14 @@ class Client:
         if retry.max_attempts < 1 or retry.min_backoff < 0 or retry.max_backoff < retry.min_backoff: raise ValueError("invalid retry options")
         delay = retry.min_backoff
         for attempt in range(retry.max_attempts):
+            retry_after = 0.0
             try: return self.publish(topic, payload, options)
             except SpruceError as exc:
                 if exc.status_code not in (408, 429, 503) or attempt + 1 == retry.max_attempts: raise
+                retry_after = exc.retry_after
             except (OSError, urllib.error.URLError):
                 if attempt + 1 == retry.max_attempts: raise
-            time.sleep(delay); delay = min(retry.max_backoff, delay * 2)
+            time.sleep(self._retry_delay(delay, retry.max_backoff, retry_after)); delay = min(retry.max_backoff, delay * 2)
         raise RuntimeError("unreachable")
 
     def publish_batch(self, topic: str, payloads: Sequence[bytes], options: PublishOptions = PublishOptions()) -> list[PublishResult]:
@@ -242,7 +260,7 @@ class Client:
         if metadata_length > 65536 or payload_length > maximum: raise ValueError("invalid Spruce frame size")
         metadata = json.loads(self._read_exact(stream, metadata_length))
         payload = self._read_exact(stream, payload_length)
-        return Delivery(metadata.get("delivery_id", ""), metadata.get("message_id", ""), metadata.get("topic", ""), payload, metadata.get("key", ""), metadata.get("headers", {}), metadata.get("created_at", 0), metadata.get("attempt", 0))
+        return Delivery(metadata.get("delivery_id", ""), metadata.get("message_id", ""), metadata.get("topic", ""), payload, metadata.get("key", ""), metadata.get("headers", {}), metadata.get("created_at", 0), metadata.get("attempt", 0), metadata.get("cursor", ""))
 
     def subscribe(self, options: SubscribeOptions, handler: Callable[[Delivery], object], stop: threading.Event | None = None) -> None:
         """Consume until stopped; handlers must be bounded or cooperatively cancellable.
@@ -252,21 +270,30 @@ class Client:
         returns.
         """
         if not options.topic: raise ValueError("topic is required")
+        if options.since: raise ValueError("timestamp subscription cursors are no longer supported; use cursor")
         if not 1 <= options.concurrency <= 1024 or not 1 <= options.max_payload_bytes <= 64 << 20: raise ValueError("invalid subscription limits")
-        stop = stop or threading.Event(); since, backoff = options.since, 0.05
+        stop = stop or threading.Event(); cursor, backoff = options.cursor, 0.05
         acks, nacks = _AckBatcher(self, "ack"), _AckBatcher(self, "nack")
+        workers = ThreadPoolExecutor(max_workers=options.concurrency)
         try:
           while not stop.is_set():
+            retry_after = 0.0
             query = {"topic": options.topic};
             if options.group: query["group"] = options.group
-            if since: query["since"] = str(since)
+            if cursor: query["cursor"] = cursor
             futures: list[tuple[int, object]] = []; sequence, next_progress, completed = 0, 1, {}
+            completion_capacity = options.concurrency * 2
             def advance() -> None:
-                nonlocal since, next_progress
+                nonlocal cursor, next_progress
                 while next_progress in completed:
-                    since = max(since, completed.pop(next_progress)); next_progress += 1
+                    value = completed.pop(next_progress)
+                    if value: cursor = value
+                    next_progress += 1
             try:
+                connected_at, connected_cursor = time.monotonic(), cursor
                 response = self._request("GET", "/v1/subscriptions/stream?" + urllib.parse.urlencode(query), timeout=None, operation="subscribe")
+                if not cursor: cursor = response.headers.get("Spruce-Cursor", "")
+                self._emit("subscription_connected", connected_at, 200, None)
                 connection_done = threading.Event()
                 def interrupt() -> None:
                     while not connection_done.wait(.05):
@@ -274,7 +301,6 @@ class Client:
                             response.close()
                             return
                 threading.Thread(target=interrupt, name="spruce-subscription-interrupt", daemon=True).start()
-                workers = ThreadPoolExecutor(max_workers=options.concurrency)
                 accept_completions = threading.Event()
                 accept_completions.set()
                 try:
@@ -282,6 +308,14 @@ class Client:
                   try:
                     with response:
                       while not stop.is_set():
+                          while sequence - next_progress + 1 >= completion_capacity and not stop.is_set():
+                              done, _ = wait([future for _, future in futures], timeout=.05, return_when=FIRST_COMPLETED)
+                              if not done: continue
+                              pending = []
+                              for index, future in futures:
+                                  if future in done: completed[index] = future.result()
+                                  else: pending.append((index, future))
+                              futures = pending; advance()
                           delivery = self._read_delivery(response, options.max_payload_bytes)
                           if not delivery.delivery_id: continue
                           sequence += 1
@@ -289,15 +323,16 @@ class Client:
                               try: handler(item)
                               except Exception:
                                   if accept_completions.is_set(): nacks.submit(item.delivery_id)
-                                  return item.created_at
+                                  return item.cursor
                               except BaseException as exc:
                                   if accept_completions.is_set(): nacks.submit(item.delivery_id)
                                   raise HandlerPanicError(str(exc)) from exc
                               if accept_completions.is_set(): acks.submit(item.delivery_id)
-                              return item.created_at
+                              return item.cursor
                           futures.append((sequence, workers.submit(consume)))
-                          if len(futures) >= options.concurrency * 4:
-                              done, _ = wait([future for _, future in futures], timeout=options.drain_timeout)
+                          while sequence - next_progress + 1 >= completion_capacity and not stop.is_set():
+                              done, _ = wait([future for _, future in futures], timeout=.05, return_when=FIRST_COMPLETED)
+                              if not done: continue
                               pending = []
                               for index, future in futures:
                                   if future in done: completed[index] = future.result()
@@ -321,15 +356,20 @@ class Client:
                       raise stream_error
                 finally:
                     accept_completions.clear()
-                    workers.shutdown(wait=False, cancel_futures=True)
+                if cursor != connected_cursor or time.monotonic() - connected_at >= 5.0: backoff = 0.05
             except SpruceError as exc:
+                self._emit("subscription_disconnected", connected_at, exc.status_code, exc)
                 if 400 <= exc.status_code < 500 and exc.status_code not in (408, 429): raise
+                retry_after = exc.retry_after
             except HandlerPanicError: raise
             except HandlerDrainTimeoutError: raise
-            except (EOFError, OSError, urllib.error.URLError): pass
-            if stop.wait(random.uniform(backoff / 2, backoff * 1.5)): return
+            except (EOFError, OSError, urllib.error.URLError) as exc:
+                self._emit("subscription_disconnected", connected_at, None, exc)
+            self._emit("subscription_reconnecting", time.monotonic(), None, None)
+            if stop.wait(self._retry_delay(backoff, 2.0, retry_after)): return
             backoff = min(2.0, backoff * 2)
         finally:
+            workers.shutdown(wait=False, cancel_futures=True)
             acks.close(); nacks.close()
 
     def deliveries(self, options: SubscribeOptions, stop: threading.Event | None = None) -> Iterator["ConsumableDelivery"]:

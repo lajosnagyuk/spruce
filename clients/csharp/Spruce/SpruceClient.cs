@@ -17,7 +17,8 @@ public sealed record Delivery(
     [property: JsonPropertyName("key")] string? Key,
     [property: JsonPropertyName("headers")] Dictionary<string, string>? Headers,
     [property: JsonPropertyName("created_at")] long CreatedAt,
-    [property: JsonPropertyName("attempt")] int Attempt)
+    [property: JsonPropertyName("attempt")] int Attempt,
+    [property: JsonPropertyName("cursor")] string? Cursor = null)
 { public byte[] Payload { get; init; } = []; }
 
 public sealed partial class SpruceClient : IDisposable
@@ -108,7 +109,7 @@ public sealed partial class SpruceClient : IDisposable
         return (await response.Content.ReadFromJsonAsync<BatchResult>(timeout.Token))!;
     }
 
-    public async Task SubscribeAsync(string topic, string? group, Func<Delivery, CancellationToken, Task> handler, CancellationToken cancellationToken = default, int concurrency = 16, int maxPayloadBytes = 1024 * 1024, long since = 0, TimeSpan? drainTimeout = null, bool preserveKeyOrder = false)
+    public async Task SubscribeAsync(string topic, string? group, Func<Delivery, CancellationToken, Task> handler, CancellationToken cancellationToken = default, int concurrency = 16, int maxPayloadBytes = 1024 * 1024, long since = 0, TimeSpan? drainTimeout = null, bool preserveKeyOrder = false, string? cursor = null)
     {
         if (string.IsNullOrWhiteSpace(topic)) throw new ArgumentException("Topic is required", nameof(topic));
         if (concurrency <= 0) concurrency = 16;
@@ -116,18 +117,24 @@ public sealed partial class SpruceClient : IDisposable
         if (maxPayloadBytes < 1 || maxPayloadBytes > 64 * 1024 * 1024) throw new ArgumentOutOfRangeException(nameof(maxPayloadBytes));
         drainTimeout ??= TimeSpan.FromSeconds(1);
         if (drainTimeout <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(drainTimeout));
+		if (since < 0) throw new ArgumentOutOfRangeException(nameof(since));
+		if (since != 0 && cursor is not null) throw new ArgumentException("Specify either since or cursor, not both");
+		var legacyTimestampCursor = since != 0;
         var backoff = TimeSpan.FromMilliseconds(50);
         while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
+				var connectedAt = DateTime.UtcNow;
                 var uri = $"{_baseUrl}/v1/subscriptions/stream?topic={Uri.EscapeDataString(topic)}" +
                     (group is null ? "" : $"&group={Uri.EscapeDataString(group)}") +
-                    (since == 0 ? "" : $"&since={since}");
+                    (legacyTimestampCursor ? $"&since={since}" : cursor is null ? "" : $"&cursor={Uri.EscapeDataString(cursor)}");
                 using var request = new HttpRequestMessage(HttpMethod.Get, uri);
                 Authorize(request);
                 using var response = await SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken, "subscribe");
                 await EnsureSuccessAsync(response, cancellationToken);
+				if (!legacyTimestampCursor) cursor ??= response.Headers.TryGetValues("Spruce-Cursor", out var initialCursors) ? initialCursors.FirstOrDefault() : null;
+                Emit(new("subscription_connected", TimeSpan.Zero, (int)response.StatusCode, null));
                 await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
                 using var connection = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 await using var acks = new AckBatcher(this, "ack", connection.Token);
@@ -136,9 +143,11 @@ public sealed partial class SpruceClient : IDisposable
                     ? Enumerable.Range(0, concurrency).Select(_ => Channel.CreateBounded<(Delivery Delivery, long Index)>(new BoundedChannelOptions(2) { FullMode = BoundedChannelFullMode.Wait, SingleWriter = true })).ToArray()
                     : [Channel.CreateBounded<(Delivery Delivery, long Index)>(new BoundedChannelOptions(concurrency * 2) { FullMode = BoundedChannelFullMode.Wait, SingleWriter = true })];
                 var progressLock = new object();
-                var completed = new SortedDictionary<long, long>();
+                var completed = new SortedDictionary<long, (string? Cursor, long CreatedAt)>();
+                using var progressWindow = new SemaphoreSlim(concurrency * 2, concurrency * 2);
                 long sequence = 0, nextProgress = 1;
-                var connectedSince = since;
+                var connectedCursor = cursor;
+				var connectedSince = since;
                 async Task ConsumeAsync(ChannelReader<(Delivery Delivery, long Index)> reader)
                 {
                     try
@@ -149,11 +158,11 @@ public sealed partial class SpruceClient : IDisposable
                             catch when (!connection.IsCancellationRequested)
                             {
                                 await nacks.SubmitAsync(work.Delivery.DeliveryId, connection.Token);
-                                MarkComplete(work.Index, work.Delivery.CreatedAt);
+                                MarkComplete(work.Index, work.Delivery.Cursor, work.Delivery.CreatedAt);
                                 continue;
                             }
                             await acks.SubmitAsync(work.Delivery.DeliveryId, connection.Token);
-                            MarkComplete(work.Index, work.Delivery.CreatedAt);
+                            MarkComplete(work.Index, work.Delivery.Cursor, work.Delivery.CreatedAt);
                         }
                     }
                     catch when (!connection.IsCancellationRequested)
@@ -162,17 +171,21 @@ public sealed partial class SpruceClient : IDisposable
                         throw;
                     }
                 }
-                void MarkComplete(long index, long createdAt)
+                void MarkComplete(long index, string? completedCursor, long createdAt)
                 {
+					var advanced = 0;
                     lock (progressLock)
                     {
-                        completed[index] = createdAt;
-                        while (completed.Remove(nextProgress, out var created))
+                        completed[index] = (completedCursor, createdAt);
+                        while (completed.Remove(nextProgress, out var value))
                         {
-                            since = Math.Max(since, created);
+							if (legacyTimestampCursor) since = Math.Max(since, value.CreatedAt);
+							else if (!string.IsNullOrEmpty(value.Cursor)) cursor = value.Cursor;
                             nextProgress++;
+							advanced++;
                         }
                     }
+					if (advanced > 0) progressWindow.Release(advanced);
                 }
                 var workers = preserveKeyOrder
                     ? deliveryLanes.Select(lane => ConsumeAsync(lane.Reader)).ToArray()
@@ -192,6 +205,7 @@ public sealed partial class SpruceClient : IDisposable
                         var payload = new byte[payloadLength]; await stream.ReadExactlyAsync(payload, connection.Token);
                         if (string.IsNullOrEmpty(delivery.DeliveryId)) continue;
                         delivery = delivery with { Payload = payload };
+						await progressWindow.WaitAsync(connection.Token);
                         var index = Interlocked.Increment(ref sequence);
                         var lane = preserveKeyOrder ? StableLane(delivery.Key ?? delivery.MessageId, deliveryLanes.Length) : 0;
                         await deliveryLanes[lane].Writer.WriteAsync((delivery, index), connection.Token);
@@ -216,7 +230,7 @@ public sealed partial class SpruceClient : IDisposable
                     }
                     try { await joined; }
                     catch (OperationCanceledException) when (connection.IsCancellationRequested) { }
-                    if (since > connectedSince) backoff = TimeSpan.FromMilliseconds(50);
+                    if ((legacyTimestampCursor ? since > connectedSince : cursor != connectedCursor) || DateTime.UtcNow - connectedAt >= TimeSpan.FromSeconds(5)) backoff = TimeSpan.FromMilliseconds(50);
                 }
                 if (gracefulEnd && !cancellationToken.IsCancellationRequested)
                 {
@@ -225,26 +239,40 @@ public sealed partial class SpruceClient : IDisposable
                     backoff = TimeSpan.FromMilliseconds(Math.Min(2000, backoff.TotalMilliseconds * 2));
                 }
             }
+            catch (SpruceException ex) when (!cancellationToken.IsCancellationRequested && ex.Code == "cursor_expired")
+            {
+                Emit(new("subscription_cursor_expired", TimeSpan.Zero, ex.StatusCode, ex));
+                Emit(new("subscription_disconnected", TimeSpan.Zero, ex.StatusCode, ex));
+                throw;
+            }
             catch (HttpRequestException ex) when (!cancellationToken.IsCancellationRequested && ex.StatusCode is null or >= System.Net.HttpStatusCode.InternalServerError)
             {
+                Emit(new("subscription_disconnected", TimeSpan.Zero, ex.StatusCode is null ? null : (int)ex.StatusCode, ex));
+                Emit(new("subscription_reconnecting", TimeSpan.Zero, null, null));
                 var jitter = 0.5 + Random.Shared.NextDouble();
                 await Task.Delay(TimeSpan.FromMilliseconds(backoff.TotalMilliseconds * jitter), cancellationToken);
                 backoff = TimeSpan.FromMilliseconds(Math.Min(2000, backoff.TotalMilliseconds * 2));
             }
             catch (SpruceException ex) when (!cancellationToken.IsCancellationRequested && (ex.StatusCode == 408 || ex.StatusCode == 429 || ex.StatusCode >= 500))
             {
+                Emit(new("subscription_disconnected", TimeSpan.Zero, ex.StatusCode, ex));
+                Emit(new("subscription_reconnecting", TimeSpan.Zero, null, null));
                 var jitter = 0.5 + Random.Shared.NextDouble();
-                await Task.Delay(TimeSpan.FromMilliseconds(backoff.TotalMilliseconds * jitter), cancellationToken);
+                await Task.Delay(TimeSpan.FromMilliseconds(Math.Max(ex.RetryAfter.TotalMilliseconds, Math.Min(2000, backoff.TotalMilliseconds * jitter))), cancellationToken);
                 backoff = TimeSpan.FromMilliseconds(Math.Min(2000, backoff.TotalMilliseconds * 2));
             }
             catch (IOException) when (!cancellationToken.IsCancellationRequested)
             {
+                Emit(new("subscription_disconnected", TimeSpan.Zero, null, null));
+                Emit(new("subscription_reconnecting", TimeSpan.Zero, null, null));
                 var jitter = 0.5 + Random.Shared.NextDouble();
                 await Task.Delay(TimeSpan.FromMilliseconds(backoff.TotalMilliseconds * jitter), cancellationToken);
                 backoff = TimeSpan.FromMilliseconds(Math.Min(2000, backoff.TotalMilliseconds * 2));
             }
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {
+				Emit(new("subscription_disconnected", TimeSpan.Zero, null, new OperationCanceledException("Spruce subscription connection cancelled unexpectedly")));
+				Emit(new("subscription_reconnecting", TimeSpan.Zero, null, null));
                 var jitter = 0.5 + Random.Shared.NextDouble();
                 await Task.Delay(TimeSpan.FromMilliseconds(backoff.TotalMilliseconds * jitter), cancellationToken);
                 backoff = TimeSpan.FromMilliseconds(Math.Min(2000, backoff.TotalMilliseconds * 2));
@@ -284,7 +312,9 @@ public sealed partial class SpruceClient : IDisposable
         var body = System.Text.Encoding.UTF8.GetString(buffer, 0, Math.Min(read, 4096));
         string? code = null;
         try { code = JsonDocument.Parse(body).RootElement.GetProperty("error").GetString(); } catch (Exception) { }
-        throw new SpruceException((int)response.StatusCode, response.ReasonPhrase ?? response.StatusCode.ToString(), code, body);
+        TimeSpan retryAfter = response.Headers.RetryAfter?.Delta ?? (response.Headers.RetryAfter?.Date is DateTimeOffset deadline ? deadline - DateTimeOffset.UtcNow : TimeSpan.Zero);
+        if (retryAfter < TimeSpan.Zero) retryAfter = TimeSpan.Zero;
+        throw new SpruceException((int)response.StatusCode, response.ReasonPhrase ?? response.StatusCode.ToString(), code, body, retryAfter);
     }
 
     private async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, HttpCompletionOption completion, CancellationToken cancellationToken, string operation)

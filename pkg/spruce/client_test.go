@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -28,7 +29,7 @@ func TestNackAdvancesOrderedCursor(t *testing.T) {
 			return
 		}
 		for i := 1; i <= 2; i++ {
-			metadata, _ := json.Marshal(Delivery{DeliveryID: string(rune('a' + i)), MessageID: "m", Topic: "t", CreatedAt: int64(i)})
+			metadata, _ := json.Marshal(Delivery{DeliveryID: string(rune('a' + i)), MessageID: "m", Topic: "t", CreatedAt: int64(i), Cursor: fmt.Sprintf("cursor-%d", i)})
 			var sizes [8]byte
 			binary.BigEndian.PutUint32(sizes[:4], uint32(len(metadata)))
 			_, _ = w.Write(sizes[:])
@@ -43,8 +44,8 @@ func TestNackAdvancesOrderedCursor(t *testing.T) {
 		}
 		return nil
 	})
-	if err == nil || last != 2 || acks.Load() != 1 || nacks.Load() != 1 {
-		t.Fatalf("last=%d acks=%d nacks=%d err=%v", last, acks.Load(), nacks.Load(), err)
+	if err == nil || last != "cursor-2" || acks.Load() != 1 || nacks.Load() != 1 {
+		t.Fatalf("last=%s acks=%d nacks=%d err=%v", last, acks.Load(), nacks.Load(), err)
 	}
 }
 
@@ -114,7 +115,7 @@ func TestDefaultSubscribeBatchesAcks(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/vnd.spruce.stream")
 		for i := 0; i < 32; i++ {
-			metadata, _ := json.Marshal(Delivery{DeliveryID: string(rune('a' + i)), MessageID: "m", Topic: "t", CreatedAt: int64(i + 1)})
+			metadata, _ := json.Marshal(Delivery{DeliveryID: string(rune('a' + i)), MessageID: "m", Topic: "t", CreatedAt: int64(i + 1), Cursor: fmt.Sprintf("cursor-%d", i+1)})
 			var sizes [8]byte
 			binary.BigEndian.PutUint32(sizes[:4], uint32(len(metadata)))
 			_, _ = w.Write(sizes[:])
@@ -127,11 +128,53 @@ func TestDefaultSubscribeBatchesAcks(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected stream EOF")
 	}
-	if last != 32 {
-		t.Fatalf("cursor=%d", last)
+	if last != "cursor-32" {
+		t.Fatalf("cursor=%s", last)
 	}
 	if calls.Load() >= 32 {
 		t.Fatalf("default subscription did not batch acknowledgements: %d requests", calls.Load())
+	}
+}
+
+func TestSubscribeBoundsOrderedCompletionWindow(t *testing.T) {
+	const concurrency = 4
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v1/deliveries/") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		for i := 0; i < 64; i++ {
+			metadata, _ := json.Marshal(Delivery{DeliveryID: fmt.Sprintf("d-%d", i), MessageID: "m", Topic: "t", Cursor: fmt.Sprintf("cursor-%d", i)})
+			var sizes [8]byte
+			binary.BigEndian.PutUint32(sizes[:4], uint32(len(metadata)))
+			_, _ = w.Write(sizes[:])
+			_, _ = w.Write(metadata)
+		}
+	}))
+	defer server.Close()
+
+	block := make(chan struct{})
+	var started atomic.Int32
+	done := make(chan error, 1)
+	go func() {
+		_, err := New(server.URL).subscribeOnce(context.Background(), SubscribeOptions{Topic: "t", Concurrency: concurrency, DrainTimeout: 20 * time.Millisecond}, func(_ context.Context, delivery Delivery) error {
+			started.Add(1)
+			if delivery.DeliveryID == "d-0" {
+				<-block
+			}
+			return nil
+		})
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if got := started.Load(); got > concurrency {
+		t.Fatalf("ordered completion window admitted %d handlers with capacity %d", got, concurrency)
+	}
+	close(block)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("subscription did not finish after head handler completed")
 	}
 }
 
@@ -228,6 +271,57 @@ func TestPublishRetryAndTelemetry(t *testing.T) {
 	}
 }
 
+func TestPublishRetryHonorsRetryAfterAsMinimum(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"id"}`))
+	}))
+	defer server.Close()
+	started := time.Now()
+	result, err := New(server.URL).PublishRetry(context.Background(), "t", nil, PublishOptions{ProducerID: "p", IdempotencyKey: "1"}, RetryOptions{MaxAttempts: 2, MinBackoff: time.Millisecond, MaxBackoff: 25 * time.Millisecond})
+	if err != nil || result.ID != "id" || time.Since(started) < 20*time.Millisecond {
+		t.Fatalf("result=%+v elapsed=%s err=%v", result, time.Since(started), err)
+	}
+}
+
+func TestSubscribeRetriesTransientStatusAndHonorsRetryAfter(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer server.Close()
+	started := time.Now()
+	err := New(server.URL).Subscribe(context.Background(), SubscribeOptions{Topic: "t"}, func(context.Context, Delivery) error { return nil })
+	if calls.Load() != 2 || time.Since(started) < time.Second || err == nil {
+		t.Fatalf("calls=%d elapsed=%s err=%v", calls.Load(), time.Since(started), err)
+	}
+}
+
+func TestSubscribeEmitsCursorExpiredAndDisconnected(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"cursor_expired"}`))
+	}))
+	defer server.Close()
+	var events []ClientEvent
+	c := New(server.URL)
+	c.OnEvent = func(event ClientEvent) { events = append(events, event) }
+	err := c.Subscribe(context.Background(), SubscribeOptions{Topic: "t", Cursor: "expired"}, func(context.Context, Delivery) error { return nil })
+	if err == nil || len(events) < 2 || events[len(events)-2].Operation != "subscription_cursor_expired" || events[len(events)-1].Operation != "subscription_disconnected" || events[len(events)-1].StatusCode != http.StatusConflict {
+		t.Fatalf("events=%+v err=%v", events, err)
+	}
+}
+
 func TestConsumableDeliveryControlsAcknowledgement(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -264,7 +358,9 @@ func TestConsumableDeliveryControlsAcknowledgement(t *testing.T) {
 
 func TestCredentialsRejectHTTPSDowngradeRedirect(t *testing.T) {
 	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "" { t.Fatal("credential reached plaintext redirect target") }
+		if r.Header.Get("Authorization") != "" {
+			t.Fatal("credential reached plaintext redirect target")
+		}
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer httpServer.Close()
@@ -282,13 +378,19 @@ func TestCredentialsRejectHTTPSDowngradeRedirect(t *testing.T) {
 
 func TestHandlerPanicReturnsErrorInsteadOfCrashing(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/deliveries/nack" { w.WriteHeader(http.StatusNoContent); return }
+		if r.URL.Path == "/v1/deliveries/nack" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		metadata, _ := json.Marshal(Delivery{DeliveryID: "d", MessageID: "m", Topic: "t", CreatedAt: 1})
 		var sizes [8]byte
 		binary.BigEndian.PutUint32(sizes[:4], uint32(len(metadata)))
-		_, _ = w.Write(sizes[:]); _, _ = w.Write(metadata)
+		_, _ = w.Write(sizes[:])
+		_, _ = w.Write(metadata)
 	}))
 	defer server.Close()
 	err := New(server.URL).Subscribe(context.Background(), SubscribeOptions{Topic: "t"}, func(context.Context, Delivery) error { panic("boom") })
-	if err == nil || !strings.Contains(err.Error(), "handler panic") { t.Fatalf("err=%v", err) }
+	if err == nil || !strings.Contains(err.Error(), "handler panic") {
+		t.Fatalf("err=%v", err)
+	}
 }
