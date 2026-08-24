@@ -43,13 +43,16 @@ class Conformance(unittest.TestCase):
         cls.server=ThreadingHTTPServer(("127.0.0.1",0),Handler); threading.Thread(target=cls.server.serve_forever,daemon=True).start()
         cls.client=Client(f"http://127.0.0.1:{cls.server.server_port}")
 
-    def test_adaptive_gzip_round_trip_and_limit(self):
+    def test_adaptive_compression_round_trip_and_limit(self):
         payload=(b'{"event":"workspace.updated","status":"ready"}' * 4096)
-        encoded=_compress_payload(payload, "gzip")
-        self.assertLess(len(encoded), len(payload) // 2)
-        self.assertEqual(_decompress_payload(encoded, len(payload)), payload)
-        with self.assertRaises(ValueError): _decompress_payload(encoded, 1024)
-        self.assertEqual(_compress_payload(b"small", "gzip"), b"small")
+        for algorithm, codec in (("gzip", 1), ("zstd", 2)):
+            with self.subTest(algorithm=algorithm):
+                encoded=_compress_payload(payload, algorithm)
+                self.assertLess(len(encoded), len(payload) // 2)
+                self.assertEqual(encoded[8], codec)
+                self.assertEqual(_decompress_payload(encoded, len(payload)), payload)
+                with self.assertRaises(ValueError): _decompress_payload(encoded, 1024)
+                self.assertEqual(_compress_payload(b"small", algorithm), b"small")
     @classmethod
     def tearDownClass(cls): cls.server.shutdown()
     def test_publish_batch_status_and_deduper(self):

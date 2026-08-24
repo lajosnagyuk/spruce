@@ -1,5 +1,7 @@
 using System.Buffers.Binary;
 using System.IO.Compression;
+using System.Collections.Concurrent;
+using ZstdSharp;
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -306,16 +308,28 @@ public sealed partial class SpruceClient : IDisposable
     }
 
     private static readonly byte[] CompressionMagic = [0x89, (byte)'S', (byte)'P', (byte)'R', (byte)'U', (byte)'C', (byte)'E', 0x01];
+    private static readonly ConcurrentBag<Compressor> ZstdCompressors = [];
+    private static readonly ConcurrentBag<Decompressor> ZstdDecompressors = [];
 
     private static byte[] EncodePayload(ReadOnlySpan<byte> payload, string? algorithm)
     {
         if (string.IsNullOrEmpty(algorithm) || payload.Length < 1024) return payload.ToArray();
-        if (!string.Equals(algorithm, "gzip", StringComparison.Ordinal)) throw new ArgumentException($"Unsupported compression '{algorithm}'", nameof(algorithm));
+        if (algorithm is not ("gzip" or "zstd")) throw new ArgumentException($"Unsupported compression '{algorithm}'", nameof(algorithm));
         using var output = new MemoryStream();
         output.Write(CompressionMagic);
-        output.WriteByte(1);
+        output.WriteByte(algorithm == "gzip" ? (byte)1 : (byte)2);
         Span<byte> size = stackalloc byte[4]; BinaryPrimitives.WriteUInt32BigEndian(size, checked((uint)payload.Length)); output.Write(size);
-        using (var gzip = new GZipStream(output, CompressionLevel.Fastest, leaveOpen: true)) gzip.Write(payload);
+        if (algorithm == "gzip")
+        {
+            using var gzip = new GZipStream(output, CompressionLevel.Fastest, leaveOpen: true);
+            gzip.Write(payload);
+        }
+        else
+        {
+            if (!ZstdCompressors.TryTake(out var compressor)) compressor = new Compressor(1);
+            try { output.Write(compressor.Wrap(payload)); }
+            finally { ZstdCompressors.Add(compressor); }
+        }
         var encoded = output.ToArray();
         var minimumSaving = Math.Max(128, payload.Length / 10);
         return encoded.Length <= payload.Length - minimumSaving ? encoded : payload.ToArray();
@@ -324,9 +338,25 @@ public sealed partial class SpruceClient : IDisposable
     private static byte[] DecodePayload(byte[] payload, int maximum)
     {
         if (payload.Length < CompressionMagic.Length + 5 || !payload.AsSpan(0, CompressionMagic.Length).SequenceEqual(CompressionMagic)) return payload;
-        if (payload[CompressionMagic.Length] != 1) throw new InvalidDataException("Unsupported compressed payload encoding");
+        var algorithm = payload[CompressionMagic.Length];
+        if (algorithm is not (1 or 2)) throw new InvalidDataException("Unsupported compressed payload encoding");
         var original = checked((int)BinaryPrimitives.ReadUInt32BigEndian(payload.AsSpan(CompressionMagic.Length + 1, 4)));
         if (original > maximum) throw new InvalidDataException("Compressed payload exceeds decompressed limit");
+        if (algorithm == 2)
+        {
+            try
+            {
+                if (!ZstdDecompressors.TryTake(out var decompressor)) decompressor = new Decompressor();
+                var zstdDecoded = new byte[original];
+                int written;
+                try { written = decompressor.Unwrap(payload.AsSpan(CompressionMagic.Length + 5), zstdDecoded); }
+                finally { ZstdDecompressors.Add(decompressor); }
+                if (written != original) throw new InvalidDataException("Invalid decompressed payload length");
+                return zstdDecoded;
+            }
+            catch (InvalidDataException) { throw; }
+            catch (Exception exception) { throw new InvalidDataException("Invalid Zstandard payload", exception); }
+        }
         using var input = new MemoryStream(payload, CompressionMagic.Length + 5, payload.Length - CompressionMagic.Length - 5, false);
         using var gzip = new GZipStream(input, CompressionMode.Decompress);
         using var output = new MemoryStream(Math.Min(original, maximum));

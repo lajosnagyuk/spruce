@@ -14,6 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zstandard
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from email.utils import parsedate_to_datetime
 from dataclasses import dataclass, field, replace
@@ -22,17 +23,38 @@ from typing import Callable, Iterator, Mapping, Sequence
 MAX_MESSAGE_BYTES = 1 << 20
 MAX_BATCH_BYTES = 16 << 20
 MAX_BATCH_MESSAGES = 4096
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 _DEFAULT_TIMEOUT = object()
 _COMPRESSION_MAGIC = b"\x89SPRUCE\x01"
+_compression_codecs = threading.local()
+
+
+def _zstd_compressor():
+    compressor = getattr(_compression_codecs, "compressor", None)
+    if compressor is None:
+        compressor = _compression_codecs.compressor = zstandard.ZstdCompressor(level=1, threads=0)
+    return compressor
+
+
+def _zstd_decompressor(maximum: int):
+    state = getattr(_compression_codecs, "decompressor", None)
+    if state is None or state[0] != maximum:
+        state = _compression_codecs.decompressor = (maximum, zstandard.ZstdDecompressor(max_window_size=maximum))
+    return state[1]
 
 
 def _compress_payload(payload: bytes, algorithm: str) -> bytes:
     if not algorithm or len(payload) < 1024:
         return payload
-    if algorithm != "gzip":
+    if algorithm not in ("gzip", "zstd"):
         raise ValueError(f"unsupported compression {algorithm!r}")
-    encoded = _COMPRESSION_MAGIC + b"\x01" + struct.pack(">I", len(payload)) + gzip.compress(payload, compresslevel=1, mtime=0)
+    if algorithm == "gzip":
+        compressed = gzip.compress(payload, compresslevel=1, mtime=0)
+        codec = b"\x01"
+    else:
+        compressed = _zstd_compressor().compress(payload)
+        codec = b"\x02"
+    encoded = _COMPRESSION_MAGIC + codec + struct.pack(">I", len(payload)) + compressed
     minimum_saving = max(128, len(payload) // 10)
     return encoded if len(encoded) <= len(payload) - minimum_saving else payload
 
@@ -44,10 +66,17 @@ def _decompress_payload(payload: bytes, maximum: int) -> bytes:
     original = struct.unpack(">I", payload[len(_COMPRESSION_MAGIC) + 1:len(_COMPRESSION_MAGIC) + 5])[0]
     if original > maximum:
         raise ValueError("compressed payload exceeds decompressed limit")
-    if algorithm != 1:
+    if algorithm not in (1, 2):
         raise ValueError("unsupported compressed payload encoding")
-    with gzip.GzipFile(fileobj=io.BytesIO(payload[len(_COMPRESSION_MAGIC) + 5:])) as stream:
-        decoded = stream.read(maximum + 1)
+    compressed = payload[len(_COMPRESSION_MAGIC) + 5:]
+    if algorithm == 1:
+        with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as stream:
+            decoded = stream.read(maximum + 1)
+    else:
+        try:
+            decoded = _zstd_decompressor(maximum).decompress(compressed, max_output_size=maximum + 1)
+        except zstandard.ZstdError as exception:
+            raise ValueError("invalid Zstandard payload") from exception
     if len(decoded) != original or len(decoded) > maximum:
         raise ValueError("invalid decompressed payload length")
     return decoded

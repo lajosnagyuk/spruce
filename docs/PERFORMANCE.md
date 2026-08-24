@@ -222,3 +222,12 @@ without missing, duplicate, or invalid payloads. First-delivery p50/p95/p99 was
 0.93/4.36/8.16 ms with pooled zstd. NACK-to-redelivery p50 remained 0.51-0.53 seconds
 and p99 0.98-1.01 seconds for every codec, showing that the broker retry schedule, not
 compression, dominates redelivery latency.
+
+Zstandard support was subsequently completed in the C# and Python SDKs. Their live
+cluster probes each delivered 100 exact mixed raw, gzip, and Zstandard messages through
+the three-broker sandbox without loss or corruption. On the same Apple M1 Pro used for
+the Go measurements, pooled Python Zstandard compression sustained approximately
+2.39/7.10/10.85 GiB/s for 4 KiB/64 KiB/900 KiB compressible payloads, compared with
+0.20/0.86/0.82 GiB/s for gzip. These codec microbenchmarks exclude HTTP and broker work;
+the cluster measurements above remain the end-to-end evidence for latency, CPU, and
+cache effects.

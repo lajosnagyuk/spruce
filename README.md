@@ -13,7 +13,7 @@ It provides opaque binary messages over HTTPS, N producers and consumers, broadc
 - Reconnecting consumer groups skip acknowledged messages while their bounded in-memory checkpoints and messages remain cached.
 - Duplicate delivery is expected. First-party clients provide bounded client-side deduplication.
 - Payloads are opaque bytes. Spruce does not inspect schemas or formats.
-- First-party SDKs can adaptively gzip payloads of at least 1 KiB. Compression is retained through caching, replication, replay, and delivery, and is used only when it saves at least 10% and 128 bytes. Go also exposes experimental `zstd`; use it only when every consumer supports that codec.
+- First-party Go, C#, and Python SDKs can adaptively gzip or Zstandard-compress payloads of at least 1 KiB. Compression is retained through caching, replication, replay, and delivery, and is used only when it saves at least 10% and 128 bytes.
 
 These are deliberate constraints, not missing features. They remove disks, consensus, leaders, partition management, and database operations from the hot path. See [ARCHITECTURE.md](ARCHITECTURE.md) for the decisions and consequences.
 
@@ -98,6 +98,10 @@ GET /v1/subscriptions/stream?topic={topic}&group={group}&cursor={opaque-resume-t
 ```
 
 The stream uses length-delimited binary frames. ACK and NACK endpoints accept batched message IDs. Resume cursors are opaque and must be returned unchanged; timestamp cursors are not supported. The Go, C#, and Python clients handle framing, reconnects, acknowledgement batching, bounded concurrency, and optional deduplication.
+
+All three clients support adaptive `gzip` and `zstd` payload compression. Compression
+is retained only when it materially reduces the payload, remains opaque to brokers, and
+is transparently decoded under the subscriber's message-size limit.
 
 ## Kubernetes
 
