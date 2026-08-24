@@ -855,7 +855,7 @@ type idempotencyOrderEntry struct{ key, id string }
 
 type Metrics struct {
 	Published, PublishBytes, Rejected, OverloadRejected, CursorExpired, Replicated, ReplicationErrors atomic.Uint64
-	ReplicationDropped                                                                                atomic.Uint64
+	ReplicationDropped, ReplicationPressureRejected                                                   atomic.Uint64
 	AckActionDropped, NackActionDropped                                                               atomic.Uint64
 	Delivered, Redelivered, Acked, Dropped, Duplicate                                                 atomic.Uint64
 	PublishLatency, ReplicationLatency, AckLatency                                                    durationHistogram
@@ -892,6 +892,7 @@ type Broker struct {
 	publishAdmissionBytes atomic.Int64
 	admissionMu           sync.Mutex
 	admissionWaiters      []*publishAdmissionWaiter
+	replicationFreed      chan struct{}
 	streamSlots           chan struct{}
 	internalSlots         chan struct{}
 	digestSlot            chan struct{}
@@ -991,7 +992,7 @@ func New(cfg Config) *Broker {
 		client: &http.Client{Timeout: 5 * time.Second, Transport: peerTransport}, subs: make(map[string]*subscriber),
 		topicBroadcast: make(map[string]map[string]*subscriber), topicGroups: make(map[string]map[string]map[string]*subscriber),
 		pending: make(map[string]*pending), idempotency: make(map[string]*idempotencyEntry), checkpoints: make(map[checkpointScope]map[string]int64), stop: make(chan struct{}),
-		requestSlots: make(chan struct{}, cfg.MaxConcurrentRequests), streamSlots: make(chan struct{}, cfg.MaxStreams), digestSlot: make(chan struct{}, 1)}
+		requestSlots: make(chan struct{}, cfg.MaxConcurrentRequests), streamSlots: make(chan struct{}, cfg.MaxStreams), digestSlot: make(chan struct{}, 1), replicationFreed: make(chan struct{}, 1)}
 	b.internalSlots = make(chan struct{}, cfg.MaxInternalRequests)
 	if _, err := rand.Read(b.boot[:]); err != nil {
 		panic("spruce: generate boot identity: " + err.Error())
@@ -1331,7 +1332,18 @@ func (b *Broker) publishBatch(w http.ResponseWriter, r *http.Request) {
 		messages = append(messages, m)
 		ids = append(ids, m.ID)
 	}
+	replicationBytes := batchBytes(messages)
+	reservedPeer := b.waitReplicationAdmission(r.Context(), replicationBytes)
+	if len(b.peers) > 0 && reservedPeer == nil {
+		b.metrics.Rejected.Add(1)
+		b.metrics.OverloadRejected.Add(1)
+		b.metrics.ReplicationPressureRejected.Add(1)
+		w.Header().Set("Retry-After", "1")
+		problem(w, http.StatusTooManyRequests, "replication_overloaded")
+		return
+	}
 	if err := b.acceptBatch(messages); err != nil {
+		b.releaseReplicationReservation(reservedPeer, replicationBytes)
 		problem(w, 507, "cache_capacity")
 		return
 	}
@@ -1339,7 +1351,7 @@ func (b *Broker) publishBatch(w http.ResponseWriter, r *http.Request) {
 		b.metrics.Published.Add(1)
 		b.metrics.PublishBytes.Add(uint64(len(m.Payload)))
 	}
-	b.enqueuePeerBatch(messages)
+	b.enqueuePeerBatch(messages, reservedPeer)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(202)
 	_ = json.NewEncoder(w).Encode(map[string]any{"ids": ids})
@@ -1566,7 +1578,22 @@ func (b *Broker) publish(w http.ResponseWriter, r *http.Request) {
 	if ct := r.Header.Get("Content-Type"); ct != "" {
 		m.Headers = map[string]string{"content-type": ct}
 	}
+	replicationBytes := messageSize(m)
+	var reservedPeer *peer
+	if ack != "one-peer" {
+		reservedPeer = b.waitReplicationAdmission(r.Context(), replicationBytes)
+	}
+	if ack != "one-peer" && len(b.peers) > 0 && reservedPeer == nil {
+		b.finishIdempotency(idempotencyCacheKey, idempotency, false, false)
+		b.metrics.Rejected.Add(1)
+		b.metrics.OverloadRejected.Add(1)
+		b.metrics.ReplicationPressureRejected.Add(1)
+		w.Header().Set("Retry-After", "1")
+		problem(w, http.StatusTooManyRequests, "replication_overloaded")
+		return
+	}
 	if _, err = b.accept(m); err != nil {
+		b.releaseReplicationReservation(reservedPeer, replicationBytes)
 		b.finishIdempotency(idempotencyCacheKey, idempotency, false, false)
 		b.metrics.Rejected.Add(1)
 		problem(w, 507, "cache_capacity")
@@ -1584,7 +1611,7 @@ func (b *Broker) publish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if ack != "one-peer" || !replicated {
-		b.enqueuePeers(m)
+		b.enqueuePeerBatch([]*Message{m}, reservedPeer)
 	}
 	b.finishIdempotency(idempotencyCacheKey, idempotency, true, replicated)
 	w.Header().Set("Content-Type", "application/json")
@@ -1728,15 +1755,23 @@ func (b *Broker) acceptReplicatedBatch(messages []*Message) error {
 }
 
 func (b *Broker) enqueuePeers(m *Message) {
-	b.enqueuePeerBatch([]*Message{m})
+	b.enqueuePeerBatch([]*Message{m}, nil)
 }
 
-func (b *Broker) enqueuePeerBatch(messages []*Message) {
+func (b *Broker) enqueuePeerBatch(messages []*Message, reservedPeer *peer) {
 	var bytes int64
 	for _, m := range messages {
 		bytes += messageSize(m)
 	}
 	for _, p := range b.peers {
+		if p == reservedPeer {
+			select {
+			case p.ch <- messages:
+			case <-b.stop:
+				b.releaseReplicationReservation(p, bytes)
+			}
+			continue
+		}
 		for {
 			queued := p.queuedBytes.Load()
 			if queued+bytes > b.cfg.ReplicationQueueBytes {
@@ -1754,6 +1789,70 @@ func (b *Broker) enqueuePeerBatch(messages []*Message) {
 			}
 			break
 		}
+	}
+}
+
+func (b *Broker) replicationHighWaterBytes() int64 {
+	highWater := b.cfg.ReplicationQueueBytes * 3 / 4
+	if highWater == 0 {
+		highWater = 1
+	}
+	return highWater
+}
+
+func (b *Broker) reserveReplicationCapacity(bytes int64) *peer {
+	highWater := b.replicationHighWaterBytes()
+	for _, p := range b.peers {
+		for {
+			queued := p.queuedBytes.Load()
+			fitsWatermark := queued+bytes <= highWater
+			fitsEmptyQueue := queued == 0 && bytes <= b.cfg.ReplicationQueueBytes
+			if !fitsWatermark && !fitsEmptyQueue {
+				break
+			}
+			if p.queuedBytes.CompareAndSwap(queued, queued+bytes) {
+				return p
+			}
+		}
+	}
+	return nil
+}
+
+func (b *Broker) waitReplicationAdmission(ctx context.Context, bytes int64) *peer {
+	if len(b.peers) == 0 {
+		return nil
+	}
+	if p := b.reserveReplicationCapacity(bytes); p != nil {
+		return p
+	}
+	timer := time.NewTimer(b.cfg.PublishAdmissionWait)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-timer.C:
+			return b.reserveReplicationCapacity(bytes)
+		case <-b.replicationFreed:
+			if p := b.reserveReplicationCapacity(bytes); p != nil {
+				return p
+			}
+		}
+	}
+}
+
+func (b *Broker) releaseReplicationReservation(p *peer, bytes int64) {
+	if p == nil {
+		return
+	}
+	p.queuedBytes.Add(-bytes)
+	b.signalReplicationFreed()
+}
+
+func (b *Broker) signalReplicationFreed() {
+	select {
+	case b.replicationFreed <- struct{}{}:
+	default:
 	}
 }
 
@@ -2020,6 +2119,7 @@ func (b *Broker) peerLoop(p *peer) {
 			if err != nil {
 				b.metrics.ReplicationErrors.Add(uint64(len(batch)))
 				p.queuedBytes.Add(-batchBytes(batch))
+				b.signalReplicationFreed()
 				continue
 			}
 			replicated := false
@@ -2038,6 +2138,7 @@ func (b *Broker) peerLoop(p *peer) {
 						<-timer.C
 					}
 					p.queuedBytes.Add(-batchBytes(batch))
+					b.signalReplicationFreed()
 					return
 				case <-timer.C:
 				}
@@ -2046,6 +2147,7 @@ func (b *Broker) peerLoop(p *peer) {
 				b.metrics.ReplicationDropped.Add(uint64(len(batch)))
 			}
 			p.queuedBytes.Add(-batchBytes(batch))
+			b.signalReplicationFreed()
 			if encoded.Cap() > 1<<20 {
 				encoded = bytes.Buffer{}
 			}
@@ -2797,7 +2899,22 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
-	bw := bufio.NewWriterSize(w, 32<<10)
+	// Keep small-message delivery syscall-efficient without allowing a slow
+	// subscriber to accumulate an unbounded response buffer. Large payloads
+	// bypass the buffer directly; small frames share a bounded 64 KiB write.
+	bw := bufio.NewWriterSize(w, 64<<10)
+	replayFrames, replayBytes := 0, int64(0)
+	flushReplay := func() bool {
+		if replayFrames == 0 {
+			return true
+		}
+		if err := bw.Flush(); err != nil {
+			return false
+		}
+		flusher.Flush()
+		replayFrames, replayBytes = 0, 0
+		return true
+	}
 	writeReplay := func(m *Message) bool {
 		if !b.sendDelivery(s, m, 1) {
 			return false
@@ -2821,16 +2938,22 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 		if err := writeFrame(bw, d); err != nil {
 			return false
 		}
-		if err := bw.Flush(); err != nil {
-			return false
-		}
-		flusher.Flush()
+		replayFrames++
+		replayBytes += messageSize(m)
 		return true
 	}
 	for _, m := range replay {
 		if !writeReplay(m) {
 			return
 		}
+		if replayFrames >= 128 || replayBytes >= 256<<10 {
+			if !flushReplay() {
+				return
+			}
+		}
+	}
+	if !flushReplay() {
+		return
 	}
 	for {
 		b.mu.Lock()
@@ -2864,7 +2987,7 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 			if err := writeFrame(bw, d); err != nil {
 				return
 			}
-			for range 63 {
+			for range 127 {
 				select {
 				case next := <-s.ch:
 					nextCursor := cloneFrontier(cursor)
@@ -3305,12 +3428,17 @@ func (b *Broker) status(w http.ResponseWriter, _ *http.Request) {
 	v["pending_bytes"] = b.pendingBytes
 	v["consumer_checkpoints"] = b.checkpointCount
 	b.mu.RUnlock()
-	var replicationQueueBytes, actionQueueBytes int64
+	var replicationQueueBytes, replicationQueueMaxPeerBytes, actionQueueBytes int64
 	for _, p := range b.peers {
-		replicationQueueBytes += p.queuedBytes.Load()
+		peerBytes := p.queuedBytes.Load()
+		replicationQueueBytes += peerBytes
+		replicationQueueMaxPeerBytes = max(replicationQueueMaxPeerBytes, peerBytes)
 		actionQueueBytes += p.actionBytes.Load()
 	}
 	v["replication_queue_bytes"] = replicationQueueBytes
+	v["replication_queue_max_peer_bytes"] = replicationQueueMaxPeerBytes
+	v["replication_queue_capacity_bytes"] = b.cfg.ReplicationQueueBytes * int64(len(b.peers))
+	v["replication_queue_high_water_bytes"] = b.replicationHighWaterBytes()
 	v["action_queue_bytes"] = actionQueueBytes
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
@@ -3385,19 +3513,21 @@ func (b *Broker) prometheus(w http.ResponseWriter, _ *http.Request) {
 	b.mu.RLock()
 	consumers, inflight, pendingBytes, checkpoints := len(b.subs), len(b.pending), b.pendingBytes, b.checkpointCount
 	b.mu.RUnlock()
-	var replicationQueueBytes, actionQueueBytes int64
+	var replicationQueueBytes, replicationQueueMaxPeerBytes, actionQueueBytes int64
 	for _, p := range b.peers {
-		replicationQueueBytes += p.queuedBytes.Load()
+		peerBytes := p.queuedBytes.Load()
+		replicationQueueBytes += peerBytes
+		replicationQueueMaxPeerBytes = max(replicationQueueMaxPeerBytes, peerBytes)
 		actionQueueBytes += p.actionBytes.Load()
 	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	vals := []struct {
 		name  string
 		value uint64
-	}{{"spruce_publish_total", b.metrics.Published.Load()}, {"spruce_publish_bytes_total", b.metrics.PublishBytes.Load()}, {"spruce_publish_rejected_total", b.metrics.Rejected.Load()}, {"spruce_publish_overload_rejected_total", b.metrics.OverloadRejected.Load()}, {"spruce_subscription_cursor_expired_total", b.metrics.CursorExpired.Load()}, {"spruce_publish_admission_bytes", uint64(b.publishAdmissionBytes.Load())}, {"spruce_publish_admission_capacity_bytes", uint64(b.cfg.PublishAdmissionBytes)}, {"spruce_public_auth_rejected_total", b.metrics.PublicAuthRejected.Load()}, {"spruce_admin_auth_rejected_total", b.metrics.AdminAuthRejected.Load()}, {"spruce_peer_auth_rejected_total", b.metrics.PeerAuthRejected.Load()}, {"spruce_replication_total", b.metrics.Replicated.Load()}, {"spruce_replication_errors_total", b.metrics.ReplicationErrors.Load()}, {"spruce_replication_dropped_messages_total", b.metrics.ReplicationDropped.Load()}, {"spruce_ack_propagation_dropped_ids_total", b.metrics.AckActionDropped.Load()}, {"spruce_nack_propagation_dropped_ids_total", b.metrics.NackActionDropped.Load()}, {"spruce_deliveries_total", b.metrics.Delivered.Load()}, {"spruce_redeliveries_total", b.metrics.Redelivered.Load()}, {"spruce_acks_total", b.metrics.Acked.Load()}, {"spruce_delivery_dropped_total", b.metrics.Dropped.Load()}, {"spruce_cache_evictions_total", evicted}, {"spruce_cache_expired_total", expired}, {"spruce_cache_messages", uint64(entries)}, {"spruce_cache_accounted_bytes", uint64(bytes)}, {"spruce_consumers", uint64(consumers)}, {"spruce_consumer_checkpoints", uint64(checkpoints)}, {"spruce_consumer_inflight", uint64(inflight)}, {"spruce_consumer_inflight_bytes", uint64(pendingBytes)}, {"spruce_replication_queue_bytes", uint64(replicationQueueBytes)}, {"spruce_action_queue_bytes", uint64(actionQueueBytes)}}
+	}{{"spruce_publish_total", b.metrics.Published.Load()}, {"spruce_publish_bytes_total", b.metrics.PublishBytes.Load()}, {"spruce_publish_rejected_total", b.metrics.Rejected.Load()}, {"spruce_publish_overload_rejected_total", b.metrics.OverloadRejected.Load()}, {"spruce_replication_pressure_rejected_total", b.metrics.ReplicationPressureRejected.Load()}, {"spruce_subscription_cursor_expired_total", b.metrics.CursorExpired.Load()}, {"spruce_publish_admission_bytes", uint64(b.publishAdmissionBytes.Load())}, {"spruce_publish_admission_capacity_bytes", uint64(b.cfg.PublishAdmissionBytes)}, {"spruce_public_auth_rejected_total", b.metrics.PublicAuthRejected.Load()}, {"spruce_admin_auth_rejected_total", b.metrics.AdminAuthRejected.Load()}, {"spruce_peer_auth_rejected_total", b.metrics.PeerAuthRejected.Load()}, {"spruce_replication_total", b.metrics.Replicated.Load()}, {"spruce_replication_errors_total", b.metrics.ReplicationErrors.Load()}, {"spruce_replication_dropped_messages_total", b.metrics.ReplicationDropped.Load()}, {"spruce_ack_propagation_dropped_ids_total", b.metrics.AckActionDropped.Load()}, {"spruce_nack_propagation_dropped_ids_total", b.metrics.NackActionDropped.Load()}, {"spruce_deliveries_total", b.metrics.Delivered.Load()}, {"spruce_redeliveries_total", b.metrics.Redelivered.Load()}, {"spruce_acks_total", b.metrics.Acked.Load()}, {"spruce_delivery_dropped_total", b.metrics.Dropped.Load()}, {"spruce_cache_evictions_total", evicted}, {"spruce_cache_expired_total", expired}, {"spruce_cache_messages", uint64(entries)}, {"spruce_cache_accounted_bytes", uint64(bytes)}, {"spruce_consumers", uint64(consumers)}, {"spruce_consumer_checkpoints", uint64(checkpoints)}, {"spruce_consumer_inflight", uint64(inflight)}, {"spruce_consumer_inflight_bytes", uint64(pendingBytes)}, {"spruce_replication_queue_bytes", uint64(replicationQueueBytes)}, {"spruce_replication_queue_max_peer_bytes", uint64(replicationQueueMaxPeerBytes)}, {"spruce_replication_queue_capacity_bytes", uint64(b.cfg.ReplicationQueueBytes * int64(len(b.peers)))}, {"spruce_replication_queue_high_water_bytes", uint64(b.replicationHighWaterBytes())}, {"spruce_action_queue_bytes", uint64(actionQueueBytes)}}
 	for _, v := range vals {
 		kind := "counter"
-		if v.name == "spruce_cache_messages" || v.name == "spruce_cache_accounted_bytes" || v.name == "spruce_consumers" || v.name == "spruce_consumer_checkpoints" || v.name == "spruce_consumer_inflight" || strings.HasSuffix(v.name, "_queue_bytes") || strings.Contains(v.name, "_admission_") || v.name == "spruce_publish_admission_bytes" || v.name == "spruce_consumer_inflight_bytes" {
+		if v.name == "spruce_cache_messages" || v.name == "spruce_cache_accounted_bytes" || v.name == "spruce_consumers" || v.name == "spruce_consumer_checkpoints" || v.name == "spruce_consumer_inflight" || strings.Contains(v.name, "_queue_") || strings.Contains(v.name, "_admission_") || v.name == "spruce_publish_admission_bytes" || v.name == "spruce_consumer_inflight_bytes" {
 			kind = "gauge"
 		}
 		_, _ = fmt.Fprintf(w, "# TYPE %s %s\n%s %d\n", v.name, kind, v.name, v.value)

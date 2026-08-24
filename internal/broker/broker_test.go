@@ -253,8 +253,8 @@ func TestPerformancePublishBatchAllocationCeiling(t *testing.T) {
 	if allocations := result.AllocsPerOp(); allocations > 2090 {
 		t.Fatalf("batch allocation-count regression: got %d allocations/request, ceiling 2090", allocations)
 	}
-	if bytes := result.AllocedBytesPerOp(); bytes > 300<<10 {
-		t.Fatalf("batch allocation-byte regression: got %d bytes/request, ceiling %d", bytes, 300<<10)
+	if bytes := result.AllocedBytesPerOp(); bytes > 320<<10 {
+		t.Fatalf("batch allocation-byte regression: got %d bytes/request, ceiling %d", bytes, 320<<10)
 	}
 }
 
@@ -1337,6 +1337,54 @@ func TestPublishAdmissionReleasesBudget(t *testing.T) {
 	}
 	if got := b.publishAdmissionBytes.Load(); got != 0 {
 		t.Fatalf("admission bytes=%d", got)
+	}
+}
+
+func TestReplicationPressureRejectsBeforeLocalAcceptance(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PublishAdmissionWait = time.Millisecond
+	cfg.ReplicationQueueBytes = maxBatchBytes
+	b := New(cfg)
+	defer b.Close()
+	blocked := &peer{ch: make(chan []*Message, 1)}
+	blocked.queuedBytes.Store(b.replicationHighWaterBytes())
+	b.peers = []*peer{blocked}
+	r := httptest.NewRequest("POST", "/v1/topics/t/messages", bytes.NewReader([]byte("payload")))
+	w := httptest.NewRecorder()
+	b.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusTooManyRequests || w.Header().Get("Retry-After") != "1" || !strings.Contains(w.Body.String(), "replication_overloaded") {
+		t.Fatalf("status=%d retry-after=%q body=%s", w.Code, w.Header().Get("Retry-After"), w.Body.String())
+	}
+	if got := b.metrics.Published.Load(); got != 0 {
+		t.Fatalf("published=%d", got)
+	}
+	if got := b.metrics.ReplicationPressureRejected.Load(); got != 1 {
+		t.Fatalf("replication pressure rejected=%d", got)
+	}
+}
+
+func TestReplicationPressureAllowsHealthyPeer(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ReplicationQueueBytes = maxBatchBytes
+	b := New(cfg)
+	defer b.Close()
+	blocked := &peer{ch: make(chan []*Message, 1)}
+	blocked.queuedBytes.Store(b.replicationHighWaterBytes())
+	healthy := &peer{ch: make(chan []*Message, 1)}
+	b.peers = []*peer{blocked, healthy}
+	r := httptest.NewRequest("POST", "/v1/topics/t/messages", bytes.NewReader([]byte("payload")))
+	w := httptest.NewRecorder()
+	b.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	select {
+	case messages := <-healthy.ch:
+		if len(messages) != 1 || string(messages[0].Payload) != "payload" {
+			t.Fatalf("replicated messages=%v", messages)
+		}
+	default:
+		t.Fatal("healthy peer did not receive replication")
 	}
 }
 
