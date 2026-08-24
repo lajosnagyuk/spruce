@@ -39,7 +39,7 @@ subscriber = threading.Thread(
 subscriber.start()
 time.sleep(0.5)
 for value, payload in enumerate(expected):
-    client.publish(topic, payload, PublishOptions(compression=("", "gzip", "zstd")[value % 3]))
+    client.publish(topic, payload, PublishOptions(compression=("off", "gzip", "zstd")[value % 3]))
 subscriber.join(30)
 stop.set()
 subscriber.join(2)

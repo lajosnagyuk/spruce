@@ -78,9 +78,11 @@ static async Task AdaptiveZstdWire()
         return Accepted();
     })));
     var payload = Encoding.UTF8.GetBytes(string.Concat(Enumerable.Repeat("{\"event\":\"workspace.updated\",\"status\":\"ready\"}", 4096)));
-    await client.PublishAsync("t", payload, new(Compression: "zstd"));
+    await client.PublishAsync("t", payload);
     Assert(wire is not null && wire.Length < payload.Length / 2, "zstd did not materially reduce the wire payload");
     Assert(wire![8] == 2, "zstd compression envelope codec missing");
+    await client.PublishAsync("t", payload, new(Compression: "off"));
+    Assert(wire.SequenceEqual(payload), "explicit compression off changed payload");
 }
 
 static async Task BatcherKeysAndCancellation()

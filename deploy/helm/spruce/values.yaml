@@ -77,8 +77,8 @@ config:
   maxInternalRequests: "256"
   publishAdmissionBytes: "33554432"
   publishAdmissionWait: 100ms
-  goMemoryLimit: 192MiB
-  memorySafetyMarginBytes: "67108864"
+  goMemoryLimit: 176MiB
+  memorySafetyMarginBytes: "83886080"
 
 podAnnotations: {}
 podLabels: {}

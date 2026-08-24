@@ -44,8 +44,9 @@ def _zstd_decompressor(maximum: int):
 
 
 def _compress_payload(payload: bytes, algorithm: str) -> bytes:
-    if not algorithm or len(payload) < 1024:
+    if len(payload) < 1024 or algorithm == "off":
         return payload
+    algorithm = algorithm or "zstd"
     if algorithm not in ("gzip", "zstd"):
         raise ValueError(f"unsupported compression {algorithm!r}")
     if algorithm == "gzip":

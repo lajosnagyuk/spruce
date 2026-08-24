@@ -23,7 +23,7 @@ var zstdEncoders = sync.Pool{New: func() any {
 }}
 
 const (
-	CompressionOff  = ""
+	CompressionOff  = "off"
 	CompressionGzip = "gzip"
 	CompressionZstd = "zstd"
 
@@ -35,7 +35,13 @@ func compressPayload(payload []byte, algorithm string) ([]byte, error) {
 	if len(payload) > 1<<20 {
 		return nil, errors.New("payload exceeds 1 MiB")
 	}
-	if algorithm == CompressionOff || len(payload) < compressionThreshold {
+	if len(payload) < compressionThreshold {
+		return payload, nil
+	}
+	if algorithm == "" {
+		algorithm = CompressionZstd
+	}
+	if algorithm == CompressionOff {
 		return payload, nil
 	}
 	header := make([]byte, len(compressionMagic)+5)

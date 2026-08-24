@@ -5,9 +5,10 @@ binary batches, bounded automatic producer batching, idempotent retry, concurren
 streaming consumption, batched ACK/NACK, explicit completion, deduplication,
 diagnostics, telemetry, Bearer and Basic authentication.
 
-Set `PublishOptions(compression="gzip")` for ubiquitous compression or
-`PublishOptions(compression="zstd")` for better throughput and cache density. Both are
-adaptive and are decoded transparently with the configured message-size bound.
+Zstandard compression is adaptive and enabled by default. Set
+`PublishOptions(compression="gzip")` for ecosystem compatibility or
+`PublishOptions(compression="off")` to disable compression. Both codecs are decoded
+transparently with the configured message-size bound.
 
 Subscription handlers are synchronous and must be bounded or cooperatively cancellable.
 `drain_timeout` bounds `subscribe()` shutdown, but Python cannot forcibly terminate a

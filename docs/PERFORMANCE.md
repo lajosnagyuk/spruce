@@ -231,3 +231,16 @@ the Go measurements, pooled Python Zstandard compression sustained approximately
 0.20/0.86/0.82 GiB/s for gzip. These codec microbenchmarks exclude HTTP and broker work;
 the cluster measurements above remain the end-to-end evidence for latency, CPU, and
 cache effects.
+
+A later ten-minute Zstandard curve varied 4 KiB, 64 KiB, and 900 KiB payloads from
+100 to 1,200 requested messages/s and back down. It verified 292,969 messages and
+90.15 GiB byte-for-byte with no missing, duplicate, invalid, publish, subscription, or
+overload result. Achieved throughput was producer-limited to 488 messages/s; publish
+p50/p95/p99 was 0.60/7.13/24.86 ms and first-delivery was 1.95/9.78/28.19 ms.
+
+A four-producer request-rate test exposed the bounded-retention edge at approximately
+1,700 accepted 4 KiB messages/s: broker CPU approached two cores, best-effort third
+replica queues shed copies while every local publish still reserved one peer, and active
+consumers could not drain all messages before the deliberately short two-minute TTL.
+This is capacity evidence, not a portable throughput claim. Operators must size TTL for
+the worst credible catch-up interval and alert on replication drops and delivery latency.

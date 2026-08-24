@@ -313,7 +313,8 @@ public sealed partial class SpruceClient : IDisposable
 
     private static byte[] EncodePayload(ReadOnlySpan<byte> payload, string? algorithm)
     {
-        if (string.IsNullOrEmpty(algorithm) || payload.Length < 1024) return payload.ToArray();
+        if (payload.Length < 1024 || algorithm == "off") return payload.ToArray();
+        algorithm ??= "zstd";
         if (algorithm is not ("gzip" or "zstd")) throw new ArgumentException($"Unsupported compression '{algorithm}'", nameof(algorithm));
         using var output = new MemoryStream();
         output.Write(CompressionMagic);

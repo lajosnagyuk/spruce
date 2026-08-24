@@ -53,6 +53,8 @@ class Conformance(unittest.TestCase):
                 self.assertEqual(_decompress_payload(encoded, len(payload)), payload)
                 with self.assertRaises(ValueError): _decompress_payload(encoded, 1024)
                 self.assertEqual(_compress_payload(b"small", algorithm), b"small")
+        self.assertEqual(_compress_payload(payload, "")[8], 2)
+        self.assertEqual(_compress_payload(payload, "off"), payload)
     @classmethod
     def tearDownClass(cls): cls.server.shutdown()
     def test_publish_batch_status_and_deduper(self):

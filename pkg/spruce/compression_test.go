@@ -35,6 +35,24 @@ func TestCompressionRoundTripAndAdaptiveFallback(t *testing.T) {
 	}
 }
 
+func TestCompressionDefaultsToZstdAndCanBeDisabled(t *testing.T) {
+	payload := bytes.Repeat([]byte("compressible"), 1024)
+	encoded, err := compressPayload(payload, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(encoded, payload) || encoded[len(compressionMagic)] != 2 {
+		t.Fatal("default compression is not zstd")
+	}
+	disabled, err := compressPayload(payload, CompressionOff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(disabled, payload) {
+		t.Fatal("explicit compression off changed payload")
+	}
+}
+
 func TestCompressionRejectsDecompressedLimit(t *testing.T) {
 	payload := bytes.Repeat([]byte("x"), 4096)
 	encoded, err := compressPayload(payload, CompressionGzip)

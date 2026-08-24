@@ -15,7 +15,7 @@ var subscribed = client.SubscribeAsync(topic, "csharp", (delivery, _) =>
     return Task.CompletedTask;
 }, timeout.Token, concurrency: 16);
 await Task.Delay(500);
-var publishes = expected.Select((value, i) => client.PublishAsync(topic, System.Text.Encoding.UTF8.GetBytes(value), new(Compression: (i % 3) switch { 1 => "gzip", 2 => "zstd", _ => null }), CancellationToken.None));
+var publishes = expected.Select((value, i) => client.PublishAsync(topic, System.Text.Encoding.UTF8.GetBytes(value), new(Compression: (i % 3) switch { 1 => "gzip", 2 => "zstd", _ => "off" }), CancellationToken.None));
 await Task.WhenAll(publishes);
 try { await subscribed; } catch (OperationCanceledException) when (received.Count == 100) { }
 if (!received.Keys.ToHashSet().SetEquals(expected)) throw new Exception($"expected 100 exact messages, received {received.Count}");
