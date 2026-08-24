@@ -215,3 +215,10 @@ These deliberately compressible payloads represent an upper-bound benefit, not a
 portable claim for arbitrary events. Adaptive mode skips payloads below 1 KiB and keeps
 the original bytes unless compression saves at least 10% and 128 bytes. Incompressible
 payloads therefore preserve wire/cache size but still pay the attempted codec CPU cost.
+
+A separate 15-second run NACKed every 50th first delivery. All planned retries completed
+without missing, duplicate, or invalid payloads. First-delivery p50/p95/p99 was
+12.9/52.7/104.6 ms raw, 1.14/5.31/9.72 ms with pooled gzip, and
+0.93/4.36/8.16 ms with pooled zstd. NACK-to-redelivery p50 remained 0.51-0.53 seconds
+and p99 0.98-1.01 seconds for every codec, showing that the broker retry schedule, not
+compression, dominates redelivery latency.

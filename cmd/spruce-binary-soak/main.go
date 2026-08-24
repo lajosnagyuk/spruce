@@ -18,10 +18,11 @@ import (
 
 func fill(payload []byte, index uint64, compressible bool) {
 	binary.BigEndian.PutUint64(payload[:8], index)
+	binary.BigEndian.PutUint64(payload[8:16], uint64(time.Now().UnixNano()))
 	if compressible {
 		pattern := []byte(`,"workspace":"spruce","event":"deployment.updated","status":"ready"`)
-		for i := 8; i < len(payload); i++ {
-			payload[i] = pattern[(i-8)%len(pattern)]
+		for i := 16; i < len(payload); i++ {
+			payload[i] = pattern[(i-16)%len(pattern)]
 		}
 		return
 	}
@@ -34,14 +35,14 @@ func fill(payload []byte, index uint64, compressible bool) {
 	}
 }
 func valid(payload []byte, index uint64, compressible bool) bool {
-	if len(payload) < 8 || binary.BigEndian.Uint64(payload[:8]) != index {
+	if len(payload) < 16 || binary.BigEndian.Uint64(payload[:8]) != index {
 		return false
 	}
 	state := index ^ 0x9e3779b97f4a7c15
 	pattern := []byte(`,"workspace":"spruce","event":"deployment.updated","status":"ready"`)
-	for i := 8; i < len(payload); i++ {
+	for i := 16; i < len(payload); i++ {
 		if compressible {
-			if payload[i] != pattern[(i-8)%len(pattern)] {
+			if payload[i] != pattern[(i-16)%len(pattern)] {
 				return false
 			}
 			continue
@@ -68,6 +69,7 @@ func main() {
 	handlerDelay := flag.Duration("handler-delay", 0, "artificial delay per consumed message")
 	compression := flag.String("compression", "off", "payload compression: off, gzip, or zstd")
 	data := flag.String("data", "random", "payload content: random or compressible")
+	nackEvery := flag.Int("nack-every", 0, "NACK every Nth message once to measure redelivery; zero disables")
 	flag.Parse()
 	rates := []int{*rate}
 	if *ratesArg != "" {
@@ -94,8 +96,8 @@ func main() {
 		}
 	}
 	for _, payloadSize := range sizes {
-		if payloadSize < 8 || payloadSize > 1<<20 {
-			fmt.Fprintln(os.Stderr, "every payload size must be between 8 and 1048576 bytes")
+		if payloadSize < 16 || payloadSize > 1<<20 {
+			fmt.Fprintln(os.Stderr, "every payload size must be between 16 and 1048576 bytes")
 			os.Exit(2)
 		}
 	}
@@ -109,6 +111,10 @@ func main() {
 	}
 	if *data != "random" && *data != "compressible" {
 		fmt.Fprintln(os.Stderr, "data must be random or compressible")
+		os.Exit(2)
+	}
+	if *nackEvery < 0 {
+		fmt.Fprintln(os.Stderr, "nack-every must not be negative")
 		os.Exit(2)
 	}
 	compressionMode := *compression
@@ -145,9 +151,12 @@ func main() {
 		topicNames[i] = fmt.Sprintf("%s-%d", topicPrefix, i)
 	}
 	seen := make([]atomic.Uint32, total)
+	nackedAt := make([]atomic.Int64, total)
 	var enqueued, published, publishedBytes, received, invalid, duplicates, overloadRejected, publishErrors, subscribeErrors atomic.Int64
 	var latencyMu sync.Mutex
 	latencies := make([]int64, 0, min(total, 100000))
+	firstDeliveryLatencies := make([]int64, 0, min(total, 100000))
+	redeliveryLatencies := make([]int64, 0, min(total, 100000))
 	var firstPublishError, firstSubscribeError sync.Once
 	ready := make(chan struct{}, len(topicNames))
 	for topicIndex, topic := range topicNames {
@@ -165,6 +174,21 @@ func main() {
 				if index >= uint64(total) || int(index%uint64(len(topicNames))) != topicIndex || len(d.Payload) != sizes[index%uint64(len(sizes))] || !valid(d.Payload, index, compressible) {
 					invalid.Add(1)
 					return nil
+				}
+				now := time.Now().UnixNano()
+				publishedAt := int64(binary.BigEndian.Uint64(d.Payload[8:16]))
+				latencyMu.Lock()
+				if d.Attempt == 1 && len(firstDeliveryLatencies) < cap(firstDeliveryLatencies) {
+					firstDeliveryLatencies = append(firstDeliveryLatencies, (now-publishedAt)/1000)
+				} else if d.Attempt > 1 && len(redeliveryLatencies) < cap(redeliveryLatencies) {
+					if nacked := nackedAt[index].Load(); nacked > 0 {
+						redeliveryLatencies = append(redeliveryLatencies, (now-nacked)/1000)
+					}
+				}
+				latencyMu.Unlock()
+				if *nackEvery > 0 && d.Attempt == 1 && index%uint64(*nackEvery) == 0 {
+					nackedAt[index].Store(now)
+					return fmt.Errorf("planned redelivery")
 				}
 				if *handlerDelay > 0 {
 					timer := time.NewTimer(*handlerDelay)
@@ -270,13 +294,15 @@ produce:
 		rateLabels[i] = strconv.Itoa(phaseRate)
 	}
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
-	percentile := func(p float64) int64 {
-		if len(latencies) == 0 {
+	sort.Slice(firstDeliveryLatencies, func(i, j int) bool { return firstDeliveryLatencies[i] < firstDeliveryLatencies[j] })
+	sort.Slice(redeliveryLatencies, func(i, j int) bool { return redeliveryLatencies[i] < redeliveryLatencies[j] })
+	percentile := func(values []int64, p float64) int64 {
+		if len(values) == 0 {
 			return 0
 		}
-		return latencies[min(len(latencies)-1, int(float64(len(latencies))*p))]
+		return values[min(len(values)-1, int(float64(len(values))*p))]
 	}
-	fmt.Printf("topic_prefix=%s topics=%d handler_delay=%s compression=%s data=%s payload_sizes=%s requested_rates=%s planned=%d enqueued=%d published=%d received=%d overload_rejected=%d missing=%d duplicates=%d invalid=%d publish_errors=%d subscription_errors=%d production_elapsed=%s publish_elapsed=%s elapsed=%s offered_rate=%.2f accepted_rate=%.2f payload_gib=%.2f publish_latency_p50_us=%d publish_latency_p95_us=%d publish_latency_p99_us=%d\n", topicPrefix, len(topicNames), *handlerDelay, *compression, *data, strings.Join(sizeLabels, "|"), strings.Join(rateLabels, "|"), total, enqueued.Load(), published.Load(), received.Load(), overloadRejected.Load(), missing, duplicates.Load(), invalid.Load(), publishErrors.Load(), subscribeErrors.Load(), productionElapsed, publishElapsed, time.Since(started), float64(enqueued.Load())/productionElapsed.Seconds(), float64(published.Load())/publishElapsed.Seconds(), float64(publishedBytes.Load())/(1<<30), percentile(.50), percentile(.95), percentile(.99))
+	fmt.Printf("topic_prefix=%s topics=%d handler_delay=%s compression=%s data=%s nack_every=%d payload_sizes=%s requested_rates=%s planned=%d enqueued=%d published=%d received=%d overload_rejected=%d missing=%d duplicates=%d invalid=%d publish_errors=%d subscription_errors=%d production_elapsed=%s publish_elapsed=%s elapsed=%s offered_rate=%.2f accepted_rate=%.2f payload_gib=%.2f publish_latency_p50_us=%d publish_latency_p95_us=%d publish_latency_p99_us=%d first_delivery_p50_us=%d first_delivery_p95_us=%d first_delivery_p99_us=%d redelivery_p50_us=%d redelivery_p95_us=%d redelivery_p99_us=%d\n", topicPrefix, len(topicNames), *handlerDelay, *compression, *data, *nackEvery, strings.Join(sizeLabels, "|"), strings.Join(rateLabels, "|"), total, enqueued.Load(), published.Load(), received.Load(), overloadRejected.Load(), missing, duplicates.Load(), invalid.Load(), publishErrors.Load(), subscribeErrors.Load(), productionElapsed, publishElapsed, time.Since(started), float64(enqueued.Load())/productionElapsed.Seconds(), float64(published.Load())/publishElapsed.Seconds(), float64(publishedBytes.Load())/(1<<30), percentile(latencies, .50), percentile(latencies, .95), percentile(latencies, .99), percentile(firstDeliveryLatencies, .50), percentile(firstDeliveryLatencies, .95), percentile(firstDeliveryLatencies, .99), percentile(redeliveryLatencies, .50), percentile(redeliveryLatencies, .95), percentile(redeliveryLatencies, .99))
 	if missing != 0 || duplicates.Load() != 0 || invalid.Load() != 0 || publishErrors.Load() != 0 || subscribeErrors.Load() != 0 {
 		os.Exit(1)
 	}
