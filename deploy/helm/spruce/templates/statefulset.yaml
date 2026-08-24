@@ -118,6 +118,7 @@ spec:
             - {name: SPRUCE_MAX_STREAMS, value: {{ .Values.config.maxStreams | quote }}}
             - {name: SPRUCE_MAX_INTERNAL_REQUESTS, value: {{ .Values.config.maxInternalRequests | quote }}}
             - {name: SPRUCE_PUBLISH_ADMISSION_BYTES, value: {{ .Values.config.publishAdmissionBytes | quote }}}
+            - {name: SPRUCE_DELIVERY_LAG_LIMIT, value: {{ .Values.config.deliveryLagLimit | quote }}}
             - {name: SPRUCE_PUBLISH_ADMISSION_WAIT, value: {{ .Values.config.publishAdmissionWait | quote }}}
             - {name: GOMEMLIMIT, value: {{ .Values.config.goMemoryLimit | quote }}}
           readinessProbe:

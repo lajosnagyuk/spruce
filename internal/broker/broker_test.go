@@ -1631,6 +1631,45 @@ func TestRejectsMaxMessageAboveSnapshotLimit(t *testing.T) {
 	_ = New(cfg)
 }
 
+func TestDeliveryLagAdmissionIsTopicScopedAndClears(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DeliveryLagLimit = 10 * time.Millisecond
+	b := New(cfg)
+	defer b.Close()
+
+	p := acquirePending()
+	*p = pending{deliveryID: "lagged", message: &Message{ID: "message", Topic: "lagged"}, deliveredAt: time.Now().Add(-time.Second)}
+	b.mu.Lock()
+	b.pending[p.deliveryID] = p
+	b.linkTopicPendingLocked(p)
+	b.mu.Unlock()
+
+	publish := func(topic string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v1/topics/"+topic+"/messages", bytes.NewReader([]byte("payload")))
+		req.SetPathValue("topic", topic)
+		response := httptest.NewRecorder()
+		b.publish(response, req)
+		return response
+	}
+	if response := publish("lagged"); response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") != "1" {
+		t.Fatalf("lagged topic status=%d retry-after=%q", response.Code, response.Header().Get("Retry-After"))
+	}
+	if response := publish("healthy"); response.Code != http.StatusAccepted {
+		t.Fatalf("healthy topic status=%d body=%s", response.Code, response.Body.String())
+	}
+	b.mu.Lock()
+	delete(b.pending, p.deliveryID)
+	b.unlinkTopicPendingLocked(p)
+	b.mu.Unlock()
+	releasePending(p)
+	if response := publish("lagged"); response.Code != http.StatusAccepted {
+		t.Fatalf("recovered topic status=%d body=%s", response.Code, response.Body.String())
+	}
+	if got := b.metrics.DeliveryPressureRejected.Load(); got != 1 {
+		t.Fatalf("delivery pressure rejected=%d", got)
+	}
+}
+
 func FuzzReadPeerBatch(f *testing.F) {
 	var seed bytes.Buffer
 	_ = writePeerBatch(&seed, []*Message{{ID: "id", Topic: "t", Payload: []byte{0, 1, 255}, ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}})

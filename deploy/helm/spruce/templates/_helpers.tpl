@@ -63,7 +63,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if lt (int .Values.gateway.replicaCount) 1 -}}{{- fail "gateway.replicaCount must be at least 1" -}}{{- end -}}
 {{- if or (lt (int .Values.service.port) 1) (gt (int .Values.service.port) 65535) -}}{{- fail "service.port must be between 1 and 65535" -}}{{- end -}}
 {{- if or (lt (int .Values.gateway.service.port) 1) (gt (int .Values.gateway.service.port) 65535) -}}{{- fail "gateway.service.port must be between 1 and 65535" -}}{{- end -}}
-{{- range $name, $duration := dict "config.defaultTTL" .Values.config.defaultTTL "config.maxTTL" .Values.config.maxTTL "config.ackDeadline" .Values.config.ackDeadline "config.drainDelay" .Values.config.drainDelay -}}
+{{- range $name, $duration := dict "config.defaultTTL" .Values.config.defaultTTL "config.maxTTL" .Values.config.maxTTL "config.ackDeadline" .Values.config.ackDeadline "config.drainDelay" .Values.config.drainDelay "config.deliveryLagLimit" .Values.config.deliveryLagLimit -}}
 {{- if regexMatch "^([0]+(ns|us|µs|ms|s|m|h))+$" $duration -}}{{- fail (printf "%s must be greater than zero" $name) -}}{{- end -}}
 {{- end -}}
 {{- $memoryLimit := int64 (include "spruce.memoryBytes" .Values.resources.limits.memory) -}}

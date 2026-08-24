@@ -17,13 +17,13 @@ data:
       proxy_ssl_server_name on;
       proxy_ssl_name {{ include "spruce.fullname" . }}-headless.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }};
       {{- end }}
-      map $arg_group $stream_key {
+      map $arg_topic $stream_key {
         "" "$remote_addr:$remote_port:$connection";
-        default "$arg_topic:$arg_group";
+        default "$arg_topic";
       }
-      map $http_spruce_key $publish_key {
-        "" "$request_id";
-        default "$uri:$http_spruce_key";
+      map $uri $publish_key {
+        ~^/v1/topics/(?<publish_topic>[A-Za-z0-9._-]+)/(messages|batches)$ $publish_topic;
+        default "$uri";
       }
       upstream brokers {
         zone brokers 64k;
@@ -40,8 +40,8 @@ data:
         server {{ include "spruce.fullname" $ }}-{{ $i }}.{{ include "spruce.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.clusterDomain }}:{{ $.Values.service.port }} resolve;
         {{- end }}
       }
-      upstream keyed_publishes {
-        zone keyed_publishes 64k;
+      upstream topic_publishes {
+        zone topic_publishes 64k;
         hash $publish_key consistent;
         {{- range $i := until (int .Values.replicaCount) }}
         server {{ include "spruce.fullname" $ }}-{{ $i }}.{{ include "spruce.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.clusterDomain }}:{{ $.Values.service.port }} resolve;
@@ -61,7 +61,7 @@ data:
           proxy_read_timeout 1h;
         }
         location ~ ^/v1/topics/[A-Za-z0-9._-]+/(messages|batches)$ {
-          proxy_pass {{ include "spruce.scheme" . }}://keyed_publishes;
+          proxy_pass {{ include "spruce.scheme" . }}://topic_publishes;
           proxy_http_version 1.1;
           proxy_set_header Connection "";
           proxy_buffering off;

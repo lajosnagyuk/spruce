@@ -1,6 +1,9 @@
 # Spruce Helm chart
 
 This chart deploys bounded, interchangeable Spruce brokers and a stateless Nginx gateway.
+The gateway consistently routes publishes and subscriptions for the same topic to one
+broker. Partition keys retain per-key ordering within that topic owner; replication is
+used for bounded replay and broker replacement rather than ordinary delivery routing.
 Release charts are published as `oci://ghcr.io/lajosnagyuk/charts/spruce` with the
 release semantic version as the OCI tag.
 
@@ -42,6 +45,7 @@ admits it: `kubectl label namespace ingress-nginx spruce.io/ingress-access=true`
 | `config.cacheBytes` | `67108864` | Per-broker payload and metadata cache budget |
 | `config.goMemoryLimit` | `176MiB` | Go runtime soft memory limit; must leave the safety margin below the pod limit |
 | `config.memorySafetyMarginBytes` | `83886080` | Space reserved for stacks, executable mappings, allocator overhead, TLS, and other non-heap memory |
+| `config.deliveryLagLimit` | `1s` | Oldest unacknowledged topic delivery age before new publishes receive retryable overload |
 | `resources.requests.memory` | `96Mi` | Broker memory request |
 | `resources.limits.memory` | `256Mi` | Broker memory hard limit |
 | `topologySpreadConstraints` | `true` | Require brokers on distinct nodes; disable explicitly only when reduced failure isolation is acceptable |

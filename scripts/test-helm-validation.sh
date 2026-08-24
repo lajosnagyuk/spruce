@@ -28,6 +28,7 @@ reject --set config.cacheBytes=0
 reject --set config.defaultTTL=0s
 reject --set config.publishAdmissionBytes=0
 reject --set config.publishAdmissionWait=0s
+reject --set config.deliveryLagLimit=0s
 reject --set config.goMemoryLimit=0MiB
 reject --set config.goMemoryLimit=224MiB
 reject --set-string config.memorySafetyMarginBytes=134217728
@@ -45,6 +46,11 @@ render --set auth.requireExistingSecret=true --set auth.existingSecret=spruce-au
 
 spread=$(helm template spruce "$chart" $base)
 printf '%s\n' "$spread" | grep -q 'whenUnsatisfiable: DoNotSchedule'
+printf '%s\n' "$spread" | grep -q 'map $arg_topic $stream_key'
+printf '%s\n' "$spread" | grep -q 'map $uri $publish_key'
+printf '%s\n' "$spread" | grep -q '(?<publish_topic>'
+printf '%s\n' "$spread" | grep -q 'hash $stream_key consistent;'
+printf '%s\n' "$spread" | grep -q 'hash $publish_key consistent;'
 
 target=$(SPRUCE_RELEASE=platform SPRUCE_NAMESPACE=events SPRUCE_CLUSTER_DOMAIN=corp.internal SPRUCE_PRINT_TARGETS=1 sh scripts/k3s-rotate-tls.sh)
 test "$target" = 'publish_url=https://platform-spruce-0.platform-spruce-headless.events.svc.corp.internal:8080'

@@ -67,6 +67,7 @@
         "maxInternalRequests": {"$ref": "#/definitions/positiveIntegerString"},
         "publishAdmissionBytes": {"$ref": "#/definitions/positiveIntegerString"},
         "publishAdmissionWait": {"$ref": "#/definitions/duration"},
+        "deliveryLagLimit": {"$ref": "#/definitions/duration"},
         "goMemoryLimit": {"type": "string", "pattern": "^[1-9][0-9]*(KiB|MiB|GiB)$"},
         "memorySafetyMarginBytes": {"$ref": "#/definitions/positiveIntegerString"},
         "defaultTTL": {"$ref": "#/definitions/duration"},

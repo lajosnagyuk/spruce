@@ -244,3 +244,14 @@ replica queues shed copies while every local publish still reserved one peer, an
 consumers could not drain all messages before the deliberately short two-minute TTL.
 This is capacity evidence, not a portable throughput claim. Operators must size TTL for
 the worst credible catch-up interval and alert on replication drops and delivery latency.
+The test also exposed a gateway mismatch: publishes and subscriptions used different
+hash keys, so a dropped best-effort replica copy could miss the consumer-owning broker.
+The gateway now hashes both paths by topic, keeping ordinary delivery local to the same
+owner while retaining replication for replay and replacement.
+
+After correcting the topic extraction to use an Nginx named capture and adding
+topic-local one-second delivery-lag admission, four independent producers completed
+145,127 accepted 4 KiB messages at 2,417 messages/s aggregate. Every accepted message
+was delivered exactly once with no transport, subscription, corruption, or expiry
+failure; one publish received the intended retryable overload response. This was a
+short saturation validation on the sandbox topology, not a production throughput SLA.
