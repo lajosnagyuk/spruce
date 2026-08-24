@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.IO.Compression;
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -6,7 +7,7 @@ using System.Threading.Channels;
 
 namespace Spruce;
 
-public sealed record PublishOptions(string? Key = null, TimeSpan? Ttl = null, string? ContentType = null, string? Ack = null, string? IdempotencyKey = null, string? ProducerId = null);
+public sealed record PublishOptions(string? Key = null, TimeSpan? Ttl = null, string? ContentType = null, string? Ack = null, string? IdempotencyKey = null, string? ProducerId = null, string? Compression = null);
 public sealed record PublishResult([property: JsonPropertyName("id")] string Id, [property: JsonPropertyName("replicated")] bool Replicated);
 public sealed record BatchResult([property: JsonPropertyName("ids")] string[] Ids);
 public sealed record BatchEntry(ReadOnlyMemory<byte> Payload, string? Key = null);
@@ -58,7 +59,7 @@ public sealed partial class SpruceClient : IDisposable
         timeout.CancelAfter(_requestTimeout);
         options ??= new();
         using var request = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/v1/topics/{Uri.EscapeDataString(topic)}/messages");
-        request.Content = new ByteArrayContent(payload.ToArray());
+        request.Content = new ByteArrayContent(EncodePayload(payload.Span, options.Compression));
         if (options.ContentType is not null) request.Content.Headers.ContentType = new(options.ContentType);
         if (options.Key is not null) request.Headers.Add("Spruce-Key", options.Key);
         if (options.Ttl is not null) request.Headers.Add("Spruce-TTL", $"{options.Ttl.Value.TotalMilliseconds}ms");
@@ -83,12 +84,13 @@ public sealed partial class SpruceClient : IDisposable
         options ??= new();
         if (options.Ack is not null and not "local") throw new ArgumentException("Batch only supports local acknowledgement", nameof(options));
         if (options.IdempotencyKey is not null) throw new ArgumentException("Batch idempotency is not supported", nameof(options));
-        var total = entries.Aggregate(0L, (sum, entry) => checked(sum + 6 + entry.Payload.Length + System.Text.Encoding.UTF8.GetByteCount(entry.Key ?? "")));
+        var encodedEntries = entries.Select(entry => new BatchEntry(EncodePayload(entry.Payload.Span, options.Compression), entry.Key)).ToArray();
+        var total = encodedEntries.Aggregate(0L, (sum, entry) => checked(sum + 6 + entry.Payload.Length + System.Text.Encoding.UTF8.GetByteCount(entry.Key ?? "")));
         if (entries.Any(entry => entry.Payload.Length > 1024 * 1024 || System.Text.Encoding.UTF8.GetByteCount(entry.Key ?? "") > 8 * 1024)) throw new ArgumentException("A batch entry exceeds its limit", nameof(entries));
         if (total > 16 * 1024 * 1024) throw new ArgumentException("Batch exceeds 16 MiB", nameof(entries));
         using var body = new MemoryStream(checked((int)total));
         var size = new byte[4];
-        foreach (var entry in entries)
+        foreach (var entry in encodedEntries)
         {
             var key = System.Text.Encoding.UTF8.GetBytes(entry.Key ?? "");
             var keySize = new byte[2]; BinaryPrimitives.WriteUInt16BigEndian(keySize, checked((ushort)key.Length));
@@ -204,7 +206,7 @@ public sealed partial class SpruceClient : IDisposable
                         var delivery = JsonSerializer.Deserialize<Delivery>(metadata)!;
                         var payload = new byte[payloadLength]; await stream.ReadExactlyAsync(payload, connection.Token);
                         if (string.IsNullOrEmpty(delivery.DeliveryId)) continue;
-                        delivery = delivery with { Payload = payload };
+                        delivery = delivery with { Payload = DecodePayload(payload, maxPayloadBytes) };
 						await progressWindow.WaitAsync(connection.Token);
                         var index = Interlocked.Increment(ref sequence);
                         var lane = preserveKeyOrder ? StableLane(delivery.Key ?? delivery.MessageId, deliveryLanes.Length) : 0;
@@ -301,6 +303,43 @@ public sealed partial class SpruceClient : IDisposable
     {
         if (_token is not null) request.Headers.Authorization = new("Bearer", _token);
         else if (_username is not null) request.Headers.Authorization = new("Basic", Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes($"{_username}:{_password}")));
+    }
+
+    private static readonly byte[] CompressionMagic = [0x89, (byte)'S', (byte)'P', (byte)'R', (byte)'U', (byte)'C', (byte)'E', 0x01];
+
+    private static byte[] EncodePayload(ReadOnlySpan<byte> payload, string? algorithm)
+    {
+        if (string.IsNullOrEmpty(algorithm) || payload.Length < 1024) return payload.ToArray();
+        if (!string.Equals(algorithm, "gzip", StringComparison.Ordinal)) throw new ArgumentException($"Unsupported compression '{algorithm}'", nameof(algorithm));
+        using var output = new MemoryStream();
+        output.Write(CompressionMagic);
+        output.WriteByte(1);
+        Span<byte> size = stackalloc byte[4]; BinaryPrimitives.WriteUInt32BigEndian(size, checked((uint)payload.Length)); output.Write(size);
+        using (var gzip = new GZipStream(output, CompressionLevel.Fastest, leaveOpen: true)) gzip.Write(payload);
+        var encoded = output.ToArray();
+        var minimumSaving = Math.Max(128, payload.Length / 10);
+        return encoded.Length <= payload.Length - minimumSaving ? encoded : payload.ToArray();
+    }
+
+    private static byte[] DecodePayload(byte[] payload, int maximum)
+    {
+        if (payload.Length < CompressionMagic.Length + 5 || !payload.AsSpan(0, CompressionMagic.Length).SequenceEqual(CompressionMagic)) return payload;
+        if (payload[CompressionMagic.Length] != 1) throw new InvalidDataException("Unsupported compressed payload encoding");
+        var original = checked((int)BinaryPrimitives.ReadUInt32BigEndian(payload.AsSpan(CompressionMagic.Length + 1, 4)));
+        if (original > maximum) throw new InvalidDataException("Compressed payload exceeds decompressed limit");
+        using var input = new MemoryStream(payload, CompressionMagic.Length + 5, payload.Length - CompressionMagic.Length - 5, false);
+        using var gzip = new GZipStream(input, CompressionMode.Decompress);
+        using var output = new MemoryStream(Math.Min(original, maximum));
+        var buffer = new byte[8192];
+        while (output.Length <= maximum)
+        {
+            var read = gzip.Read(buffer, 0, Math.Min(buffer.Length, maximum + 1 - checked((int)output.Length)));
+            if (read == 0) break;
+            output.Write(buffer, 0, read);
+        }
+        var decoded = output.ToArray();
+        if (decoded.Length != original || decoded.Length > maximum) throw new InvalidDataException("Invalid decompressed payload length");
+        return decoded;
     }
 
     private static async Task EnsureSuccessAsync(HttpResponseMessage response, CancellationToken cancellationToken)

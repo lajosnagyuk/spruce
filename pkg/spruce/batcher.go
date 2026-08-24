@@ -135,11 +135,19 @@ func (b *ProducerBatcher) run() {
 		entries := make([]BatchEntry, 0, len(pending))
 		active := make([]*batchPublish, 0, len(pending))
 		for i := range pending {
-			if pending[i].ctx.Err() == nil { entries = append(entries, BatchEntry{Payload: pending[i].payload, Key: pending[i].options.Key}); active = append(active, pending[i])
-			} else { pending[i].done <- batchPublishResult{err: pending[i].ctx.Err()} }
+			if pending[i].ctx.Err() == nil {
+				entries = append(entries, BatchEntry{Payload: pending[i].payload, Key: pending[i].options.Key})
+				active = append(active, pending[i])
+			} else {
+				pending[i].done <- batchPublishResult{err: pending[i].ctx.Err()}
+			}
 		}
-		if len(entries) == 0 { pending = pending[:0]; return nil }
-		shared := pending[0].options; shared.Key = ""
+		if len(entries) == 0 {
+			pending = pending[:0]
+			return nil
+		}
+		shared := pending[0].options
+		shared.Key = ""
 		result, err := b.client.PublishBatchEntries(b.ctx, pending[0].topic, entries, shared)
 		if err == nil && len(result.IDs) != len(active) {
 			err = errors.New("spruce: invalid batch result count")
@@ -163,7 +171,11 @@ func (b *ProducerBatcher) run() {
 		}
 		return err
 	}
-	compatible := func(a, c *batchPublish) bool { ao, co := a.options, c.options; ao.Key, co.Key = "", ""; return a.topic == c.topic && ao == co }
+	compatible := func(a, c *batchPublish) bool {
+		ao, co := a.options, c.options
+		ao.Key, co.Key = "", ""
+		return a.topic == c.topic && ao == co
+	}
 	bytes := func(items []*batchPublish) int {
 		n := 0
 		for _, item := range items {

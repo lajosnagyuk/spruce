@@ -38,8 +38,8 @@ type HandlerPanicError struct{ Value any }
 func (e *HandlerPanicError) Error() string { return fmt.Sprintf("spruce: handler panic: %v", e.Value) }
 
 type PublishOptions struct {
-	Key, ContentType, ProducerID, IdempotencyKey, Ack string
-	TTL                                               time.Duration
+	Key, ContentType, ProducerID, IdempotencyKey, Ack, Compression string
+	TTL                                                            time.Duration
 }
 type PublishResult struct {
 	ID         string `json:"id"`
@@ -160,6 +160,10 @@ func (c *Client) Publish(ctx context.Context, topic string, payload []byte, o Pu
 	var finalErr error
 	defer func() { c.emit("publish", started, status, finalErr) }()
 	var out PublishResult
+	payload, err := compressPayload(payload, o.Compression)
+	if err != nil {
+		return out, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/v1/topics/"+url.PathEscape(topic)+"/messages", bytes.NewReader(payload))
 	if err != nil {
 		return out, err
@@ -276,7 +280,15 @@ func (c *Client) PublishBatchEntries(ctx context.Context, topic string, entries 
 	}
 	var body bytes.Buffer
 	total := 0
-	for _, entry := range entries {
+	encodedEntries := make([]BatchEntry, len(entries))
+	for i, entry := range entries {
+		payload, err := compressPayload(entry.Payload, o.Compression)
+		if err != nil {
+			return out, err
+		}
+		encodedEntries[i] = BatchEntry{Payload: payload, Key: entry.Key}
+	}
+	for _, entry := range encodedEntries {
 		key := []byte(entry.Key)
 		if len(key) > 8<<10 || len(entry.Payload) > 1<<20 || total > (16<<20)-6-len(key)-len(entry.Payload) {
 			return out, errors.New("batch exceeds protocol limits")
@@ -284,7 +296,7 @@ func (c *Client) PublishBatchEntries(ctx context.Context, topic string, entries 
 		total += 6 + len(key) + len(entry.Payload)
 	}
 	body.Grow(total)
-	for _, entry := range entries {
+	for _, entry := range encodedEntries {
 		payload, key := entry.Payload, []byte(entry.Key)
 		if len(payload) > int(^uint32(0)) {
 			return out, errors.New("payload is too large")
@@ -707,6 +719,11 @@ func (c *Client) subscribeOnce(ctx context.Context, o SubscribeOptions, handler 
 		}
 		if d.DeliveryID == "" {
 			continue
+		}
+		d.Payload, err = decompressPayload(d.Payload, o.MaxPayloadBytes)
+		if err != nil {
+			cancel()
+			return cursor.Load().(string), err
 		}
 		select {
 		case progressWindow <- struct{}{}:

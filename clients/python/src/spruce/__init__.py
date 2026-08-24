@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 from collections import deque
+import gzip
+import io
 import json
 import queue
 import random
@@ -22,6 +24,33 @@ MAX_BATCH_BYTES = 16 << 20
 MAX_BATCH_MESSAGES = 4096
 __version__ = "0.2.0"
 _DEFAULT_TIMEOUT = object()
+_COMPRESSION_MAGIC = b"\x89SPRUCE\x01"
+
+
+def _compress_payload(payload: bytes, algorithm: str) -> bytes:
+    if not algorithm or len(payload) < 1024:
+        return payload
+    if algorithm != "gzip":
+        raise ValueError(f"unsupported compression {algorithm!r}")
+    encoded = _COMPRESSION_MAGIC + b"\x01" + struct.pack(">I", len(payload)) + gzip.compress(payload, compresslevel=1, mtime=0)
+    minimum_saving = max(128, len(payload) // 10)
+    return encoded if len(encoded) <= len(payload) - minimum_saving else payload
+
+
+def _decompress_payload(payload: bytes, maximum: int) -> bytes:
+    if len(payload) < len(_COMPRESSION_MAGIC) + 5 or not payload.startswith(_COMPRESSION_MAGIC):
+        return payload
+    algorithm = payload[len(_COMPRESSION_MAGIC)]
+    original = struct.unpack(">I", payload[len(_COMPRESSION_MAGIC) + 1:len(_COMPRESSION_MAGIC) + 5])[0]
+    if original > maximum:
+        raise ValueError("compressed payload exceeds decompressed limit")
+    if algorithm != 1:
+        raise ValueError("unsupported compressed payload encoding")
+    with gzip.GzipFile(fileobj=io.BytesIO(payload[len(_COMPRESSION_MAGIC) + 5:])) as stream:
+        decoded = stream.read(maximum + 1)
+    if len(decoded) != original or len(decoded) > maximum:
+        raise ValueError("invalid decompressed payload length")
+    return decoded
 
 
 class SpruceError(Exception):
@@ -55,6 +84,7 @@ class PublishOptions:
     idempotency_key: str = ""
     ack: str = ""
     ttl: str = ""
+    compression: str = ""
 
 
 @dataclass(frozen=True)
@@ -188,7 +218,8 @@ class Client:
         if not topic: raise ValueError("topic is required")
         if len(payload) > MAX_MESSAGE_BYTES: raise ValueError("payload exceeds 1 MiB")
         path = f"/v1/topics/{urllib.parse.quote(topic, safe='')}/messages"
-        with self._request("POST", path, bytes(payload), self._option_headers(options), operation="publish") as response:
+        encoded = _compress_payload(bytes(payload), options.compression)
+        with self._request("POST", path, encoded, self._option_headers(options), operation="publish") as response:
             value = json.load(response)
         return PublishResult(value["id"], bool(value.get("replicated", False)))
 
@@ -213,7 +244,8 @@ class Client:
     def publish_batch_entries(self, topic: str, entries: Sequence[BatchEntry], options: PublishOptions = PublishOptions()) -> list[PublishResult]:
         if not entries or len(entries) > MAX_BATCH_MESSAGES: raise ValueError("batch message count is outside protocol limits")
         if options.idempotency_key or options.ack not in ("", "local"): raise ValueError("options are incompatible with batch publishing")
-        encoded = [(entry.key.encode(), bytes(entry.payload)) for entry in entries]
+        if any(len(entry.payload) > MAX_MESSAGE_BYTES for entry in entries): raise ValueError("batch entry exceeds decompressed payload limit")
+        encoded = [(entry.key.encode(), _compress_payload(bytes(entry.payload), options.compression)) for entry in entries]
         total = sum(6 + len(key) + len(payload) for key, payload in encoded)
         if total > MAX_BATCH_BYTES or any(len(key) > 8192 or len(payload) > MAX_MESSAGE_BYTES for key, payload in encoded): raise ValueError("batch exceeds protocol limits")
         body = b"".join(struct.pack(">H", len(key)) + key + struct.pack(">I", len(payload)) + payload for key, payload in encoded)
@@ -259,7 +291,7 @@ class Client:
         metadata_length, payload_length = struct.unpack(">II", self._read_exact(stream, 8))
         if metadata_length > 65536 or payload_length > maximum: raise ValueError("invalid Spruce frame size")
         metadata = json.loads(self._read_exact(stream, metadata_length))
-        payload = self._read_exact(stream, payload_length)
+        payload = _decompress_payload(self._read_exact(stream, payload_length), maximum)
         return Delivery(metadata.get("delivery_id", ""), metadata.get("message_id", ""), metadata.get("topic", ""), payload, metadata.get("key", ""), metadata.get("headers", {}), metadata.get("created_at", 0), metadata.get("attempt", 0), metadata.get("cursor", ""))
 
     def subscribe(self, options: SubscribeOptions, handler: Callable[[Delivery], object], stop: threading.Event | None = None) -> None:

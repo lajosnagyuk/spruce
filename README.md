@@ -13,6 +13,7 @@ It provides opaque binary messages over HTTPS, N producers and consumers, broadc
 - Reconnecting consumer groups skip acknowledged messages while their bounded in-memory checkpoints and messages remain cached.
 - Duplicate delivery is expected. First-party clients provide bounded client-side deduplication.
 - Payloads are opaque bytes. Spruce does not inspect schemas or formats.
+- First-party SDKs can adaptively gzip payloads of at least 1 KiB. Compression is retained through caching, replication, replay, and delivery, and is used only when it saves at least 10% and 128 bytes. Go also exposes experimental `zstd`; use it only when every consumer supports that codec.
 
 These are deliberate constraints, not missing features. They remove disks, consensus, leaders, partition management, and database operations from the hot path. See [ARCHITECTURE.md](ARCHITECTURE.md) for the decisions and consequences.
 

@@ -6,6 +6,7 @@ using Spruce;
 var failures = new List<string>();
 await Run("invalid batch", RejectsInvalidBatch, failures);
 await Run("batch v2 per-entry keys", BatchV2PerEntryKeys, failures);
+await Run("adaptive gzip wire", AdaptiveGzipWire, failures);
 await Run("batcher coalesces keys and skips queued cancellation", BatcherKeysAndCancellation, failures);
 await Run("bearer token", SendsBearerToken, failures);
 await Run("permanent subscription error", SurfacesPermanentSubscriptionErrors, failures);
@@ -50,6 +51,21 @@ static async Task BatchV2PerEntryKeys()
     await client.PublishBatchAsync("t", [new BatchEntry(new byte[] { 1 }, "a"), new BatchEntry(new byte[] { 2 }, "b")]);
     Assert(version == "2", "batch v2 header missing");
     Assert(wire is not null && wire.SequenceEqual(new byte[] { 0,1,(byte)'a',0,0,0,1,1, 0,1,(byte)'b',0,0,0,1,2 }), "unexpected batch v2 wire");
+}
+
+static async Task AdaptiveGzipWire()
+{
+    byte[]? wire = null;
+    var client = new SpruceClient("https://spruce.invalid", new HttpClient(new StubHandler(request =>
+    {
+        wire = request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+        return Accepted();
+    })));
+    var payload = Encoding.UTF8.GetBytes(string.Concat(Enumerable.Repeat("{\"event\":\"workspace.updated\",\"status\":\"ready\"}", 4096)));
+    await client.PublishAsync("t", payload, new(Compression: "gzip"));
+    Assert(wire is not null && wire.Length < payload.Length / 2, "gzip did not materially reduce the wire payload");
+    Assert(wire!.AsSpan(0, 8).SequenceEqual(new byte[] { 0x89, (byte)'S', (byte)'P', (byte)'R', (byte)'U', (byte)'C', (byte)'E', 0x01 }), "compression envelope magic missing");
+    await Expect<ArgumentException>(() => client.PublishAsync("t", payload, new(Compression: "zstd")));
 }
 
 static async Task BatcherKeysAndCancellation()

@@ -190,3 +190,28 @@ Full three-broker rolling replacements lost 24-62 of 480 expected logical delive
 (5-12.9%) while publishes continued across repeated runs. This is an explicit
 non-durable maintenance observation, not a portable SLA; pause publishers when
 maintenance loss is unacceptable.
+
+## Adaptive payload compression
+
+An isolated three-broker K3s comparison used eight topics, 16 publishers, and payloads
+of 4 KiB, 64 KiB, and 900 KiB containing repetitive JSON-shaped data. The offered rate
+ramped through 100, 250, and 400 messages/second. Brokers were restarted before each
+60-second case. Every case completed without missing, duplicate, or invalid payloads,
+delivery drops, redeliveries, or replication drops.
+
+| Codec | Accepted | Logical GiB | Publish p50/p95/p99 | Cache/messages per broker |
+|---|---:|---:|---:|---:|
+| off | 13,951 | 4.29 | 6.7 / 29.3 / 53.2 ms | ~66.3 MiB / 196-197 |
+| gzip fastest | 14,912 | 4.59 | 1.2 / 4.0 / 12.9 ms | 39.3 MiB / 14,912 |
+| zstd fastest | 14,802 | 4.55 | 1.9 / 11.9 / 27.3 ms | 4.7 MiB / 14,802 |
+
+The first codec run constructed encoder state per message. Pooling that state changed a
+subsequent identical 30-second comparison to gzip p50/p95/p99 of 0.89/2.58/6.12 ms and
+zstd 0.54/1.34/3.01 ms. Sampled producer CPU was 323m for gzip and 395m for zstd;
+producer memory was 17 MiB and 56 MiB respectively. Broker and gateway CPU decreased
+substantially for both codecs because they handled fewer wire bytes.
+
+These deliberately compressible payloads represent an upper-bound benefit, not a
+portable claim for arbitrary events. Adaptive mode skips payloads below 1 KiB and keeps
+the original bytes unless compression saves at least 10% and 128 bytes. Incompressible
+payloads therefore preserve wire/cache size but still pay the attempted codec CPU cost.
