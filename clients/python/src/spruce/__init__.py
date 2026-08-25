@@ -7,6 +7,7 @@ import io
 import json
 import queue
 import random
+import secrets
 import ssl
 import struct
 import threading
@@ -150,6 +151,7 @@ class SubscribeOptions:
     concurrency: int = 16
     max_payload_bytes: int = MAX_MESSAGE_BYTES
     drain_timeout: float = 1.0
+    member_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -335,6 +337,8 @@ class Client:
         if options.since: raise ValueError("timestamp subscription cursors are no longer supported; use cursor")
         if not 1 <= options.concurrency <= 1024 or not 1 <= options.max_payload_bytes <= 64 << 20: raise ValueError("invalid subscription limits")
         stop = stop or threading.Event(); cursor, backoff = options.cursor, 0.05
+        member_id = options.member_id or secrets.token_hex(16)
+        if len(member_id.encode("utf-8")) > 255: raise ValueError("member_id exceeds 255 UTF-8 bytes")
         acks, nacks = _AckBatcher(self, "ack"), _AckBatcher(self, "nack")
         workers = ThreadPoolExecutor(max_workers=options.concurrency)
         try:
@@ -342,6 +346,7 @@ class Client:
             retry_after = 0.0
             query = {"topic": options.topic};
             if options.group: query["group"] = options.group
+            query["member"] = member_id
             if cursor: query["cursor"] = cursor
             futures: list[tuple[int, object]] = []; sequence, next_progress, completed = 0, 1, {}
             completion_capacity = options.concurrency * 2

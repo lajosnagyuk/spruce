@@ -79,7 +79,7 @@ config:
   publishAdmissionWait: 100ms
   deliveryLagLimit: 1s
   goMemoryLimit: 176MiB
-  memorySafetyMarginBytes: "83886080"
+  memorySafetyMarginBytes: "150994944"
 
 podAnnotations: {}
 podLabels: {}
@@ -98,9 +98,9 @@ securityContext:
 resources:
   requests:
     cpu: 25m
-    memory: 96Mi
+    memory: 224Mi
   limits:
-    memory: 256Mi
+    memory: 320Mi
 
 nodeSelector: {}
 tolerations: []

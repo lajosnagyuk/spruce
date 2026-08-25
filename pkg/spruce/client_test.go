@@ -394,3 +394,34 @@ func TestHandlerPanicReturnsErrorInsteadOfCrashing(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 }
+
+func TestSubscriptionMemberIdentityBoundsAndReconnectStability(t *testing.T) {
+	if got, err := subscriptionMemberID(strings.Repeat("x", 255)); err != nil || len(got) != 255 {
+		t.Fatalf("255-byte identity: got=%q err=%v", got, err)
+	}
+	if _, err := subscriptionMemberID(strings.Repeat("é", 128)); err == nil {
+		t.Fatal("256-byte UTF-8 identity was accepted")
+	}
+	generated, err := subscriptionMemberID("")
+	if err != nil || len(generated) != 32 {
+		t.Fatalf("generated identity=%q err=%v", generated, err)
+	}
+	var mu sync.Mutex
+	var members []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		members = append(members, r.URL.Query().Get("member"))
+		attempt := len(members)
+		mu.Unlock()
+		if attempt < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer server.Close()
+	err = New(server.URL).Subscribe(context.Background(), SubscribeOptions{Topic: "t"}, func(context.Context, Delivery) error { return nil })
+	if err == nil || len(members) != 3 || members[0] == "" || members[0] != members[1] || members[1] != members[2] {
+		t.Fatalf("members=%v err=%v", members, err)
+	}
+}

@@ -255,3 +255,32 @@ topic-local one-second delivery-lag admission, four independent producers comple
 was delivered exactly once with no transport, subscription, corruption, or expiry
 failure; one publish received the intended retryable overload response. This was a
 short saturation validation on the sandbox topology, not a production throughput SLA.
+
+## Key-affinity hot-topic pressure
+
+A three-broker K3s curve used one topic, four consumer-group members, 128 keys, 32
+unbatched HTTPS publishers, and compressible 4 KiB events. Requested load changed every
+25 seconds through 500, 1,500, 3,000, 5,000, 3,000, and 1,000 messages/second. The
+generator reached approximately 2,800 messages/second at its highest phase.
+
+With a 256 MiB container limit and cache accounting biased toward payload bytes, one
+broker reached 255 MiB RSS and was OOM-killed. Consumers then correctly failed closed
+with `cursor_expired` rather than skipping the replacement broker's uncertain history.
+Before termination, 249,979 unique deliveries had zero duplicates, corruption, or key
+ownership changes.
+
+The cache now reserves a conservative per-message structural allowance, the default pod
+limit is 320 MiB with 144 MiB explicitly reserved outside the 176 MiB Go soft limit,
+and SDK subscription attempts retain a client-lifetime affinity identity across HTTP
+reconnects. Repeating the same curve accepted and delivered all 279,116 messages with
+zero missing, duplicate, invalid, overload, publish, subscription, or key-movement
+result. Delivery p50/p95/p99 was 169/235/356 ms, peak single-broker CPU was 1.75 cores,
+peak sampled RSS was 211 MiB, and no broker restarted. These are sandbox observations,
+not portable capacity guarantees.
+
+A follow-up structural-overhead case removed the 4 KiB body and sent 188,997 tiny keyed
+messages over two minutes, maximizing retained message/index objects per logical byte.
+Every message was accepted and delivered exactly once with no invalid result, key move,
+cursor expiry, or restart. Container cgroup `memory.peak` was 13.4, 15.0, and 50.8 MiB
+across the three brokers; the topic owner recorded the highest value. This bounds the
+tested tiny-message shape but does not replace workload-specific capacity testing.

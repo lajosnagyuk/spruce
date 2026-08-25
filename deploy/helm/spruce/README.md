@@ -44,10 +44,10 @@ admits it: `kubectl label namespace ingress-nginx spruce.io/ingress-access=true`
 | `tls.existingSecret` | empty | TLS Secret with `tls.crt`, `tls.key`, and `ca.crt` |
 | `config.cacheBytes` | `67108864` | Per-broker payload and metadata cache budget |
 | `config.goMemoryLimit` | `176MiB` | Go runtime soft memory limit; must leave the safety margin below the pod limit |
-| `config.memorySafetyMarginBytes` | `83886080` | Space reserved for stacks, executable mappings, allocator overhead, TLS, and other non-heap memory |
+| `config.memorySafetyMarginBytes` | `150994944` | Space reserved for stacks, executable mappings, allocator overhead, TLS, and other non-heap memory |
 | `config.deliveryLagLimit` | `1s` | Oldest unacknowledged topic delivery age before new publishes receive retryable overload |
-| `resources.requests.memory` | `96Mi` | Broker memory request |
-| `resources.limits.memory` | `256Mi` | Broker memory hard limit |
+| `resources.requests.memory` | `224Mi` | Broker reservation, sized above the measured hot-topic working set |
+| `resources.limits.memory` | `320Mi` | Broker memory hard limit |
 | `topologySpreadConstraints` | `true` | Require brokers on distinct nodes; disable explicitly only when reduced failure isolation is acceptable |
 
 When `auth.existingSecret` is empty, Helm generates credentials and preserves them only

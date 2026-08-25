@@ -21,6 +21,7 @@ await Run("retry diagnostics and telemetry", RetryDiagnosticsTelemetry, failures
 await Run("explicit stream completion", ExplicitStreamCompletion, failures);
 await Run("key ordered subscription", KeyOrderedSubscription, failures);
 await Run("bounded ordered completion window", BoundedOrderedCompletionWindow, failures);
+await Run("subscription member identity validation", SubscriptionMemberIdentityValidation, failures);
 if (failures.Count > 0) throw new Exception(string.Join(Environment.NewLine, failures));
 Console.WriteLine("C# conformance passed");
 
@@ -37,6 +38,15 @@ static async Task RejectsInvalidBatch()
     var tooMany = Enumerable.Repeat<ReadOnlyMemory<byte>>(ReadOnlyMemory<byte>.Empty, 4097).ToArray();
     await Expect<ArgumentException>(() => client.PublishBatchAsync("t", tooMany));
     await Expect<ArgumentException>(() => client.PublishBatchAsync("t", [new byte[1]], new(Ack: "one-peer")));
+}
+
+static async Task SubscriptionMemberIdentityValidation()
+{
+    var client = new SpruceClient("http://spruce.invalid", new HttpClient(new StubHandler(_ => Accepted())));
+    await Expect<ArgumentException>(() => client.SubscribeAsync("t", "g", "", (_, _) => Task.CompletedTask));
+    await Expect<ArgumentException>(() => client.SubscribeAsync("t", "g", new string('é', 128), (_, _) => Task.CompletedTask));
+    using var cancelled = new CancellationTokenSource(); cancelled.Cancel();
+    await client.SubscribeAsync("t", "g", new string('x', 255), (_, _) => Task.CompletedTask, cancelled.Token);
 }
 
 static async Task BatchV2PerEntryKeys()
@@ -131,8 +141,10 @@ static async Task RetriesTransientSubscriptionErrors()
 {
     using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(2));
     var calls = 0;
-    var client = new SpruceClient("https://spruce.invalid", new HttpClient(new StubHandler(_ =>
+    var members = new List<string?>();
+    var client = new SpruceClient("https://spruce.invalid", new HttpClient(new StubHandler(request =>
     {
+        members.Add(System.Web.HttpUtility.ParseQueryString(request.RequestUri!.Query)["member"]);
         if (Interlocked.Increment(ref calls) == 1) return new(HttpStatusCode.ServiceUnavailable) { Content = new StringContent("{\"error\":\"unavailable\"}") };
         cancellation.Cancel();
         return new(HttpStatusCode.OK) { Content = new StreamContent(Stream.Null) };
@@ -140,6 +152,7 @@ static async Task RetriesTransientSubscriptionErrors()
     try { await client.SubscribeAsync("t", null, (_, _) => Task.CompletedTask, cancellation.Token); }
     catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
     Assert(calls >= 2, $"transient subscription response was not retried: {calls}");
+    Assert(members.Count >= 2 && !string.IsNullOrEmpty(members[0]) && members.All(member => member == members[0]), $"member identity changed across reconnect: {string.Join(',', members)}");
 }
 
 static async Task AckFailureCancellation()
