@@ -338,6 +338,7 @@ class Client:
         if not 1 <= options.concurrency <= 1024 or not 1 <= options.max_payload_bytes <= 64 << 20: raise ValueError("invalid subscription limits")
         stop = stop or threading.Event(); cursor, backoff = options.cursor, 0.05
         member_id = options.member_id or secrets.token_hex(16)
+        if len(member_id.encode("utf-8")) > 255: raise ValueError("member_id exceeds 255 UTF-8 bytes")
         acks, nacks = _AckBatcher(self, "ack"), _AckBatcher(self, "nack")
         workers = ThreadPoolExecutor(max_workers=options.concurrency)
         try:

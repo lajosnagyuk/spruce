@@ -2721,6 +2721,21 @@ func (b *Broker) addSubscriberLocked(s *subscriber) {
 	b.topicGroups[s.topic][s.group][s.id] = s
 }
 
+func (b *Broker) fenceAffinityMemberLocked(s *subscriber) {
+	if s.group == "" || s.affinityID == "" {
+		return
+	}
+	for _, existing := range b.topicGroups[s.topic][s.group] {
+		if existing.affinityID == s.affinityID {
+			existing.replaying = false
+			if existing.cancel != nil {
+				existing.cancel()
+			}
+			b.removeSubscriberLocked(existing)
+		}
+	}
+}
+
 func (b *Broker) removeSubscriberLocked(s *subscriber) {
 	s.detached = true
 	delete(b.subs, s.id)
@@ -2958,6 +2973,7 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 		replay = b.cache.replayLocked(topic, cursor)
 	}
 	b.mu.Lock()
+	b.fenceAffinityMemberLocked(s)
 	groupReplayOwner := group == "" || len(b.topicGroups[topic][group]) == 0
 	if !groupReplayOwner {
 		replay = replay[:0]

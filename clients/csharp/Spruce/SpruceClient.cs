@@ -113,7 +113,13 @@ public sealed partial class SpruceClient : IDisposable
         return (await response.Content.ReadFromJsonAsync<BatchResult>(timeout.Token))!;
     }
 
-    public async Task SubscribeAsync(string topic, string? group, Func<Delivery, CancellationToken, Task> handler, CancellationToken cancellationToken = default, int concurrency = 16, int maxPayloadBytes = 1024 * 1024, long since = 0, TimeSpan? drainTimeout = null, bool preserveKeyOrder = false, string? cursor = null, string? memberId = null)
+    public Task SubscribeAsync(string topic, string? group, Func<Delivery, CancellationToken, Task> handler, CancellationToken cancellationToken = default, int concurrency = 16, int maxPayloadBytes = 1024 * 1024, long since = 0, TimeSpan? drainTimeout = null, bool preserveKeyOrder = false, string? cursor = null)
+        => SubscribeCoreAsync(topic, group, Guid.NewGuid().ToString("N"), handler, cancellationToken, concurrency, maxPayloadBytes, since, drainTimeout, preserveKeyOrder, cursor);
+
+    public Task SubscribeAsync(string topic, string? group, string memberId, Func<Delivery, CancellationToken, Task> handler, CancellationToken cancellationToken = default, int concurrency = 16, int maxPayloadBytes = 1024 * 1024, long since = 0, TimeSpan? drainTimeout = null, bool preserveKeyOrder = false, string? cursor = null)
+        => SubscribeCoreAsync(topic, group, memberId, handler, cancellationToken, concurrency, maxPayloadBytes, since, drainTimeout, preserveKeyOrder, cursor);
+
+    private async Task SubscribeCoreAsync(string topic, string? group, string memberId, Func<Delivery, CancellationToken, Task> handler, CancellationToken cancellationToken, int concurrency, int maxPayloadBytes, long since, TimeSpan? drainTimeout, bool preserveKeyOrder, string? cursor)
     {
         if (string.IsNullOrWhiteSpace(topic)) throw new ArgumentException("Topic is required", nameof(topic));
         if (concurrency <= 0) concurrency = 16;
@@ -124,8 +130,7 @@ public sealed partial class SpruceClient : IDisposable
 		if (since < 0) throw new ArgumentOutOfRangeException(nameof(since));
 		if (since != 0 && cursor is not null) throw new ArgumentException("Specify either since or cursor, not both");
 		var legacyTimestampCursor = since != 0;
-		memberId ??= Guid.NewGuid().ToString("N");
-		if (memberId.Length > 255) throw new ArgumentException("Member ID exceeds 255 characters", nameof(memberId));
+		if (string.IsNullOrEmpty(memberId) || System.Text.Encoding.UTF8.GetByteCount(memberId) > 255) throw new ArgumentException("Member ID must contain 1 to 255 UTF-8 bytes", nameof(memberId));
         var backoff = TimeSpan.FromMilliseconds(50);
         while (!cancellationToken.IsCancellationRequested)
         {

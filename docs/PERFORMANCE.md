@@ -277,3 +277,10 @@ zero missing, duplicate, invalid, overload, publish, subscription, or key-moveme
 result. Delivery p50/p95/p99 was 169/235/356 ms, peak single-broker CPU was 1.75 cores,
 peak sampled RSS was 211 MiB, and no broker restarted. These are sandbox observations,
 not portable capacity guarantees.
+
+A follow-up structural-overhead case removed the 4 KiB body and sent 188,997 tiny keyed
+messages over two minutes, maximizing retained message/index objects per logical byte.
+Every message was accepted and delivered exactly once with no invalid result, key move,
+cursor expiry, or restart. Container cgroup `memory.peak` was 13.4, 15.0, and 50.8 MiB
+across the three brokers; the topic owner recorded the highest value. This bounds the
+tested tiny-message shape but does not replace workload-specific capacity testing.

@@ -448,13 +448,11 @@ func (c *Client) Subscribe(ctx context.Context, o SubscribeOptions, handler Hand
 		return errors.New("timestamp subscription cursors are no longer supported; use Cursor")
 	}
 	backoff := 50 * time.Millisecond
-	if o.MemberID == "" {
-		var id [16]byte
-		if _, err := cryptorand.Read(id[:]); err != nil {
-			return fmt.Errorf("generate subscription member ID: %w", err)
-		}
-		o.MemberID = hex.EncodeToString(id[:])
+	memberID, err := subscriptionMemberID(o.MemberID)
+	if err != nil {
+		return err
 	}
+	o.MemberID = memberID
 	cursor := o.Cursor
 	for ctx.Err() == nil {
 		o.Cursor = cursor
@@ -508,6 +506,20 @@ func (c *Client) Subscribe(ctx context.Context, o SubscribeOptions, handler Hand
 		}
 	}
 	return ctx.Err()
+}
+
+func subscriptionMemberID(explicit string) (string, error) {
+	if len(explicit) > 255 {
+		return "", errors.New("subscription member ID exceeds 255 UTF-8 bytes")
+	}
+	if explicit != "" {
+		return explicit, nil
+	}
+	var id [16]byte
+	if _, err := cryptorand.Read(id[:]); err != nil {
+		return "", fmt.Errorf("generate subscription member ID: %w", err)
+	}
+	return hex.EncodeToString(id[:]), nil
 }
 
 var ErrHandlerDrainTimeout = errors.New("spruce: handlers did not stop before drain timeout")

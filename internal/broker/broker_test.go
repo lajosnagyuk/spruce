@@ -1234,8 +1234,8 @@ func TestConsumerGroupKeyAffinitySurvivesRedelivery(t *testing.T) {
 func TestConsumerGroupAffinitySurvivesStreamReconnect(t *testing.T) {
 	b := New(DefaultConfig())
 	defer b.Close()
-	a := &subscriber{id: "stream-a-1", affinityID: "member-a", topic: "events", group: "workers", ch: make(chan Delivery, 2)}
-	c := &subscriber{id: "stream-b", affinityID: "member-b", topic: "events", group: "workers", ch: make(chan Delivery, 2)}
+	a := &subscriber{id: "stream-a-1", affinityID: "member-a", topic: "events", group: "workers", ch: make(chan Delivery, 2), cancel: func() {}}
+	c := &subscriber{id: "stream-b", affinityID: "member-b", topic: "events", group: "workers", ch: make(chan Delivery, 2), cancel: func() {}}
 	b.mu.Lock()
 	b.addSubscriberLocked(a)
 	b.addSubscriberLocked(c)
@@ -1248,11 +1248,14 @@ func TestConsumerGroupAffinitySurvivesStreamReconnect(t *testing.T) {
 	}
 	delivery := <-owner.ch
 	b.removeAcks([]string{delivery.DeliveryID})
-	reconnected := &subscriber{id: owner.id + "-replacement", affinityID: owner.affinityID, topic: owner.topic, group: owner.group, ch: make(chan Delivery, 2)}
+	reconnected := &subscriber{id: owner.id + "-replacement", affinityID: owner.affinityID, topic: owner.topic, group: owner.group, ch: make(chan Delivery, 2), cancel: func() {}}
 	b.mu.Lock()
-	b.removeSubscriberLocked(owner)
+	b.fenceAffinityMemberLocked(reconnected)
 	b.addSubscriberLocked(reconnected)
 	b.mu.Unlock()
+	if !owner.detached {
+		t.Fatal("replacement did not fence the prior stream")
+	}
 	b.deliver(&Message{ID: "second", Topic: "events", Key: "workspace", Payload: []byte("x"), ExpiresAt: first.ExpiresAt}, "workers", 1)
 	if len(reconnected.ch) != 1 || len(other.ch) != 0 {
 		t.Fatalf("reconnected=%d other=%d", len(reconnected.ch), len(other.ch))

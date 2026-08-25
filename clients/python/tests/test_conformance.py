@@ -169,6 +169,15 @@ class Conformance(unittest.TestCase):
         self.assertGreaterEqual(len(Handler.stream_paths),2)
         query=urllib.parse.parse_qs(urllib.parse.urlsplit(Handler.stream_paths[1]).query)
         self.assertEqual(query.get("cursor"), ["cursor-0"])
+        first_query=urllib.parse.parse_qs(urllib.parse.urlsplit(Handler.stream_paths[0]).query)
+        self.assertEqual(first_query.get("member"), query.get("member"))
+
+    def test_subscription_member_identity_utf8_bound(self):
+        spruce=__import__('spruce')
+        stop=threading.Event(); stop.set()
+        self.client.subscribe(spruce.SubscribeOptions("stream", member_id="x"*255), lambda _: None, stop)
+        with self.assertRaises(ValueError):
+            self.client.subscribe(spruce.SubscribeOptions("stream", member_id="é"*128), lambda _: None, stop)
 
     def test_stuck_early_handler_bounds_ordered_completion_window(self):
         stop=threading.Event(); release=threading.Event(); Handler.stream_count=32
