@@ -20,7 +20,8 @@ import (
 )
 
 func TestCacheEvictsOldestWithinBound(t *testing.T) {
-	c := newCache(300)
+	template := &Message{ID: "a", Topic: "t", Payload: make([]byte, 80)}
+	c := newCache(messageSize(template) * 2)
 	for i := 0; i < 10; i++ {
 		m := &Message{ID: string(rune('a' + i)), Topic: "t", Payload: make([]byte, 80), ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
 		if _, e := c.put(m, time.Now().UnixMilli()); e != nil {
@@ -1230,6 +1231,45 @@ func TestConsumerGroupKeyAffinitySurvivesRedelivery(t *testing.T) {
 	}
 }
 
+func TestConsumerGroupAffinitySurvivesStreamReconnect(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	a := &subscriber{id: "stream-a-1", affinityID: "member-a", topic: "events", group: "workers", ch: make(chan Delivery, 2)}
+	c := &subscriber{id: "stream-b", affinityID: "member-b", topic: "events", group: "workers", ch: make(chan Delivery, 2)}
+	b.mu.Lock()
+	b.addSubscriberLocked(a)
+	b.addSubscriberLocked(c)
+	b.mu.Unlock()
+	first := &Message{ID: "first", Topic: "events", Key: "workspace", Payload: []byte("x"), ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
+	b.deliver(first, "workers", 1)
+	owner, other := a, c
+	if len(c.ch) == 1 {
+		owner, other = c, a
+	}
+	delivery := <-owner.ch
+	b.removeAcks([]string{delivery.DeliveryID})
+	reconnected := &subscriber{id: owner.id + "-replacement", affinityID: owner.affinityID, topic: owner.topic, group: owner.group, ch: make(chan Delivery, 2)}
+	b.mu.Lock()
+	b.removeSubscriberLocked(owner)
+	b.addSubscriberLocked(reconnected)
+	b.mu.Unlock()
+	b.deliver(&Message{ID: "second", Topic: "events", Key: "workspace", Payload: []byte("x"), ExpiresAt: first.ExpiresAt}, "workers", 1)
+	if len(reconnected.ch) != 1 || len(other.ch) != 0 {
+		t.Fatalf("reconnected=%d other=%d", len(reconnected.ch), len(other.ch))
+	}
+}
+
+func TestSubscriptionRejectsOversizedMemberIdentity(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	r := httptest.NewRequest(http.MethodGet, "/v1/subscriptions/stream?topic=t&member="+strings.Repeat("x", 256), nil)
+	w := httptest.NewRecorder()
+	b.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "invalid_member") {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestInvalidSinceIsRejected(t *testing.T) {
 	b := New(DefaultConfig())
 	defer b.Close()
@@ -1279,7 +1319,7 @@ func TestLegacyTimestampSinceReplaysCleanTopic(t *testing.T) {
 
 func TestLegacyTimestampSinceFailsClosedAfterTopicLoss(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.CacheBytes = 300
+	cfg.CacheBytes = messageSize(&Message{ID: "loss-0", Topic: "t", Payload: make([]byte, 100)}) * 2
 	b := New(cfg)
 	defer b.Close()
 	now := time.Now()
@@ -1449,7 +1489,7 @@ func TestReplicationPressureAllowsHealthyPeer(t *testing.T) {
 
 func TestStreamRejectsCursorBehindEvictionWatermark(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.CacheBytes = 300
+	cfg.CacheBytes = messageSize(&Message{ID: "second", Topic: "t", Payload: make([]byte, 100)})
 	b := New(cfg)
 	defer b.Close()
 	now := time.Now()

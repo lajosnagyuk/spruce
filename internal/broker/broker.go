@@ -290,7 +290,10 @@ func messageSize(m *Message) int64 {
 	if m.accountedSize > 0 {
 		return m.accountedSize
 	}
-	n := int64(96 + len(m.ID) + len(m.Topic) + len(m.Key) + len(m.Payload))
+	// CacheBytes is an RSS safety budget, not just a payload limit. Include a
+	// conservative allowance for map/list/interface and allocator-class overhead
+	// so a large population of tiny messages cannot outrun the cgroup boundary.
+	n := int64(256 + len(m.ID) + len(m.Topic) + len(m.Key) + len(m.Payload))
 	for k, v := range m.Headers {
 		n += int64(len(k) + len(v) + 8)
 	}
@@ -629,6 +632,7 @@ func (c *cache) get(id string) *Message {
 
 type subscriber struct {
 	id, topic, group string
+	affinityID       string
 	ch               chan Delivery
 	inflightBytes    int64
 	cancel           context.CancelFunc
@@ -2606,6 +2610,13 @@ func deliveryAffinity(m *Message) string {
 	return m.ID
 }
 
+func subscriberAffinity(s *subscriber) string {
+	if s.affinityID != "" {
+		return s.affinityID
+	}
+	return s.id
+}
+
 func (b *Broker) deliver(m *Message, onlyGroup string, attempt int) {
 	b.mu.Lock()
 	if len(b.topicBroadcast[m.Topic]) == 0 && len(b.topicGroups[m.Topic]) == 0 {
@@ -2638,7 +2649,7 @@ func (b *Broker) deliver(m *Message, onlyGroup string, attempt int) {
 		var selected *subscriber
 		var selectedScore uint64
 		for _, candidate := range indexed {
-			score := hashValue(m.Topic, group, affinity, candidate.id)
+			score := hashValue(m.Topic, group, affinity, subscriberAffinity(candidate))
 			if selected == nil || score > selectedScore {
 				selected, selectedScore = candidate, score
 			}
@@ -2656,7 +2667,7 @@ func (b *Broker) deliver(m *Message, onlyGroup string, attempt int) {
 		}
 		for _, candidate := range indexed {
 			if !candidate.replaying {
-				candidates = append(candidates, deliveryCandidate{subscriber: candidate, group: group, score: hashValue(m.Topic, group, affinity, candidate.id)})
+				candidates = append(candidates, deliveryCandidate{subscriber: candidate, group: group, score: hashValue(m.Topic, group, affinity, subscriberAffinity(candidate))})
 			}
 		}
 	}
@@ -2889,12 +2900,17 @@ func appendJSONField(out []byte, name, value string, comma bool) []byte {
 
 func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 	topic, group := r.URL.Query().Get("topic"), r.URL.Query().Get("group")
+	member := r.URL.Query().Get("member")
 	if !validTopic(topic) {
 		problem(w, 400, "invalid_topic")
 		return
 	}
 	if len(group) > 255 {
 		problem(w, 400, "invalid_group")
+		return
+	}
+	if len(member) > 255 {
+		problem(w, 400, "invalid_member")
 		return
 	}
 	legacy := r.URL.Query().Has("since")
@@ -2923,7 +2939,7 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 	}
 	streamCtx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	s := &subscriber{id: b.nextID(), topic: topic, group: group, ch: make(chan Delivery, 256), cancel: cancel, replaying: true}
+	s := &subscriber{id: b.nextID(), affinityID: member, topic: topic, group: group, ch: make(chan Delivery, 256), cancel: cancel, replaying: true}
 	b.cache.mu.Lock()
 	b.cache.expireLocked(time.Now().UnixMilli())
 	frontier := b.cache.frontiers[topic]

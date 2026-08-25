@@ -113,7 +113,7 @@ public sealed partial class SpruceClient : IDisposable
         return (await response.Content.ReadFromJsonAsync<BatchResult>(timeout.Token))!;
     }
 
-    public async Task SubscribeAsync(string topic, string? group, Func<Delivery, CancellationToken, Task> handler, CancellationToken cancellationToken = default, int concurrency = 16, int maxPayloadBytes = 1024 * 1024, long since = 0, TimeSpan? drainTimeout = null, bool preserveKeyOrder = false, string? cursor = null)
+    public async Task SubscribeAsync(string topic, string? group, Func<Delivery, CancellationToken, Task> handler, CancellationToken cancellationToken = default, int concurrency = 16, int maxPayloadBytes = 1024 * 1024, long since = 0, TimeSpan? drainTimeout = null, bool preserveKeyOrder = false, string? cursor = null, string? memberId = null)
     {
         if (string.IsNullOrWhiteSpace(topic)) throw new ArgumentException("Topic is required", nameof(topic));
         if (concurrency <= 0) concurrency = 16;
@@ -124,6 +124,8 @@ public sealed partial class SpruceClient : IDisposable
 		if (since < 0) throw new ArgumentOutOfRangeException(nameof(since));
 		if (since != 0 && cursor is not null) throw new ArgumentException("Specify either since or cursor, not both");
 		var legacyTimestampCursor = since != 0;
+		memberId ??= Guid.NewGuid().ToString("N");
+		if (memberId.Length > 255) throw new ArgumentException("Member ID exceeds 255 characters", nameof(memberId));
         var backoff = TimeSpan.FromMilliseconds(50);
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -132,6 +134,7 @@ public sealed partial class SpruceClient : IDisposable
 				var connectedAt = DateTime.UtcNow;
                 var uri = $"{_baseUrl}/v1/subscriptions/stream?topic={Uri.EscapeDataString(topic)}" +
                     (group is null ? "" : $"&group={Uri.EscapeDataString(group)}") +
+                    $"&member={Uri.EscapeDataString(memberId)}" +
                     (legacyTimestampCursor ? $"&since={since}" : cursor is null ? "" : $"&cursor={Uri.EscapeDataString(cursor)}");
                 using var request = new HttpRequestMessage(HttpMethod.Get, uri);
                 Authorize(request);

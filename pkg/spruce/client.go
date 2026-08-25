@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -349,6 +351,7 @@ func (c *Client) PublishBatchEntries(ctx context.Context, topic string, entries 
 
 type SubscribeOptions struct {
 	Topic, Group    string
+	MemberID        string
 	Cursor          string
 	Since           int64 // Deprecated: timestamp cursors are rejected.
 	Concurrency     int
@@ -445,6 +448,13 @@ func (c *Client) Subscribe(ctx context.Context, o SubscribeOptions, handler Hand
 		return errors.New("timestamp subscription cursors are no longer supported; use Cursor")
 	}
 	backoff := 50 * time.Millisecond
+	if o.MemberID == "" {
+		var id [16]byte
+		if _, err := cryptorand.Read(id[:]); err != nil {
+			return fmt.Errorf("generate subscription member ID: %w", err)
+		}
+		o.MemberID = hex.EncodeToString(id[:])
+	}
 	cursor := o.Cursor
 	for ctx.Err() == nil {
 		o.Cursor = cursor
@@ -624,6 +634,9 @@ func (c *Client) subscribeOnce(ctx context.Context, o SubscribeOptions, handler 
 	v := url.Values{"topic": []string{o.Topic}}
 	if o.Group != "" {
 		v.Set("group", o.Group)
+	}
+	if o.MemberID != "" {
+		v.Set("member", o.MemberID)
 	}
 	if o.Cursor != "" {
 		v.Set("cursor", o.Cursor)
