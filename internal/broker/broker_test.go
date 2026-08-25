@@ -1161,13 +1161,72 @@ func TestGroupFallsBackFromSaturatedPreferredMember(t *testing.T) {
 	b.addSubscriberLocked(c)
 	m := &Message{ID: "message", Topic: "t", Payload: []byte("x"), ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
 	preferred, other := a, c
-	if hashValue(m.ID, c.id) > hashValue(m.ID, a.id) {
+	if hashValue(m.Topic, a.group, deliveryAffinity(m), c.id) > hashValue(m.Topic, a.group, deliveryAffinity(m), a.id) {
 		preferred, other = c, a
 	}
 	preferred.ch <- Delivery{}
 	b.deliver(m, "\x00", 1)
 	if len(other.ch) != 1 {
 		t.Fatal("healthy group member did not receive fallback delivery")
+	}
+}
+
+func TestConsumerGroupKeepsKeyAffinity(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	a := &subscriber{id: "consumer-a", topic: "events", group: "workers", ch: make(chan Delivery, 32)}
+	c := &subscriber{id: "consumer-b", topic: "events", group: "workers", ch: make(chan Delivery, 32)}
+	b.mu.Lock()
+	b.addSubscriberLocked(a)
+	b.addSubscriberLocked(c)
+	b.mu.Unlock()
+
+	owners := make(map[string]string)
+	for i := range 24 {
+		key := []string{"workspace-a", "workspace-b", "workspace-c"}[i%3]
+		m := &Message{ID: fmt.Sprintf("message-%d", i), Topic: "events", Key: key, Payload: []byte("x"), ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
+		b.deliver(m, "workers", 1)
+		select {
+		case d := <-a.ch:
+			if previous := owners[d.Key]; previous != "" && previous != a.id {
+				t.Fatalf("key %q moved from %s to %s", d.Key, previous, a.id)
+			}
+			owners[d.Key] = a.id
+		case d := <-c.ch:
+			if previous := owners[d.Key]; previous != "" && previous != c.id {
+				t.Fatalf("key %q moved from %s to %s", d.Key, previous, c.id)
+			}
+			owners[d.Key] = c.id
+		default:
+			t.Fatalf("message %d was not delivered", i)
+		}
+	}
+}
+
+func TestConsumerGroupKeyAffinitySurvivesRedelivery(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	a := &subscriber{id: "consumer-a", topic: "events", group: "workers", ch: make(chan Delivery, 2)}
+	c := &subscriber{id: "consumer-b", topic: "events", group: "workers", ch: make(chan Delivery, 2)}
+	b.mu.Lock()
+	b.addSubscriberLocked(a)
+	b.addSubscriberLocked(c)
+	b.mu.Unlock()
+	m := &Message{ID: "message", Topic: "events", Key: "workspace", Payload: []byte("x"), ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
+	b.deliver(m, "workers", 1)
+	owner := a
+	if len(c.ch) == 1 {
+		owner = c
+	}
+	first := <-owner.ch
+	b.applyNacks([]string{first.DeliveryID})
+	select {
+	case retry := <-owner.ch:
+		if retry.Attempt != 2 {
+			t.Fatal("redelivery attempt was not incremented")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("redelivery moved away from the key owner")
 	}
 }
 

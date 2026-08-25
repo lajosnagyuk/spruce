@@ -2599,6 +2599,13 @@ func hashValue(parts ...string) uint64 {
 	return h
 }
 
+func deliveryAffinity(m *Message) string {
+	if m.Key != "" {
+		return m.Key
+	}
+	return m.ID
+}
+
 func (b *Broker) deliver(m *Message, onlyGroup string, attempt int) {
 	b.mu.Lock()
 	if len(b.topicBroadcast[m.Topic]) == 0 && len(b.topicGroups[m.Topic]) == 0 {
@@ -2627,10 +2634,11 @@ func (b *Broker) deliver(m *Message, onlyGroup string, attempt int) {
 		if b.checkpointActiveLocked(m.Topic, group, m.ID, now) {
 			continue
 		}
+		affinity := deliveryAffinity(m)
 		var selected *subscriber
 		var selectedScore uint64
 		for _, candidate := range indexed {
-			score := hashValue(m.ID, candidate.id)
+			score := hashValue(m.Topic, group, affinity, candidate.id)
 			if selected == nil || score > selectedScore {
 				selected, selectedScore = candidate, score
 			}
@@ -2648,7 +2656,7 @@ func (b *Broker) deliver(m *Message, onlyGroup string, attempt int) {
 		}
 		for _, candidate := range indexed {
 			if !candidate.replaying {
-				candidates = append(candidates, deliveryCandidate{subscriber: candidate, group: group, score: hashValue(m.ID, candidate.id)})
+				candidates = append(candidates, deliveryCandidate{subscriber: candidate, group: group, score: hashValue(m.Topic, group, affinity, candidate.id)})
 			}
 		}
 	}

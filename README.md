@@ -9,7 +9,11 @@ It provides opaque binary messages over HTTPS, N producers and consumers, broadc
 - Delivery is at least once while a message remains in a replica's bounded cache.
 - Messages are not persisted. Restarting every replica can lose all cached messages.
 - Group ACK checkpoints are propagated and bootstrapped between replicas on a best-effort basis; NACK retry remains best effort.
-- Consumer groups deliver to one healthy member. Ungrouped subscribers receive broadcasts.
+- Consumer groups deliver to one healthy member. Keyed messages use rendezvous hashing so
+  the same key stays with the same member while group membership and owner capacity remain
+  stable; membership changes deterministically remap only part of the key space. A saturated
+  owner may fall back to another healthy member rather than block the group. Ungrouped
+  subscribers receive broadcasts.
 - Reconnecting consumer groups skip acknowledged messages while their bounded in-memory checkpoints and messages remain cached.
 - Duplicate delivery is expected. First-party clients provide bounded client-side deduplication.
 - Payloads are opaque bytes. Spruce does not inspect schemas or formats.
@@ -105,7 +109,7 @@ is transparently decoded under the subscriber's message-size limit.
 
 ## Kubernetes
 
-The Helm chart deploys one to many interchangeable brokers plus a tiny stateless gateway. Every broker can publish, stream, replay, ACK, and NACK; there is no leader or quorum. The gateway consistently hashes streaming consumers by topic and group so all members of a consumer group reach the same broker, while publishes remain load-balanced.
+The Helm chart deploys one to many interchangeable brokers plus a tiny stateless gateway. Every broker can publish, stream, replay, ACK, and NACK; there is no leader or quorum. The gateway consistently hashes publishes and streaming consumers by topic so a topic's ordinary live-delivery decisions remain local to one broker; replicas still receive bounded asynchronous copies.
 
 Create runtime credentials and TLS material outside source control, then install with an
 Ingress (or service mesh) terminating client TLS before the HTTP gateway:
