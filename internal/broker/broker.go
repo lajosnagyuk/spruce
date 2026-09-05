@@ -134,6 +134,7 @@ type cache struct {
 	reorderLimit    int
 	bytes           int64
 	maxBytes        int64
+	rejectPressure  bool
 	evicted         atomic.Uint64
 	expired         atomic.Uint64
 }
@@ -320,6 +321,9 @@ func (c *cache) insertLocked(m *Message) (bool, error) {
 	sz := messageSize(m)
 	if sz > c.maxBytes {
 		return false, errors.New("message exceeds cache capacity")
+	}
+	if c.rejectPressure && c.bytes+sz > c.maxBytes {
+		return false, errRetentionCapacity
 	}
 	for c.bytes+sz > c.maxBytes && c.orderHead < len(c.order) {
 		c.dropOldestLocked()
@@ -876,6 +880,7 @@ type idempotencyEntry struct {
 type idempotencyOrderEntry struct{ key, id string }
 
 type Metrics struct {
+	GroupExpired                                                                                      atomic.Uint64
 	Published, PublishBytes, Rejected, OverloadRejected, CursorExpired, Replicated, ReplicationErrors atomic.Uint64
 	ReplicationDropped, ReplicationPressureRejected, DeliveryPressureRejected                         atomic.Uint64
 	AckActionDropped, NackActionDropped                                                               atomic.Uint64
@@ -898,6 +903,9 @@ type Broker struct {
 	subs                  map[string]*subscriber
 	topicBroadcast        map[string]map[string]*subscriber
 	topicGroups           map[string]map[string]map[string]*subscriber
+	groupWork             map[checkpointScope]*groupWorkState
+	groupWake             chan struct{}
+	groupMemoryBytes      int64
 	pending               map[string]*pending
 	topicPending          map[string]*topicPendingState
 	pendingBytes          int64
@@ -1027,6 +1035,9 @@ func New(cfg Config) *Broker {
 		topicBroadcast: make(map[string]map[string]*subscriber), topicGroups: make(map[string]map[string]map[string]*subscriber),
 		pending: make(map[string]*pending), topicPending: make(map[string]*topicPendingState), idempotency: make(map[string]*idempotencyEntry), checkpoints: make(map[checkpointScope]map[string]int64), stop: make(chan struct{}),
 		requestSlots: make(chan struct{}, cfg.MaxConcurrentRequests), streamSlots: make(chan struct{}, cfg.MaxStreams), digestSlot: make(chan struct{}, 1), replicationFreed: make(chan struct{}, 1)}
+	b.cache.rejectPressure = true
+	b.groupWork = make(map[checkpointScope]*groupWorkState)
+	b.groupWake = make(chan struct{}, 1)
 	b.internalSlots = make(chan struct{}, cfg.MaxInternalRequests)
 	if _, err := rand.Read(b.boot[:]); err != nil {
 		panic("spruce: generate boot identity: " + err.Error())
@@ -1049,6 +1060,7 @@ func New(cfg Config) *Broker {
 		go b.actionLoop(p, "nack", p.nacks)
 	}
 	go b.maintenance()
+	go b.groupLoop()
 	return b
 }
 
@@ -1386,6 +1398,7 @@ func (b *Broker) publishBatch(w http.ResponseWriter, r *http.Request) {
 			problem(w, 507, "cache_capacity")
 			return
 		}
+
 		messages = append(messages, m)
 		ids = append(ids, m.ID)
 	}
@@ -1401,7 +1414,12 @@ func (b *Broker) publishBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := b.acceptBatch(messages); err != nil {
 		b.releaseReplicationReservation(reservedPeer, replicationBytes)
-		problem(w, 507, "cache_capacity")
+		if errors.Is(err, errRetentionCapacity) {
+			w.Header().Set("Retry-After", "1")
+			problem(w, 429, "retention_capacity")
+		} else {
+			problem(w, 507, "cache_capacity")
+		}
 		return
 	}
 	for _, m := range messages {
@@ -1680,7 +1698,12 @@ func (b *Broker) publish(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, errIdempotencyConflict) {
 			problem(w, 409, "idempotency_conflict")
 		} else {
-			problem(w, 507, "cache_capacity")
+			if errors.Is(err, errRetentionCapacity) {
+				w.Header().Set("Retry-After", "1")
+				problem(w, 429, "retention_capacity")
+			} else {
+				problem(w, 507, "cache_capacity")
+			}
 		}
 		return
 	}
@@ -1730,6 +1753,15 @@ func (b *Broker) acceptLocked(m *Message) (bool, error) {
 		b.metrics.Duplicate.Add(1)
 		return false, nil
 	}
+	if b.cache.bytes+messageSize(m) > b.cache.maxBytes {
+		return false, errRetentionCapacity
+	}
+	if m.Origin == "" && b.cache.topicSequences[m.Topic] == nil && len(b.cache.topicSequences) >= b.cache.frontierLimit {
+		return false, errors.New("topic sequence capacity")
+	}
+	if err := b.prepareGroupWork([]*Message{m}); err != nil {
+		return false, err
+	}
 	if m.Origin == "" {
 		state := b.cache.topicSequences[m.Topic]
 		if state == nil {
@@ -1777,6 +1809,18 @@ func (b *Broker) acceptBatch(messages []*Message) error {
 	if len(b.cache.topicSequences)+len(newTopics) > b.cache.frontierLimit {
 		return errors.New("topic sequence capacity")
 	}
+	var added int64
+	for _, m := range messages {
+		if b.cache.items[m.ID] == nil {
+			added += messageSize(m)
+		}
+	}
+	if b.cache.bytes+added > b.cache.maxBytes {
+		return errRetentionCapacity
+	}
+	if err := b.prepareGroupWork(messages); err != nil {
+		return err
+	}
 	for _, m := range messages {
 		if m.Origin == "" {
 			state := b.cache.topicSequences[m.Topic]
@@ -1817,6 +1861,15 @@ func (b *Broker) acceptReplicatedBatch(messages []*Message) error {
 			return errors.New("invalid replicated sequence")
 		}
 	}
+	var added int64
+	for _, m := range messages {
+		if b.cache.items[m.ID] == nil {
+			added += messageSize(m)
+		}
+	}
+	if b.cache.bytes+b.cache.reorderBytes+added > b.cache.maxBytes {
+		return errRetentionCapacity
+	}
 	sort.SliceStable(messages, func(i, j int) bool {
 		if messages[i].Origin == messages[j].Origin {
 			return messages[i].Sequence < messages[j].Sequence
@@ -1824,12 +1877,20 @@ func (b *Broker) acceptReplicatedBatch(messages []*Message) error {
 		return messages[i].Origin < messages[j].Origin
 	})
 	for _, m := range messages {
+		fromGap := false
 		through := b.cache.receivedThrough[m.Origin]
 		if m.Sequence <= through {
 			if _, exists := b.cache.items[m.ID]; exists {
 				b.metrics.Duplicate.Add(1)
 			}
-			continue
+			next := b.cache.reorder[m.Origin][through+1]
+			if next == nil {
+				continue
+			}
+			m = next
+			fromGap = true
+			delete(b.cache.reorder[m.Origin], m.Sequence)
+			b.cache.reorderBytes -= messageSize(m)
 		}
 		if m.Sequence > through+1 {
 			gaps := b.cache.reorder[m.Origin]
@@ -1852,6 +1913,17 @@ func (b *Broker) acceptReplicatedBatch(messages []*Message) error {
 			continue
 		}
 		for current := m; current != nil; {
+			if err := b.prepareGroupWork([]*Message{current}); err != nil {
+				if current != m || fromGap {
+					if b.cache.reorder[current.Origin] == nil {
+						b.cache.reorder[current.Origin] = make(map[uint64]*Message)
+					}
+					b.cache.reorder[current.Origin][current.Sequence] = current
+					b.cache.reorderBytes += messageSize(current)
+					b.cache.markUnsafeLocked(current.Topic, "gap:"+current.Origin, current.ExpiresAt)
+				}
+				return err
+			}
 			inserted, err := b.cache.insertLocked(current)
 			if err != nil {
 				return err
@@ -2717,7 +2789,12 @@ func (b *Broker) replicate(w http.ResponseWriter, r *http.Request) {
 		acceptErr = b.acceptBatch(live)
 	}
 	if acceptErr != nil {
-		problem(w, 507, "cache_capacity")
+		if errors.Is(acceptErr, errRetentionCapacity) {
+			w.Header().Set("Retry-After", "1")
+			problem(w, 429, "retention_capacity")
+		} else {
+			problem(w, 507, "cache_capacity")
+		}
 		return
 	}
 	w.WriteHeader(204)
@@ -2751,6 +2828,8 @@ func subscriberAffinity(s *subscriber) string {
 }
 
 func (b *Broker) deliver(m *Message, onlyGroup string, attempt int) {
+	_ = b.prepareGroupWork([]*Message{m}, onlyGroup)
+	b.dispatchGroupMessage(m, onlyGroup)
 	b.mu.Lock()
 	if len(b.topicBroadcast[m.Topic]) == 0 && len(b.topicGroups[m.Topic]) == 0 {
 		b.mu.Unlock()
@@ -2768,57 +2847,6 @@ func (b *Broker) deliver(m *Message, onlyGroup string, attempt int) {
 				continue
 			}
 			candidates = append(candidates, deliveryCandidate{subscriber: s})
-		}
-	}
-	now := time.Now().UnixMilli()
-	for group, indexed := range b.topicGroups[m.Topic] {
-		if onlyGroup != "" && group != onlyGroup {
-			continue
-		}
-		if b.checkpointActiveLocked(m.Topic, group, m.ID, now) {
-			continue
-		}
-		// While a group is recovering, all new work waits behind its replay.
-		// A newly joined live member must not bypass the replay owner.
-		var replayOwner *subscriber
-		for _, candidate := range indexed {
-			if candidate.replaying {
-				replayOwner = candidate
-				break
-			}
-		}
-		if replayOwner != nil {
-			if len(replayOwner.deferred) >= 256 {
-				replayOwner.cancel()
-			} else {
-				replayOwner.deferred = append(replayOwner.deferred, m.ID)
-			}
-			continue
-		}
-		affinity := deliveryAffinity(m)
-		var selected *subscriber
-		var selectedScore uint64
-		for _, candidate := range indexed {
-			score := hashValue(m.Topic, group, affinity, subscriberAffinity(candidate))
-			if selected == nil || score > selectedScore {
-				selected, selectedScore = candidate, score
-			}
-		}
-		if selected == nil {
-			continue
-		}
-		if selected.replaying {
-			if len(selected.deferred) >= 256 {
-				selected.cancel()
-				continue
-			}
-			selected.deferred = append(selected.deferred, m.ID)
-			continue
-		}
-		for _, candidate := range indexed {
-			if !candidate.replaying {
-				candidates = append(candidates, deliveryCandidate{subscriber: candidate, group: group, score: hashValue(m.Topic, group, affinity, subscriberAffinity(candidate))})
-			}
 		}
 	}
 	b.mu.Unlock()
@@ -2854,6 +2882,9 @@ func (b *Broker) deliver(m *Message, onlyGroup string, attempt int) {
 }
 
 func (b *Broker) addSubscriberLocked(s *subscriber) {
+	if s.group != "" {
+		b.registerGroupLocked(s.topic, s.group)
+	}
 	b.subs[s.id] = s
 	if s.group == "" {
 		if b.topicBroadcast[s.topic] == nil {
@@ -2945,58 +2976,32 @@ func (b *Broker) unlinkTopicPendingLocked(p *pending) {
 	}
 }
 
+// Grouped work uses byte admission and key completion gates. A slow key must
+// not impose the legacy topic-wide broadcast lag rejection on unrelated keys.
+func (b *Broker) broadcastDeliveryPressuredLocked(state *topicPendingState, now time.Time) bool {
+	if state == nil {
+		return false
+	}
+	for p := state.head; p != nil; p = p.topicNext {
+		if p.group == "" {
+			return now.Sub(p.deliveredAt) >= b.cfg.DeliveryLagLimit
+		}
+	}
+	return false
+}
+
 func (b *Broker) topicDeliveryPressured(topic string, now time.Time) bool {
 	b.mu.RLock()
 	state := b.topicPending[topic]
-	pressured := state != nil && state.head != nil && now.Sub(state.head.deliveredAt) >= b.cfg.DeliveryLagLimit
+	pressured := b.broadcastDeliveryPressuredLocked(state, now)
 	b.mu.RUnlock()
 	return pressured
 }
 
 func (b *Broker) sendDelivery(s *subscriber, m *Message, attempt int) bool {
-	deliveryID := b.nextID()
-	d := Delivery{DeliveryID: deliveryID, MessageID: m.ID, Topic: m.Topic, Key: m.Key, Headers: m.Headers, CreatedAt: m.CreatedAt, Attempt: attempt, Payload: m.Payload, origin: m.Origin, sequence: m.Sequence}
-	bytes := messageSize(m)
-	now := time.Now()
-	p := acquirePending()
-	*p = pending{deliveryID: deliveryID, message: m, attempt: attempt, group: s.group, subscriberID: s.id, expiresAt: m.ExpiresAt, bytes: bytes, deliveredAt: now, next: now.Add(b.cfg.AckDeadline)}
-	p.deadline = pendingDeadline{id: deliveryID, at: p.next}
 	b.mu.Lock()
-	if s.detached || b.pendingBytes+bytes > b.cfg.MaxInflightBytes || s.inflightBytes+bytes > b.cfg.MaxSubscriberInflightBytes {
-		b.mu.Unlock()
-		releasePending(p)
-		if s.cancel != nil {
-			s.cancel()
-		}
-		b.metrics.Dropped.Add(1)
-		return false
-	}
-	b.pending[deliveryID] = p
-	b.linkTopicPendingLocked(p)
-	b.pendingBytes += bytes
-	s.inflightBytes += bytes
-	heap.Push(&b.pendingDeadlines, &p.deadline)
-	select {
-	case s.ch <- d:
-		b.mu.Unlock()
-		b.metrics.Delivered.Add(1)
-		return true
-	default:
-		delete(b.pending, deliveryID)
-		b.unlinkTopicPendingLocked(p)
-		b.pendingBytes -= bytes
-		s.inflightBytes -= bytes
-		if p.deadline.index >= 0 {
-			heap.Remove(&b.pendingDeadlines, p.deadline.index)
-		}
-		b.mu.Unlock()
-		releasePending(p)
-		if s.cancel != nil {
-			s.cancel()
-		}
-		b.metrics.Dropped.Add(1)
-		return false
-	}
+	defer b.mu.Unlock()
+	return b.sendDeliveryLocked(s, m, attempt, true) != ""
 }
 
 func writeFrame(w io.Writer, d Delivery) error {
@@ -3130,14 +3135,22 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusServiceUnavailable, "broker_draining")
 		return
 	}
-	groupReplayOwner := group == "" || len(b.topicGroups[topic][group]) == 0
-	// An existing connection with the same affinity identity will be fenced
-	// below. Its replacement must take over replay when it is the sole member.
-	if group != "" && len(b.topicGroups[topic][group]) == 1 && member != "" {
-		for _, existing := range b.topicGroups[topic][group] {
-			groupReplayOwner = existing.affinityID == member
+	if group != "" {
+		if !b.registerGroupLocked(topic, group) {
+			b.mu.Unlock()
+			b.cache.mu.Unlock()
+			problem(w, 429, "group_memory_capacity")
+			return
 		}
+		b.mu.Unlock()
+		if err := b.prepareGroupWork(b.cache.topics[topic]); err != nil {
+			b.cache.mu.Unlock()
+			problem(w, 429, "group_memory_capacity")
+			return
+		}
+		b.mu.Lock()
 	}
+	groupReplayOwner := group == ""
 	var replay []string
 	if groupReplayOwner {
 		indexBytes := int64(len(b.cache.topics[topic])) * 16
@@ -3167,6 +3180,7 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 		s.replaying = false
 	}
 	b.addSubscriberLocked(s)
+	b.wakeGroups()
 	if group != "" && groupReplayOwner {
 		kept := replay[:0]
 		now := time.Now().UnixMilli()
@@ -3401,6 +3415,7 @@ func (b *Broker) putCheckpointLocked(checkpoint groupCheckpoint, now int64) {
 		b.checkpointCount++
 	}
 	indexed[checkpoint.MessageID] = checkpoint.ExpiresAt
+	b.completeGroupWorkLocked(checkpoint.Topic, checkpoint.Group, checkpoint.MessageID)
 	b.checkpointOrder = append(b.checkpointOrder, checkpointOrderEntry{scope: scope, messageID: checkpoint.MessageID, expiresAt: checkpoint.ExpiresAt})
 	for b.checkpointCount > b.cfg.CheckpointEntries && b.checkpointHead < len(b.checkpointOrder) {
 		old := b.checkpointOrder[b.checkpointHead]
@@ -3733,6 +3748,12 @@ func (b *Broker) maintenance() {
 			}
 			b.mu.Unlock()
 			for _, p := range retry {
+				if p.group != "" {
+					b.retryGroup(p)
+					b.metrics.Redelivered.Add(1)
+					releasePending(p)
+					continue
+				}
 				if p.attempt >= b.cfg.MaxAttempts {
 					b.metrics.Dropped.Add(1)
 					releasePending(p)
@@ -3779,10 +3800,16 @@ func (b *Broker) status(w http.ResponseWriter, _ *http.Request) {
 	v["pending_deliveries"] = len(b.pending)
 	v["pending_bytes"] = b.pendingBytes
 	v["consumer_checkpoints"] = b.checkpointCount
+	groupEntries, groupKeys := b.groupWorkCountsLocked()
+	v["registered_groups"] = len(b.groupWork)
+	v["group_outstanding_messages"] = groupEntries
+	v["group_active_keys"] = groupKeys
+	v["group_memory_bytes"] = b.groupMemoryBytes
+	v["group_expired_messages"] = b.metrics.GroupExpired.Load()
 	pressuredTopics := 0
 	now := time.Now()
 	for _, state := range b.topicPending {
-		if state.head != nil && now.Sub(state.head.deliveredAt) >= b.cfg.DeliveryLagLimit {
+		if b.broadcastDeliveryPressuredLocked(state, now) {
 			pressuredTopics++
 		}
 	}
@@ -3872,10 +3899,13 @@ func (b *Broker) prometheus(w http.ResponseWriter, _ *http.Request) {
 	b.cache.mu.Unlock()
 	b.mu.RLock()
 	consumers, inflight, pendingBytes, checkpoints := len(b.subs), len(b.pending), b.pendingBytes, b.checkpointCount
+	groupEntries, groupKeys := b.groupWorkCountsLocked()
+	registeredGroups := len(b.groupWork)
+	groupMemoryBytes := b.groupMemoryBytes
 	pressuredTopics := 0
 	now := time.Now()
 	for _, state := range b.topicPending {
-		if state.head != nil && now.Sub(state.head.deliveredAt) >= b.cfg.DeliveryLagLimit {
+		if b.broadcastDeliveryPressuredLocked(state, now) {
 			pressuredTopics++
 		}
 	}
@@ -3899,6 +3929,9 @@ func (b *Broker) prometheus(w http.ResponseWriter, _ *http.Request) {
 		}
 		_, _ = fmt.Fprintf(w, "# TYPE %s %s\n%s %d\n", v.name, kind, v.name, v.value)
 	}
+	_, _ = fmt.Fprintf(w, "# TYPE spruce_group_outstanding_messages gauge\nspruce_group_outstanding_messages %d\n# TYPE spruce_group_active_keys gauge\nspruce_group_active_keys %d\n# TYPE spruce_registered_groups gauge\nspruce_registered_groups %d\n", groupEntries, groupKeys, registeredGroups)
+	_, _ = fmt.Fprintf(w, "# TYPE spruce_group_memory_bytes gauge\nspruce_group_memory_bytes %d\n", groupMemoryBytes)
+	_, _ = fmt.Fprintf(w, "# TYPE spruce_group_expired_messages_total counter\nspruce_group_expired_messages_total %d\n", b.metrics.GroupExpired.Load())
 	b.writeHistogram(w, "spruce_publish_request_duration_microseconds", &b.metrics.PublishLatency)
 	_, _ = fmt.Fprintf(w, "# TYPE spruce_stream_memory_bytes gauge\nspruce_stream_memory_bytes %d\n# TYPE spruce_stream_memory_capacity_bytes gauge\nspruce_stream_memory_capacity_bytes %d\n", b.streamMemoryBytes.Load(), b.cfg.StreamMemoryBytes)
 	b.writeHistogram(w, "spruce_replication_request_duration_microseconds", &b.metrics.ReplicationLatency)

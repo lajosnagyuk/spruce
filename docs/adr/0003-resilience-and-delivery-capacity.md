@@ -3,6 +3,10 @@
 Status: accepted direction, 2026-09-05. Implementation is incremental; this document
 separates the agreed contract from guarantees already established by tests.
 
+Implementation update: [ADR 0004](0004-outstanding-work.md) implements local per-key
+completion scheduling and conservative TTL retention. The remaining partition/fencing
+and capacity-scaling limits below still apply.
+
 ## Product decisions
 
 Memory replication primarily buys resilience. A surviving minority remains available;

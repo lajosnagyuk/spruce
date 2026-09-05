@@ -532,6 +532,12 @@ func subscriptionMemberID(explicit string) (string, error) {
 var ErrHandlerDrainTimeout = errors.New("spruce: handlers did not stop before drain timeout")
 
 type Status struct {
+	RegisteredGroups         int64 `json:"registered_groups"`
+	GroupOutstandingMessages int64 `json:"group_outstanding_messages"`
+	GroupActiveKeys          int64 `json:"group_active_keys"`
+	GroupMemoryBytes         int64 `json:"group_memory_bytes"`
+	GroupExpiredMessages     int64 `json:"group_expired_messages"`
+
 	Messages            int   `json:"messages"`
 	CacheAccountedBytes int64 `json:"cache_accounted_bytes"`
 	CacheLimitBytes     int64 `json:"cache_limit_bytes"`

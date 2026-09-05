@@ -265,3 +265,11 @@ delivery work while preserving full memory replication for resilience. It does n
 increase retained capacity or provide exclusive group ownership during partitions.
 See [the follow-up evidence](docs/RESILIENCE-DELIVERY-RESULTS.md) and
 [the accepted scaling direction](docs/adr/0003-resilience-and-delivery-capacity.md).
+
+Grouped delivery now queues message IDs per key and waits for completion before sending
+that key's next event. NACK/timeout keeps the head outstanding until completion or its
+original expiry. Brokers retain accepted cache entries until expiry and return explicit
+429 backpressure instead of pressure-evicting older events. Retention includes completed
+history, so size TTL and cache capacity together. See
+[ADR 0004](docs/adr/0004-outstanding-work.md) for bounds, reconnection headroom and the
+limits of local ordering during partitions or overlapping handler attempts.

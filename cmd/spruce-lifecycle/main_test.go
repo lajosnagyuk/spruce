@@ -34,7 +34,7 @@ func TestLifecycleHelper(t *testing.T) {
 }
 
 func TestLifecycleOracleDetectsDeliveryFailures(t *testing.T) {
-	for _, mode := range []string{"healthy", "missing", "duplicate", "reordered"} {
+	for _, mode := range []string{"healthy", "missing", "duplicate", "reordered", "concurrent"} {
 		t.Run(mode, func(t *testing.T) {
 			var mu sync.Mutex
 			groups := make(map[string]chan []byte)
@@ -107,6 +107,9 @@ func TestLifecycleOracleDetectsDeliveryFailures(t *testing.T) {
 			}))
 			defer server.Close()
 			cmd := exec.Command(os.Args[0], "-test.run=^TestLifecycleHelper$", "--", "-server", server.URL, "-producers", "1", "-topics", "1", "-groups", "2", "-members", "1", "-keys", "1", "-messages", "3", "-timeout", "1500ms", "-settle", "10ms")
+			if mode == "concurrent" {
+				cmd.Args = append(cmd.Args, "-handler-delay", "100ms", "-handler-concurrency", "3")
+			}
 			cmd.Env = append(os.Environ(), "SPRUCE_LIFECYCLE_TEST_HELPER=1", "SPRUCE_TOKEN=")
 			var stdout, stderr bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -130,6 +133,10 @@ func TestLifecycleOracleDetectsDeliveryFailures(t *testing.T) {
 			case "duplicate":
 				if err == nil || got.Duplicates != 1 {
 					t.Fatalf("duplicate passed unnoticed: %+v", got)
+				}
+			case "concurrent":
+				if err == nil || got.DistinctKeyOverlaps == 0 {
+					t.Fatalf("concurrent distinct events passed unnoticed: %+v", got)
 				}
 			case "reordered":
 				if err == nil || got.OrderRegressions != 1 {

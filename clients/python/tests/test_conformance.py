@@ -10,7 +10,7 @@ class Handler(BaseHTTPRequestHandler):
     batch_keys = []
     def log_message(self, *_): pass
     def do_GET(self):
-        if self.path == "/v1/status": self.reply(200, {"messages": 1, "cache_accounted_bytes": 2, "cache_limit_bytes": 3, "peers": 1, "consumers": 0, "pending_deliveries": 0})
+        if self.path == "/v1/status": self.reply(200, {"messages": 1, "cache_accounted_bytes": 2, "cache_limit_bytes": 3, "peers": 1, "consumers": 0, "pending_deliveries": 0, "group_outstanding_messages": 7, "future_status_field": 99})
         elif self.path.startswith("/v1/subscriptions/stream"):
             Handler.stream_paths.append(self.path)
             body=b""
@@ -65,6 +65,7 @@ class Conformance(unittest.TestCase):
         self.assertEqual(self.client.publish("t", b"opaque").id,"id")
         self.assertEqual(len(self.client.publish_batch("t",[b"a",b"b"])),2)
         self.assertEqual(self.client.status().messages,1)
+        self.assertEqual(self.client.status().group_outstanding_messages,7)
         d=Deduper(2,1); self.assertFalse(d.seen("x")); self.assertTrue(d.seen("x"))
     def test_batcher_coalesces_and_copies(self):
         Handler.requests=0

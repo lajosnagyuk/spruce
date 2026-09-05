@@ -172,6 +172,11 @@ class BrokerStatus:
     peers: int
     consumers: int
     pending_deliveries: int
+    registered_groups: int = 0
+    group_outstanding_messages: int = 0
+    group_active_keys: int = 0
+    group_memory_bytes: int = 0
+    group_expired_messages: int = 0
 
 
 class _NoDowngrade(urllib.request.HTTPRedirectHandler):
@@ -295,7 +300,8 @@ class Client:
         with self._request("GET", path, operation=operation) as response: return response.read()
 
     def status(self) -> BrokerStatus:
-        return BrokerStatus(**json.loads(self._get("/v1/status")))
+        value = json.loads(self._get("/v1/status"))
+        return BrokerStatus(**{key: value[key] for key in BrokerStatus.__dataclass_fields__ if key in value})
 
     def check_health(self) -> None:
         self._get("/health/ready")

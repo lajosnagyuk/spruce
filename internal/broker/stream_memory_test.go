@@ -75,6 +75,9 @@ func TestReplayIDsDoNotKeepEvictedMessagesDeliverable(t *testing.T) {
 			b.cache.mu.Lock()
 			ids := b.cache.replayIDsLocked("t", nil, false, 0)
 			b.cache.mu.Unlock()
+			b.cache.mu.Lock()
+			b.cache.dropOldestLocked()
+			b.cache.mu.Unlock() // Simulate lost history; pressure no longer evicts.
 			if len(ids) != 1 || ids[0] != id {
 				t.Fatalf("unexpected replay IDs: %v", ids)
 			}

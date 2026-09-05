@@ -112,3 +112,34 @@ Owner-local ACKs now complete even when peer checkpoint queues are full. Monitor
 drops: subsequent owner loss can redeliver work whose checkpoint did not propagate.
 [Follow-up cluster results](RESILIENCE-DELIVERY-RESULTS.md) distinguish the tested repairs
 from unfinished per-key completion gating and retention admission.
+
+### Retention and unfinished grouped work
+
+Accepted events now remain cached until their original expiry, even after completion.
+A full retention or group-index budget returns HTTP 429 `retention_capacity`; producers
+must handle rejection and retry the same operation identity. ACK does not immediately
+make cache space available. Choose TTL and memory together: approximately arrival rate
+× retention seconds × accounted message size, plus the separately bounded stream,
+in-flight, replication and runtime memory. The chart still defaults to a one-minute
+TTL; set an explicit window appropriate to the tolerated consumer outage.
+
+Groups now gate each key on completion. NACK and timeout retry its current head;
+MaxAttempts caps the reported group attempt rather than discarding the work. Expiry
+releases the key and may require the consumer to handle a cursor-expired error. Broadcast
+retry limits retain their existing behaviour. A slow grouped key does not impose the
+broadcast topic-wide lag rejection on unrelated keys; actual byte pressure still applies.
+
+Group ID queues share `streamMemoryBytes`, with one stream reservation protected from
+queue usage to permit reconnection. A large backlog can reject additional group/stream
+admission. Group state survives disconnection while it contains work; retained TTL
+history provides recovery on other brokers without distributed group registration.
+
+Monitor `spruce_group_outstanding_messages`, `spruce_group_active_keys`,
+`spruce_group_memory_bytes`, `spruce_registered_groups`, and especially increases in
+`spruce_group_expired_messages_total`. The latter means indexed unfinished work reached
+expiry. Normal cache expiry also includes already completed history and is a different
+signal. Status exposes corresponding fields in all three SDKs.
+
+These gates order distinct event identities at one broker. They do not fence an old
+application handler after timeout or an independently serving partition. Keep side
+effects idempotent and do not interpret one passing fault trial as exclusive ownership.

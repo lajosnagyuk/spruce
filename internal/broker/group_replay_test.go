@@ -65,7 +65,10 @@ func TestLiveMemberCannotBypassGroupReplay(t *testing.T) {
 	for i := range 100 {
 		b.deliver(&Message{ID: fmt.Sprint(i), Key: fmt.Sprint(i), Topic: "t", ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}, "", 1)
 	}
-	if len(owner.deferred) != 100 || len(live.ch) != 0 || len(owner.ch) != 0 {
+	b.mu.RLock()
+	count := len(b.groupWork[checkpointScope{topic: "t", group: "g"}].work)
+	b.mu.RUnlock()
+	if count != 100 || len(live.ch) != 0 || len(owner.ch) != 0 {
 		t.Fatalf("new work overtook group replay: deferred=%d live=%d owner=%d", len(owner.deferred), len(live.ch), len(owner.ch))
 	}
 }
@@ -99,7 +102,7 @@ func TestDeferredReplayFlushesWithoutMoreTraffic(t *testing.T) {
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, "GET", server.URL+"/v1/subscriptions/stream?topic=t&group=g", nil)
+	req, _ := http.NewRequestWithContext(ctx, "GET", server.URL+"/v1/subscriptions/stream?topic=t", nil)
 	resp, err := server.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)

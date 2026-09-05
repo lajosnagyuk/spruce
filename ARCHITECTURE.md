@@ -11,8 +11,9 @@ implemented system, not a roadmap.
 **Why:** Avoiding disks, databases, consensus, and recovery logs keeps latency low and
 operation simple.
 
-**Consequence:** Pod loss, cache eviction, exhausted queues, or full-cluster restart can
-lose messages. Spruce is not a durable log.
+**Consequence:** Loss of retained copies, TTL expiry, or full-cluster restart can lose
+messages. Capacity pressure rejects new admission; accepted cache entries are retained
+until their original expiry. Spruce is not a durable log.
 
 ## ADR-002: Identical leaderless replicas
 
@@ -32,12 +33,14 @@ an opaque per-origin sequence replay cursor. Group ACKs create count-bounded, TT
 checkpoints that are propagated to peers and included in replica bootstrap. Every queue
 and in-flight window is bounded by count, bytes, or both.
 
-**Why:** A slow consumer must not exhaust broker memory or block producers.
+**Why:** A slow consumer must not exhaust broker memory. Producers receive explicit
+backpressure when the bounded retention or work-index budget is exhausted.
 
 **Consequence:** Delivery is not exactly-once or durable at-least-once. A reconnecting
 group normally skips completed cached messages, but checkpoint propagation, total
-cluster restart, cache expiry, or capacity eviction can still cause duplicates or loss.
-Overflow closes the stream so clients can reconnect and replay what remains cached.
+cluster restart or cache expiry can still cause duplicates or loss. Grouped work waits
+in completion-gated per-key ID queues; broadcast overflow still closes the stream for
+reconnection. Cache pressure no longer evicts retained events.
 First-party clients provide an additional bounded deduplication layer.
 
 ## ADR-004: Opaque payloads and simple HTTP
@@ -153,3 +156,7 @@ full/unreachable peer action queue; checkpoint propagation remains bounded and b
 Deferred replay flushes before returning to idle live-stream waiting.
 See [ADR 0003](docs/adr/0003-resilience-and-delivery-capacity.md) for accepted scaling,
 ordering and retention direction, including the parts not yet implemented.
+
+[ADR 0004](docs/adr/0004-outstanding-work.md) implements bounded per-key group queues,
+retry-until-completion/expiry and conservative TTL retention. These provide local
+completion ordering without claiming cross-partition fencing of application handlers.

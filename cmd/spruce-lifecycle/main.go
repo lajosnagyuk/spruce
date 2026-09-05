@@ -28,6 +28,10 @@ type event struct {
 }
 
 type report struct {
+	DistinctKeyOverlaps int         `json:"concurrent_distinct_key_events"`
+	KeyOverlaps         int         `json:"concurrent_key_handlers"`
+	InjectedNacks       int         `json:"injected_nacks"`
+	HandlerDelayMS      int64       `json:"handler_delay_ms"`
 	Run                 string      `json:"run"`
 	Producers           int         `json:"producers"`
 	Topics              int         `json:"topics"`
@@ -81,8 +85,11 @@ func main() {
 	insecure := flag.Bool("allow-insecure-credentials", false, "allow synthetic development credentials over HTTP")
 	allowDuplicates := flag.Bool("allow-duplicates", false, "allow measured at-least-once redeliveries")
 	allowReorder := flag.Bool("allow-reorder", false, "record ordering violations without passing them as ordered")
+	handlerDelay := flag.Duration("handler-delay", 0, "delay handlers for key zero")
+	handlerConcurrency := flag.Int("handler-concurrency", 1, "handler workers per stream")
+	nackFirst := flag.Bool("nack-first", false, "reject each producer first event once per group")
 	flag.Parse()
-	if *producers < 1 || *producers > 1024 || *topics < 1 || *topics > 256 || *groups < 1 || *groups > 256 || *members < 1 || *members > 256 || *keys < 1 || *keys > 1000000 || *count < 1 || *count > 1000000 || *size < 0 || *size > 900<<10 || *rate < 0 || *timeout <= 0 || *settle < 0 || int64(*producers)*int64(*count) > 1000000 || int64(*topics)*int64(*groups)*int64(*members) > 1024 || int64(*producers)*int64(*count)*int64(*groups) > 4000000 {
+	if *handlerDelay < 0 || *handlerDelay > time.Second || *handlerConcurrency < 1 || *handlerConcurrency > 32 || *producers < 1 || *producers > 1024 || *topics < 1 || *topics > 256 || *groups < 1 || *groups > 256 || *members < 1 || *members > 256 || *keys < 1 || *keys > 1000000 || *count < 1 || *count > 1000000 || *size < 0 || *size > 900<<10 || *rate < 0 || *timeout <= 0 || *settle < 0 || int64(*producers)*int64(*count) > 1000000 || int64(*topics)*int64(*groups)*int64(*members) > 1024 || int64(*producers)*int64(*count)*int64(*groups) > 4000000 {
 		fmt.Fprintln(os.Stderr, "invalid or excessive scenario bounds")
 		os.Exit(2)
 	}
@@ -98,7 +105,9 @@ func main() {
 	}
 	var mu sync.Mutex
 	var deliveryLatencies, publishLatencies []time.Duration
-	var invalid, duplicates, orderRegressions, publishErrors int
+	var invalid, duplicates, orderRegressions, publishErrors, keyOverlaps, distinctKeyOverlaps, injectedNacks int
+	activeKeys := make(map[[3]int]map[string]int)
+	rejected := make(map[[2]int]bool)
 	copyCounts := make(map[int]int)
 	last := make(map[[3]int]int)
 	var terminal atomic.Int64
@@ -125,7 +134,7 @@ func main() {
 							first.Do(func() { ready <- struct{}{} })
 						}
 					}
-					err := c.Subscribe(ctx, spruce.SubscribeOptions{Topic: fmt.Sprintf("%s-%d", run, topic), Group: fmt.Sprintf("group-%d", group), Concurrency: 1}, func(_ context.Context, d spruce.Delivery) error {
+					err := c.Subscribe(ctx, spruce.SubscribeOptions{Topic: fmt.Sprintf("%s-%d", run, topic), Group: fmt.Sprintf("group-%d", group), Concurrency: *handlerConcurrency}, func(handlerCtx context.Context, d spruce.Delivery) error {
 						var e event
 						decodeErr := json.Unmarshal(d.Payload, &e)
 						mu.Lock()
@@ -138,6 +147,48 @@ func main() {
 						if sentAt[index] != e.Sent {
 							invalid++
 							return fmt.Errorf("timestamp differs from published event")
+						}
+						rejectionKey := [2]int{group, index}
+						if *nackFirst && e.Sequence == 0 && !rejected[rejectionKey] {
+							rejected[rejectionKey] = true
+							injectedNacks++
+							return fmt.Errorf("injected handler rejection")
+						}
+						activeKey := [3]int{group, topic, e.Key}
+						running := activeKeys[activeKey]
+						if len(running) > 0 {
+							keyOverlaps++
+						}
+						for id := range running {
+							if id != d.MessageID {
+								distinctKeyOverlaps++
+								break
+							}
+						}
+						if running == nil {
+							running = make(map[string]int)
+							activeKeys[activeKey] = running
+						}
+						running[d.MessageID]++
+						defer func() {
+							running[d.MessageID]--
+							if running[d.MessageID] == 0 {
+								delete(running, d.MessageID)
+							}
+							if len(running) == 0 {
+								delete(activeKeys, activeKey)
+							}
+						}()
+						if *handlerDelay > 0 && e.Key == 0 {
+							mu.Unlock()
+							select {
+							case <-time.After(*handlerDelay):
+							case <-handlerCtx.Done():
+							}
+							mu.Lock()
+							if handlerCtx.Err() != nil {
+								return handlerCtx.Err()
+							}
 						}
 						observed[group][index]++
 						if observed[group][index] > 1 {
@@ -250,7 +301,7 @@ func main() {
 	}
 	cancel()
 	subscribers.Wait()
-	r := report{ConfirmedCopyCounts: copyCounts, Run: run, Producers: *producers, Topics: *topics, Groups: *groups, Members: *members, Keys: *keys, Ack: *ack, Compression: *compression, PaddingBytes: *size, PublishErrors: publishErrors, Invalid: invalid, Duplicates: duplicates, OrderRegressions: orderRegressions, SubscriptionErrors: terminal.Load(), PublishSeconds: publishSeconds, PublishMS: percentiles(publishLatencies), DeliveryMS: percentiles(deliveryLatencies)}
+	r := report{DistinctKeyOverlaps: distinctKeyOverlaps, KeyOverlaps: keyOverlaps, InjectedNacks: injectedNacks, HandlerDelayMS: handlerDelay.Milliseconds(), ConfirmedCopyCounts: copyCounts, Run: run, Producers: *producers, Topics: *topics, Groups: *groups, Members: *members, Keys: *keys, Ack: *ack, Compression: *compression, PaddingBytes: *size, PublishErrors: publishErrors, Invalid: invalid, Duplicates: duplicates, OrderRegressions: orderRegressions, SubscriptionErrors: terminal.Load(), PublishSeconds: publishSeconds, PublishMS: percentiles(publishLatencies), DeliveryMS: percentiles(deliveryLatencies)}
 	for i, ok := range accepted {
 		if ok {
 			r.Accepted++
@@ -266,7 +317,7 @@ func main() {
 	}
 	r.AcceptedPerSecond = float64(r.Accepted) / publishSeconds
 	_ = json.NewEncoder(os.Stdout).Encode(r)
-	if r.Accepted != total || r.PublishErrors+r.Missing+r.Invalid > 0 || r.SubscriptionErrors > 0 || (!*allowDuplicates && r.Duplicates > 0) || (!*allowReorder && r.OrderRegressions > 0) {
+	if r.Accepted != total || r.PublishErrors+r.Missing+r.Invalid+r.DistinctKeyOverlaps > 0 || r.SubscriptionErrors > 0 || (!*allowDuplicates && r.Duplicates > 0) || (!*allowReorder && r.OrderRegressions > 0) {
 		os.Exit(1)
 	}
 }

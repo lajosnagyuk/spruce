@@ -23,7 +23,12 @@ public sealed record BrokerStatus(
     [property: JsonPropertyName("cache_limit_bytes")] long CacheLimitBytes,
     [property: JsonPropertyName("peers")] int Peers,
     [property: JsonPropertyName("consumers")] int Consumers,
-    [property: JsonPropertyName("pending_deliveries")] int PendingDeliveries);
+    [property: JsonPropertyName("pending_deliveries")] int PendingDeliveries,
+    [property: JsonPropertyName("registered_groups")] long RegisteredGroups = 0,
+    [property: JsonPropertyName("group_outstanding_messages")] long GroupOutstandingMessages = 0,
+    [property: JsonPropertyName("group_active_keys")] long GroupActiveKeys = 0,
+    [property: JsonPropertyName("group_memory_bytes")] long GroupMemoryBytes = 0,
+    [property: JsonPropertyName("group_expired_messages")] long GroupExpiredMessages = 0);
 
 public sealed class ConsumableDelivery(Delivery delivery)
 {

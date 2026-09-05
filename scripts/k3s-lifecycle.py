@@ -18,6 +18,9 @@ parser.add_argument('--case', choices=['baseline', 'scale', 'kill', 'kill-two'],
 parser.add_argument('--ack', default='available')
 parser.add_argument('--messages', type=int, default=500, help='messages per producer')
 parser.add_argument('--rate', type=float, default=50)
+parser.add_argument('--handler-delay', default='0s')
+parser.add_argument('--handler-concurrency', type=int, default=1)
+parser.add_argument('--nack-first', action='store_true')
 args = parser.parse_args()
 if not 1 <= args.messages <= 100000 or not 0 <= args.rate <= 100000:
     parser.error('invalid workload bounds')
@@ -47,7 +50,9 @@ job = {'apiVersion': 'batch/v1', 'kind': 'Job', 'metadata': {'name': name}, 'spe
             'command': ['/spruce-lifecycle'],
             'args': ['-server', f'http://{args.release}:8080', '-ack', args.ack,
                      '-messages', str(args.messages), '-rate', str(args.rate),
-                     '-timeout', '120s', '-allow-duplicates', '-allow-insecure-credentials'],
+                     '-timeout', '120s', '-allow-duplicates', '-allow-insecure-credentials',
+                     '-handler-delay', args.handler_delay, '-handler-concurrency', str(args.handler_concurrency),
+                     '-nack-first=' + str(args.nack_first).lower()],
             'resources': {'requests': {'cpu': '50m', 'memory': '64Mi'},
                           'limits': {'memory': '256Mi'}},
             'env': [{'name': 'SPRUCE_TOKEN', 'valueFrom': {'secretKeyRef': {
