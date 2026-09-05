@@ -69,3 +69,55 @@ func TestLiveMemberCannotBypassGroupReplay(t *testing.T) {
 		t.Fatalf("new work overtook group replay: deferred=%d live=%d owner=%d", len(owner.deferred), len(live.ch), len(owner.ch))
 	}
 }
+
+// Inject publication after the replay snapshot, exactly when the stream becomes
+// visible to its client. Deferred replay must flush without a subsequent event.
+type replayFlushWriter struct {
+	http.ResponseWriter
+	once    bool
+	onFlush func()
+}
+
+func (w *replayFlushWriter) Flush() {
+	if !w.once {
+		w.once = true
+		w.onFlush()
+	}
+	w.ResponseWriter.(http.Flusher).Flush()
+}
+func TestDeferredReplayFlushesWithoutMoreTraffic(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b.Handler().ServeHTTP(&replayFlushWriter{ResponseWriter: w, onFlush: func() {
+			_, err := b.accept(&Message{ID: "deferred", Topic: "t", Payload: []byte("opaque"), ExpiresAt: time.Now().Add(time.Minute).UnixMilli()})
+			if err != nil {
+				t.Error(err)
+			}
+		}}, r)
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", server.URL+"/v1/subscriptions/stream?topic=t&group=g", nil)
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var sizes [8]byte
+	if _, err = io.ReadFull(resp.Body, sizes[:]); err != nil {
+		t.Fatalf("deferred event remained buffered: %v", err)
+	}
+	meta := make([]byte, binary.BigEndian.Uint32(sizes[:4]))
+	if _, err = io.ReadFull(resp.Body, meta); err != nil {
+		t.Fatal(err)
+	}
+	var d Delivery
+	if err = json.Unmarshal(meta, &d); err != nil {
+		t.Fatal(err)
+	}
+	if d.MessageID != "deferred" {
+		t.Fatalf("unexpected delivery: %+v", d)
+	}
+}

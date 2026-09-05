@@ -144,3 +144,12 @@ Drain rejects new publishes/streams and closes current streams after withdrawing
 readiness, while retaining ACK and peer-recovery access during the grace period.
 See [ADR 0002](docs/adr/0002-memory-availability.md) for the memory-only availability
 contract and the limit on ordering across live network partitions.
+
+Consumer-group delivery is now distributed by a canonical topic/group affinity digest.
+First-party stream and ACK/NACK requests carry the same digest, allowing gateway routing
+to keep completion with the delivery path across language-specific URL encodings. This
+is advisory routing, not cross-broker fencing. Owner-local ACK completion survives a
+full/unreachable peer action queue; checkpoint propagation remains bounded and best-effort.
+Deferred replay flushes before returning to idle live-stream waiting.
+See [ADR 0003](docs/adr/0003-resilience-and-delivery-capacity.md) for accepted scaling,
+ordering and retention direction, including the parts not yet implemented.

@@ -258,3 +258,10 @@ unfinished copies use bounded background replication. `one-peer` retains its str
 peer requirement. These receipts do not prevent TTL expiry, eviction or later loss of
 all copies. Complete-cluster restart survival is outside the product contract.
 See [ADR 0002](docs/adr/0002-memory-availability.md).
+
+Current gateways distribute topic/group streams across replicas, and first-party SDKs
+route completion using the same canonical affinity digest. This spreads independent
+delivery work while preserving full memory replication for resilience. It does not
+increase retained capacity or provide exclusive group ownership during partitions.
+See [the follow-up evidence](docs/RESILIENCE-DELIVERY-RESULTS.md) and
+[the accepted scaling direction](docs/adr/0003-resilience-and-delivery-capacity.md).

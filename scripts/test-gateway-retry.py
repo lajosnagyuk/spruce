@@ -2,6 +2,8 @@
 """Verify real nginx retries only operation-identified single-message publishes."""
 import argparse
 import http.server
+import hashlib
+import urllib.parse
 from pathlib import Path
 import shutil
 import socket
@@ -25,7 +27,18 @@ requests = []
 payload = b'\x00\xffopaque\x10\xfd'
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_): pass
+    def owner_response(self):
+        body = str(self.server.server_port).encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def do_GET(self): self.owner_response()
     def do_POST(self):
+        if self.path.startswith('/v1/deliveries/'):
+            self.rfile.read(int(self.headers['Content-Length']))
+            self.owner_response()
+            return
         body = self.rfile.read(int(self.headers['Content-Length']))
         with lock:
             requests.append((self.path, body, self.headers.get('Spruce-Producer-ID'), self.headers.get('Spruce-Idempotency-Key')))
@@ -87,6 +100,20 @@ try:
             assert len(observed) == expected, (suffix, headers, status, observed)
             assert status == (202 if expected == 2 else 503), status
             assert all(row == (route, payload, headers.get('Spruce-Producer-ID'), headers.get('Spruce-Idempotency-Key')) for row in observed), observed
+        owners = set()
+        for group in range(20):
+            topic, group_name = 'shared-topic', f'group {group}:é/+'
+            affinity = hashlib.sha256((topic + '\0' + group_name).encode()).hexdigest()
+            headers = {'Spruce-Delivery-Affinity': affinity}
+            with urllib.request.urlopen(urllib.request.Request(f'http://127.0.0.1:{port}/v1/subscriptions/stream?' + urllib.parse.urlencode({'topic':topic,'group':group_name}), headers=headers)) as response:
+                owner = response.read()
+            owners.add(owner)
+            for action in ('ack', 'nack'):
+                request = urllib.request.Request(f'http://127.0.0.1:{port}/v1/deliveries/{action}', data=b'{}', headers=headers)
+                with urllib.request.urlopen(request) as response:
+                    assert response.read() == owner, 'completion did not follow its group stream'
+        assert len(owners) == 3, ('groups did not distribute across brokers', owners)
+        print('group routing passed: one topic uses all three brokers; ACK/NACK follows each group')
         print('gateway retry passed: identified single publish retries unchanged; plain and batch POSTs do not')
 finally:
     subprocess.run([args.engine, 'rm', '-f', name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

@@ -43,6 +43,10 @@ class Conformance(unittest.TestCase):
         cls.server=ThreadingHTTPServer(("127.0.0.1",0),Handler); threading.Thread(target=cls.server.serve_forever,daemon=True).start()
         cls.client=Client(f"http://127.0.0.1:{cls.server.server_port}")
 
+    def test_completion_affinity_utf8_vector(self):
+        from spruce import _completion_affinity
+        self.assertEqual(_completion_affinity("shared-topic", "group é/+"), "e55cbafe41fd93ae0d545bf3d420c3f191bc6b140698f12e2a4e7e9f2794b242")
+
     def test_adaptive_compression_round_trip_and_limit(self):
         payload=(b'{"event":"workspace.updated","status":"ready"}' * 4096)
         for algorithm, codec in (("gzip", 1), ("zstd", 2)):
@@ -103,10 +107,10 @@ class Conformance(unittest.TestCase):
 
     def test_post_stream_ack_failure_reconnects_without_advancing_cursor(self):
         stop=threading.Event(); calls=[]; original=self.client._ack; Handler.stream_paths=[]; Handler.stream_count=2
-        def flaky(action, ids):
+        def flaky(action, ids, *scope):
             calls.append((action, tuple(ids)))
             if len(calls) == 1: raise urllib.error.URLError("transient")
-            original(action, ids)
+            original(action, ids, *scope)
             if len(calls) >= 3: stop.set()
         self.client._ack=flaky
         try:
@@ -172,10 +176,10 @@ class Conformance(unittest.TestCase):
 
     def test_post_stream_ack_socket_timeout_reconnects(self):
         stop=threading.Event(); calls=[]; original=self.client._ack
-        def flaky(action, ids):
+        def flaky(action, ids, *scope):
             calls.append((action, tuple(ids)))
             if len(calls) == 1: raise TimeoutError("socket timeout")
-            original(action, ids); stop.set()
+            original(action, ids, *scope); stop.set()
         self.client._ack=flaky
         try:
             self.client.subscribe(__import__('spruce').SubscribeOptions("stream", drain_timeout=.2), lambda _: None, stop)
@@ -205,10 +209,10 @@ class Conformance(unittest.TestCase):
 
     def test_cursor_advances_only_through_earlier_success(self):
         stop=threading.Event(); calls=[]; original=self.client._ack; Handler.stream_paths=[]; Handler.stream_count=2
-        def ordered(action, ids):
+        def ordered(action, ids, *scope):
             calls.append((action, tuple(ids)))
             if len(calls) == 2: raise urllib.error.URLError("later ACK failed")
-            original(action, ids)
+            original(action, ids, *scope)
             if len(calls) >= 3: stop.set()
         self.client._ack=ordered
         try:

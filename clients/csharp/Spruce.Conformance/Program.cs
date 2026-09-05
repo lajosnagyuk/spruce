@@ -298,12 +298,13 @@ static async Task ExplicitStreamCompletion()
     var acks = 0;
     var client = new SpruceClient("https://spruce.invalid", new HttpClient(new StubHandler(request =>
     {
+        Assert(request.Headers.GetValues("Spruce-Delivery-Affinity").Single() == "e55cbafe41fd93ae0d545bf3d420c3f191bc6b140698f12e2a4e7e9f2794b242", "stream/completion affinity differs from the shared UTF-8 vector");
         if (request.RequestUri!.AbsolutePath == "/v1/deliveries/ack") { Interlocked.Increment(ref acks); cancellation.Cancel(); return new(HttpStatusCode.NoContent); }
         return new(HttpStatusCode.OK) { Content = new StreamContent(Frame()) };
     })));
     try
     {
-        await foreach (var item in client.ReadAllAsync(new("t"), cancellation.Token))
+        await foreach (var item in client.ReadAllAsync(new("shared-topic", Group: "group é/+"), cancellation.Token))
         {
             Assert(acks == 0, "delivery ACKed before explicit completion");
             item.Complete();

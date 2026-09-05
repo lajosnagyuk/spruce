@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -368,13 +369,17 @@ type ackItem struct {
 }
 
 type ackBatcher struct {
-	c     *Client
-	kind  string
-	items chan ackItem
+	c            *Client
+	kind         string
+	topic, group string
+	items        chan ackItem
 }
 
-func newAckBatcher(ctx context.Context, c *Client, kind string) *ackBatcher {
+func newAckBatcher(ctx context.Context, c *Client, kind string, scope ...string) *ackBatcher {
 	b := &ackBatcher{c: c, kind: kind, items: make(chan ackItem, 1024)}
+	if len(scope) == 2 {
+		b.topic, b.group = scope[0], scope[1]
+	}
 	go b.run(ctx)
 	return b
 }
@@ -435,7 +440,7 @@ func (b *ackBatcher) run(ctx context.Context) {
 		for i := range batch {
 			ids[i] = batch[i].id
 		}
-		err := b.c.ack(ctx, b.kind, ids)
+		err := b.c.ack(ctx, b.kind, ids, b.topic, b.group)
 		for _, item := range batch {
 			item.done <- err
 		}
@@ -656,6 +661,7 @@ func (c *Client) subscribeOnce(ctx context.Context, o SubscribeOptions, handler 
 		v.Set("cursor", o.Cursor)
 	}
 	req, _ := http.NewRequestWithContext(streamCtx, http.MethodGet, c.BaseURL+"/v1/subscriptions/stream?"+v.Encode(), nil)
+	req.Header.Set("Spruce-Delivery-Affinity", completionAffinity(o.Topic, o.Group))
 	if err := c.authorize(req); err != nil {
 		return o.Cursor, err
 	}
@@ -681,8 +687,8 @@ func (c *Client) subscribeOnce(ctx context.Context, o SubscribeOptions, handler 
 	sem := make(chan struct{}, o.Concurrency)
 	progressWindow := make(chan struct{}, o.Concurrency)
 	workerErrors := make(chan error, 1)
-	acks := newAckBatcher(streamCtx, c, "ack")
-	nacks := newAckBatcher(streamCtx, c, "nack")
+	acks := newAckBatcher(streamCtx, c, "ack", o.Topic, o.Group)
+	nacks := newAckBatcher(streamCtx, c, "nack", o.Topic, o.Group)
 	var progressMu sync.Mutex
 	nextProgress := uint64(1)
 	completed := make(map[uint64]string)
@@ -839,10 +845,13 @@ func readFrame(r io.Reader, maxPayloadBytes int) (Delivery, error) {
 	_, e := io.ReadFull(r, d.Payload)
 	return d, e
 }
-func (c *Client) ack(ctx context.Context, kind string, ids []string) error {
+func (c *Client) ack(ctx context.Context, kind string, ids []string, scope ...string) error {
 	body, _ := json.Marshal(map[string][]string{"delivery_ids": ids})
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/v1/deliveries/"+kind, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	if len(scope) == 2 && scope[0] != "" {
+		req.Header.Set("Spruce-Delivery-Affinity", completionAffinity(scope[0], scope[1]))
+	}
 	if e := c.authorize(req); e != nil {
 		return e
 	}
@@ -897,4 +906,9 @@ func (d *Deduper) Seen(id string) bool {
 		}
 	}
 	return false
+}
+
+func completionAffinity(topic, group string) string {
+	sum := sha256.Sum256([]byte(topic + "\x00" + group))
+	return hex.EncodeToString(sum[:])
 }

@@ -50,7 +50,7 @@ render --set auth.requireExistingSecret=true --set auth.existingSecret=spruce-au
 
 spread=$(helm template spruce "$chart" $base)
 printf '%s\n' "$spread" | grep -q 'whenUnsatisfiable: DoNotSchedule'
-printf '%s\n' "$spread" | grep -q 'map $arg_topic $stream_key'
+printf '%s\n' "$spread" | grep -q 'map $http_spruce_delivery_affinity $stream_key'
 printf '%s\n' "$spread" | grep -q 'map $uri $publish_key'
 printf '%s\n' "$spread" | grep -q '(?<publish_topic>'
 printf '%s\n' "$spread" | grep -q 'hash $stream_key consistent;'

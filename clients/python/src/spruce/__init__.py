@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from collections import deque
 import gzip
+import hashlib
 import io
 import json
 import queue
@@ -308,9 +309,11 @@ class Client:
     def metrics(self) -> str:
         return self._get("/metrics", operation="metrics").decode()
 
-    def _ack(self, action: str, ids: Sequence[str]) -> None:
+    def _ack(self, action: str, ids: Sequence[str], topic: str = "", group: str = "") -> None:
         body = json.dumps({"delivery_ids": list(ids)}, separators=(",", ":")).encode()
-        with self._request("POST", f"/v1/deliveries/{action}", body, {"Content-Type": "application/json"}, timeout=10, operation=action): pass
+        headers = {"Content-Type": "application/json"}
+        if topic: headers.update({"Spruce-Delivery-Affinity": _completion_affinity(topic, group)})
+        with self._request("POST", f"/v1/deliveries/{action}", body, headers, timeout=10, operation=action): pass
 
     @staticmethod
     def _read_exact(stream, length: int) -> bytes:
@@ -341,7 +344,7 @@ class Client:
         stop = stop or threading.Event(); cursor, backoff = options.cursor, 0.05
         member_id = options.member_id or secrets.token_hex(16)
         if len(member_id.encode("utf-8")) > 255: raise ValueError("member_id exceeds 255 UTF-8 bytes")
-        acks, nacks = _AckBatcher(self, "ack"), _AckBatcher(self, "nack")
+        acks, nacks = _AckBatcher(self, "ack", options.topic, options.group), _AckBatcher(self, "nack", options.topic, options.group)
         workers = ThreadPoolExecutor(max_workers=options.concurrency)
         try:
           while not stop.is_set():
@@ -360,7 +363,7 @@ class Client:
                     next_progress += 1
             try:
                 connected_at, connected_cursor = time.monotonic(), cursor
-                response = self._request("GET", "/v1/subscriptions/stream?" + urllib.parse.urlencode(query), timeout=None, operation="subscribe")
+                response = self._request("GET", "/v1/subscriptions/stream?" + urllib.parse.urlencode(query), headers={"Spruce-Delivery-Affinity": _completion_affinity(options.topic, options.group)}, timeout=None, operation="subscribe")
                 if not cursor: cursor = response.headers.get("Spruce-Cursor", "")
                 self._emit("subscription_connected", connected_at, 200, None)
                 connection_done = threading.Event()
@@ -480,7 +483,8 @@ class ConsumableDelivery:
 
 
 class _AckBatcher:
-    def __init__(self, client: Client, action: str) -> None:
+    def __init__(self, client: Client, action: str, topic: str = "", group: str = "") -> None:
+        self.topic, self.group = topic, group
         self.client, self.action, self.items, self.closed, self.close_lock = client, action, queue.Queue(1024), threading.Event(), threading.Lock()
         self.thread = threading.Thread(target=self._run, daemon=True); self.thread.start()
     def submit(self, delivery_id: str) -> None:
@@ -506,7 +510,7 @@ class _AckBatcher:
                 if item is None:
                     self.items.put(None); break
                 batch.append(item)
-            try: self.client._ack(self.action, [item[0] for item in batch]); error = None
+            try: self.client._ack(self.action, [item[0] for item in batch], self.topic, self.group); error = None
             except BaseException as exc: error = exc
             for _, result in batch: result.put(error)
 
@@ -589,3 +593,7 @@ class ProducerBatcher:
 
 
 __all__ = ["BatchEntry", "BatcherOptions", "BrokerStatus", "Client", "ClientEvent", "ConsumableDelivery", "Deduper", "Delivery", "HandlerDrainTimeoutError", "HandlerPanicError", "ProducerBatcher", "PublishOptions", "PublishResult", "RetryOptions", "SpruceError", "SubscribeOptions", "__version__"]
+
+
+def _completion_affinity(topic: str, group: str) -> str:
+    return hashlib.sha256((topic + "\0" + (group or "")).encode("utf-8")).hexdigest()

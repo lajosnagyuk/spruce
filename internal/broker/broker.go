@@ -3286,6 +3286,14 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 			if !writeReplay(id) {
 				return
 			}
+			if replayFrames >= 128 || replayBytes >= 256<<10 {
+				if !flushReplay() {
+					return
+				}
+			}
+		}
+		if !flushReplay() {
+			return
 		}
 	}
 	for {
@@ -3474,6 +3482,25 @@ func (b *Broker) ack(w http.ResponseWriter, r *http.Request) {
 		problem(w, 400, "invalid_ack")
 		return
 	}
+	// A local completion must not depend on a failed replica's queue. Delivery
+	// IDs include the boot identity, so repeated local ACKs remain recognisable
+	// after pending state has been removed. Unknown owners still need forwarding.
+	local := true
+	for _, id := range a.DeliveryIDs {
+		raw, err := base64.RawURLEncoding.DecodeString(id)
+		if err != nil || len(raw) != 16 || !bytes.Equal(raw[:8], b.boot[:]) {
+			local = false
+			break
+		}
+	}
+	if local {
+		checkpoints := b.removeAcks(a.DeliveryIDs)
+		if len(checkpoints) > 0 {
+			b.broadcastAction(r.Context(), "ack", ackRequest{Checkpoints: checkpoints})
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	a.Checkpoints = b.checkpointsForAcks(a.DeliveryIDs)
 	if !b.broadcastAction(r.Context(), "ack", a) {
 		problem(w, 503, "peer_ack_unavailable")
@@ -3492,16 +3519,13 @@ func (b *Broker) internalAck(w http.ResponseWriter, r *http.Request) {
 		problem(w, 400, "invalid_ack")
 		return
 	}
-	// The public gateway may send an ACK to a broker that did not deliver it.
-	// Only the delivery owner can derive its group checkpoint. Forward that
-	// checkpoint before removing pending state so a full queue remains retryable.
-	// Checkpoint-only actions cannot generate further forwarding loops.
-	derived := b.checkpointsForAcks(a.DeliveryIDs)
-	if len(derived) > 0 && !b.broadcastAction(r.Context(), "ack", ackRequest{Checkpoints: derived}) {
-		problem(w, 503, "peer_ack_unavailable")
-		return
+	// Complete locally before best-effort checkpoint propagation. A partition
+	// must not turn a successful handler into repeated local delivery. A later
+	// loss of this owner can still replay work whose checkpoint did not survive.
+	derived := b.removeAcks(a.DeliveryIDs)
+	if len(derived) > 0 {
+		b.broadcastAction(r.Context(), "ack", ackRequest{Checkpoints: derived})
 	}
-	b.removeAcks(a.DeliveryIDs)
 	b.applyCheckpoints(a.Checkpoints)
 	w.WriteHeader(204)
 }

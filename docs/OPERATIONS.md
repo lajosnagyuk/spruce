@@ -99,3 +99,16 @@ retains job results for an hour. It does not cordon or drain cluster hosts.
 Gateway retries of forwarded POSTs are restricted to single-message publishes with
 both operation-identity headers. See [current cluster evidence](ELASTIC-MEMORY-RESULTS.md)
 for tested degradation and outstanding group-overlap limitations.
+
+### Delivery distribution and completion
+
+Current SDKs send a canonical `Spruce-Delivery-Affinity` digest on streams and ACK/NACK
+requests. The gateway spreads topic/group pairs across brokers and sends scoped
+completion through that same upstream. Coordinate client stream reconnection when
+migrating from older SDKs, whose routing can differ. This does not fence independent
+brokers during partitions. Full replication still stores every event on each broker.
+
+Owner-local ACKs now complete even when peer checkpoint queues are full. Monitor action
+drops: subsequent owner loss can redeliver work whose checkpoint did not propagate.
+[Follow-up cluster results](RESILIENCE-DELIVERY-RESULTS.md) distinguish the tested repairs
+from unfinished per-key completion gating and retention admission.

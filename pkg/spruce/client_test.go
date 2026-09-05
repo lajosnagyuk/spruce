@@ -109,6 +109,9 @@ func TestDefaultSubscribeBatchesAcks(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/deliveries/ack" {
+			if r.Header.Get("Spruce-Delivery-Affinity") != completionAffinity("t", "workers") {
+				t.Errorf("missing completion routing scope: %v", r.Header)
+			}
 			calls.Add(1)
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -124,7 +127,7 @@ func TestDefaultSubscribeBatchesAcks(t *testing.T) {
 	}))
 	defer server.Close()
 	c := New(server.URL)
-	last, err := c.subscribeOnce(context.Background(), SubscribeOptions{Topic: "t"}, func(context.Context, Delivery) error { return nil })
+	last, err := c.subscribeOnce(context.Background(), SubscribeOptions{Topic: "t", Group: "workers"}, func(context.Context, Delivery) error { return nil })
 	if err == nil {
 		t.Fatal("expected stream EOF")
 	}
@@ -470,5 +473,11 @@ func TestDefaultPublishRetryOutlastsTransientDrain(t *testing.T) {
 	result, err := New(server.URL).PublishRetry(ctx, "t", []byte("event"), PublishOptions{ProducerID: "p", IdempotencyKey: "operation", Ack: "available", Compression: "off"}, RetryOptions{})
 	if err != nil || attempts.Load() != 4 || result.ConfirmedCopies != 1 || !result.Degraded {
 		t.Fatalf("drain recovery: attempts=%d result=%+v err=%v", attempts.Load(), result, err)
+	}
+}
+
+func TestCompletionAffinityUTF8Vector(t *testing.T) {
+	if got := completionAffinity("shared-topic", "group é/+"); got != "e55cbafe41fd93ae0d545bf3d420c3f191bc6b140698f12e2a4e7e9f2794b242" {
+		t.Fatal(got)
 	}
 }

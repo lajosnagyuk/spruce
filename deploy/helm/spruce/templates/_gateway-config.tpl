@@ -15,9 +15,14 @@ http {
   proxy_ssl_server_name on;
   proxy_ssl_name {{ include "spruce.fullname" . }}-headless.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }};
   {{- end }}
-  map $arg_topic $stream_key {
+  map $http_spruce_delivery_affinity $scoped_completion { "" 0; default 1; }
+  map $arg_topic $legacy_stream_key {
     "" "$remote_addr:$remote_port:$connection";
-    default "$arg_topic";
+    default "$arg_topic:$arg_group";
+  }
+  map $http_spruce_delivery_affinity $stream_key {
+    "" $legacy_stream_key;
+    default $http_spruce_delivery_affinity;
   }
   map $uri $publish_key {
     ~^/v1/topics/(?<publish_topic>[A-Za-z0-9._-]+)/(messages|batches)$ $publish_topic;
@@ -81,6 +86,20 @@ http {
       proxy_read_timeout 1h;
       proxy_next_upstream error timeout http_502 http_503 http_504 non_idempotent;
       proxy_next_upstream_tries 3;
+    }
+    location ~ ^/v1/deliveries/(ack|nack)$ {
+      error_page 418 = @scoped_completion;
+      if ($scoped_completion) { return 418; }
+      proxy_pass {{ include "spruce.scheme" . }}://brokers;
+      proxy_http_version 1.1;
+      proxy_set_header Connection "";
+      proxy_connect_timeout 250ms;
+    }
+    location @scoped_completion {
+      proxy_pass {{ include "spruce.scheme" . }}://streams;
+      proxy_http_version 1.1;
+      proxy_set_header Connection "";
+      proxy_connect_timeout 250ms;
     }
     location / {
       proxy_pass {{ include "spruce.scheme" . }}://brokers;

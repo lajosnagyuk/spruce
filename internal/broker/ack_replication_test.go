@@ -59,36 +59,46 @@ func TestRoutedAckPropagatesOwnerCheckpoint(t *testing.T) {
 	}
 }
 
-func TestInternalAckRetainsPendingWhenCheckpointQueueFull(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.PeerToken, cfg.ClusterID = "synthetic-peer", "synthetic-cluster"
-	b := New(cfg)
-	defer b.Close()
-	// No action worker: an unbuffered queue must reject admission.
-	b.peers = []*peer{{acks: make(chan actionBatch)}}
-	sub := &subscriber{id: "member", topic: "t", group: "workers", ch: make(chan Delivery, 1)}
-	b.mu.Lock()
-	b.addSubscriberLocked(sub)
-	b.mu.Unlock()
-	m := &Message{ID: "event", Topic: "t", Payload: []byte("event"), ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
-	if !b.sendDelivery(sub, m, 1) {
-		t.Fatal("delivery rejected")
-	}
-	delivery := <-sub.ch
-	body, _ := json.Marshal(ackRequest{DeliveryIDs: []string{delivery.DeliveryID}})
-	r := httptest.NewRequest("POST", "/internal/ack", bytes.NewReader(body))
-	r.Header.Set("Spruce-Peer-Token", cfg.PeerToken)
-	r.Header.Set("Spruce-Cluster-ID", cfg.ClusterID)
-	w := httptest.NewRecorder()
-	b.Handler().ServeHTTP(w, r)
-	if w.Code != 503 {
-		t.Fatalf("status %d: %s", w.Code, w.Body.String())
-	}
-	if len(b.checkpointsForAcks([]string{delivery.DeliveryID})) != 1 {
-		t.Fatal("failed forwarding discarded retryable pending state")
-	}
-	if b.peers[0].actionBytes.Load() != 0 {
-		t.Fatal("failed admission leaked queue bytes")
+func TestAckCompletesLocallyWhenCheckpointQueueFull(t *testing.T) {
+	for _, path := range []string{"/internal/ack", "/v1/deliveries/ack"} {
+		t.Run(path, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.PeerToken, cfg.ClusterID = "synthetic-peer", "synthetic-cluster"
+			b := New(cfg)
+			defer b.Close()
+			// No action worker: an unbuffered queue must reject admission.
+			b.peers = []*peer{{acks: make(chan actionBatch)}}
+			sub := &subscriber{id: "member", topic: "t", group: "workers", ch: make(chan Delivery, 1)}
+			b.mu.Lock()
+			b.addSubscriberLocked(sub)
+			b.mu.Unlock()
+			m := &Message{ID: "event", Topic: "t", Payload: []byte("event"), ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
+			if !b.sendDelivery(sub, m, 1) {
+				t.Fatal("delivery rejected")
+			}
+			delivery := <-sub.ch
+			body, _ := json.Marshal(ackRequest{DeliveryIDs: []string{delivery.DeliveryID}})
+			r := httptest.NewRequest("POST", path, bytes.NewReader(body))
+			r.Header.Set("Spruce-Peer-Token", cfg.PeerToken)
+			r.Header.Set("Spruce-Cluster-ID", cfg.ClusterID)
+			w := httptest.NewRecorder()
+			b.Handler().ServeHTTP(w, r)
+			if w.Code != 204 {
+				t.Fatalf("status %d: %s", w.Code, w.Body.String())
+			}
+			if len(b.checkpointsForAcks([]string{delivery.DeliveryID})) != 0 {
+				t.Fatal("failed replica prevented local completion")
+			}
+			b.mu.RLock()
+			completed := b.checkpointActiveLocked("t", "workers", "event", time.Now().UnixMilli())
+			b.mu.RUnlock()
+			if !completed || b.metrics.AckActionDropped.Load() == 0 {
+				t.Fatal("local completion or propagation-drop evidence missing")
+			}
+			if b.peers[0].actionBytes.Load() != 0 {
+				t.Fatal("failed admission leaked queue bytes")
+			}
+		})
 	}
 }
 
