@@ -1,0 +1,103 @@
+name: Kubernetes integration
+on:
+  workflow_dispatch:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  kubernetes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@bf6a7d304bc2fdb57e0331155b7ebf2c504acf0a # v4
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with: {cluster_name: spruce-ci}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: {go-version: '1.26.x'}
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with: {dotnet-version: '8.0.x'}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: {python-version: '3.11'}
+      - name: Install Python client dependencies
+        run: python -m pip install ./clients/python
+      - run: |
+          docker build -t spruce:ci .
+          kind load docker-image spruce:ci --name spruce-ci
+          mkdir -p .cache/ci-tls
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj '/CN=localhost' \
+            -addext 'subjectAltName=DNS:localhost,DNS:spruce-headless.spruce.svc.cluster.local,DNS:*.spruce-headless.spruce.svc.cluster.local' \
+            -keyout .cache/ci-tls/tls.key -out .cache/ci-tls/tls.crt
+          cp .cache/ci-tls/tls.crt .cache/ci-tls/ca.crt
+          kubectl create namespace spruce
+          kubectl label namespace spruce spruce.io/ingress-access=true
+          kubectl -n spruce create secret generic spruce-tls \
+            --from-file=tls.crt=.cache/ci-tls/tls.crt --from-file=tls.key=.cache/ci-tls/tls.key --from-file=ca.crt=.cache/ci-tls/ca.crt
+          kubectl -n spruce create secret tls spruce-public-tls --cert=.cache/ci-tls/tls.crt --key=.cache/ci-tls/tls.key
+          helm upgrade --install spruce deploy/helm/spruce --namespace spruce --create-namespace \
+            --set image.repository=spruce --set image.tag=ci --set image.pullPolicy=Never \
+            --set tls.enabled=true --set tls.existingSecret=spruce-tls \
+            --set ingress.enabled=true --set ingress.hosts[0].host=localhost \
+            --set ingress.hosts[0].paths[0].path=/ --set ingress.hosts[0].paths[0].pathType=Prefix \
+            --set ingress.tls[0].secretName=spruce-public-tls --set ingress.tls[0].hosts[0]=localhost \
+            --wait --timeout 5m
+          helm test spruce --namespace spruce --logs --timeout 3m
+          cat <<'EOF' | kubectl -n spruce apply -f -
+          apiVersion: v1
+          kind: ConfigMap
+          metadata: {name: ci-ingress}
+          data:
+            nginx.conf: |
+              events {}
+              http { server { listen 8443 ssl; ssl_certificate /tls/tls.crt; ssl_certificate_key /tls/tls.key; location / { proxy_pass http://spruce:8080; proxy_http_version 1.1; proxy_set_header Connection ""; proxy_buffering off; } } }
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: ci-ingress}
+          spec:
+            replicas: 1
+            selector: {matchLabels: {app: ci-ingress}}
+            template:
+              metadata: {labels: {app: ci-ingress}}
+              spec:
+                containers:
+                  - name: nginx
+                    image: nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+                    ports: [{name: https, containerPort: 8443}]
+                    volumeMounts: [{name: config, mountPath: /etc/nginx/nginx.conf, subPath: nginx.conf}, {name: tls, mountPath: /tls, readOnly: true}]
+                volumes: [{name: config, configMap: {name: ci-ingress}}, {name: tls, secret: {secretName: spruce-public-tls}}]
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: {name: ci-ingress}
+          spec: {selector: {app: ci-ingress}, ports: [{name: https, port: 443, targetPort: https}]}
+          EOF
+          kubectl -n spruce rollout status deploy/ci-ingress --timeout=2m
+      - name: Verified TLS conformance and rotation
+        run: |
+          set -eu
+          token=$(kubectl -n spruce get secret spruce-auth -o jsonpath='{.data.client-token}' | base64 -d)
+          start_forward() { kubectl -n spruce port-forward service/ci-ingress 8443:443 >.cache/port-forward.log 2>&1 & forward=$!; }
+          wait_ready() { ready=0; for i in $(seq 1 30); do if curl --cacert .cache/ci-tls/ca.crt -fsS https://localhost:8443/health/ready >/dev/null; then ready=1; break; fi; sleep 1; done; test "$ready" = 1; }
+          start_forward
+          trap 'kill "$forward" 2>/dev/null || true' EXIT
+          if curl -fsS https://localhost:8443/health/ready >/dev/null 2>&1; then echo 'untrusted broker certificate was accepted' >&2; exit 1; fi
+          wait_ready
+          sudo cp .cache/ci-tls/ca.crt /usr/local/share/ca-certificates/spruce-ci.crt
+          sudo update-ca-certificates
+          export SPRUCE_URL=https://localhost:8443 SPRUCE_TOKEN="$token" SPRUCE_CA_FILE="$PWD/.cache/ci-tls/ca.crt"
+          SSL_CERT_FILE="$SPRUCE_CA_FILE" go run ./cmd/spruce-integration -server "$SPRUCE_URL" -token "$token" -topics 1 -messages 100 -producers 2 -broadcast-consumers 1 -group-consumers 2 -timeout 30s
+          SSL_CERT_FILE="$SPRUCE_CA_FILE" dotnet run --project clients/csharp/Spruce.ClusterProbe/Spruce.ClusterProbe.csproj -- "$SPRUCE_URL" "$token"
+          PYTHONPATH=clients/python/src python clients/python/cluster_probe.py
+          SPRUCE_TLS_EXTRA_DNS=localhost sh scripts/k3s-rotate-tls.sh
+          kubectl -n spruce get secret spruce-tls -o jsonpath='{.data.ca\.crt}' | base64 -d >.cache/ci-tls/rotated-ca.crt
+          kill "$forward" 2>/dev/null || true; wait "$forward" 2>/dev/null || true
+          start_forward
+          wait_ready
+          kubectl -n spruce port-forward service/spruce-admin 8445:8080 >.cache/internal-port-forward.log 2>&1 & internal_forward=$!
+          internal_ready=0; for i in $(seq 1 30); do if curl --cacert .cache/ci-tls/rotated-ca.crt -fsS https://localhost:8445/health/ready >/dev/null; then internal_ready=1; break; fi; sleep 1; done; test "$internal_ready" = 1
+          if curl --cacert .cache/ci-tls/ca.crt -fsS https://localhost:8445/health/ready >/dev/null 2>&1; then echo 'rotated broker retained old trust unexpectedly' >&2; kill "$internal_forward"; exit 1; fi
+          kill "$internal_forward" 2>/dev/null || true; wait "$internal_forward" 2>/dev/null || true
+          SSL_CERT_FILE="$SPRUCE_CA_FILE" go run ./cmd/spruce-integration -server "$SPRUCE_URL" -token "$token" -topics 1 -messages 100 -producers 2 -broadcast-consumers 1 -group-consumers 2 -timeout 30s
+          SSL_CERT_FILE="$SPRUCE_CA_FILE" dotnet run --project clients/csharp/Spruce.ClusterProbe/Spruce.ClusterProbe.csproj -- "$SPRUCE_URL" "$token"
+          PYTHONPATH=clients/python/src python clients/python/cluster_probe.py

@@ -214,7 +214,13 @@ make image
 make helm-lint
 ```
 
-Performance results and methodology are documented in [docs/PERFORMANCE.md](docs/PERFORMANCE.md). CI runs correctness, race, all-client conformance, Helm validation, and verified public/internal TLS rotation checks; a scheduled full-cache soak enforces the bounded memory envelope.
+Performance results and methodology are documented in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+PR and main-branch CI run correctness, race, performance, client conformance, package
+builds, and Helm validation without creating a Kubernetes cluster. Superseded PR runs
+are cancelled. The separate **Kubernetes integration** workflow deploys a disposable
+kind cluster for live client conformance and public/internal TLS rotation checks. It
+can run manually and must pass before tagged releases publish any packages.
+A scheduled full-cache soak enforces the bounded memory envelope.
 
 ## Repository guide
 
