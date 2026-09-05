@@ -30,10 +30,12 @@ reject --set config.publishAdmissionBytes=0
 reject --set config.publishAdmissionWait=0s
 reject --set config.deliveryLagLimit=0s
 reject --set config.goMemoryLimit=0MiB
-reject --set config.goMemoryLimit=224MiB
-reject --set-string config.memorySafetyMarginBytes=134217728
+# Check the exact boundary and each budget one byte over it, independently of defaults.
+render --set resources.limits.memory=320Mi --set config.goMemoryLimit=176MiB --set-string config.memorySafetyMarginBytes=150994944
+reject --set resources.limits.memory=320Mi --set-string config.goMemoryLimit=184549377 --set-string config.memorySafetyMarginBytes=150994944
+reject --set resources.limits.memory=320Mi --set config.goMemoryLimit=176MiB --set-string config.memorySafetyMarginBytes=150994945
 render --set resources.limits.memory=512Mi --set config.goMemoryLimit=384MiB --set-string config.memorySafetyMarginBytes=134217728
-render --set resources.limits.memory=300M --set config.goMemoryLimit=192MiB
+render --set resources.limits.memory=300M --set config.goMemoryLimit=192MiB --set-string config.memorySafetyMarginBytes=67108864
 render --set resources.limits.memory=0.5Gi --set config.goMemoryLimit=384MiB --set-string config.memorySafetyMarginBytes=67108864
 reject --set resources.limits.memory=watts
 reject --set replicaCount=3 --set podDisruptionBudget.maxUnavailable=3
