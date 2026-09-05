@@ -56,9 +56,61 @@ var disposeBatcher = new ProducerBatcher(failedClient, new(MaxDelay: TimeSpan.Fr
 var disposePublish = disposeBatcher.PublishAsync("dispose-failure", new byte[] { 1 });
 try { await disposeBatcher.DisposeAsync(); throw new Exception("dispose hid batch failure"); } catch (SpruceException) { }
 try { await disposePublish; throw new Exception("dispose stranded publish failure"); } catch (SpruceException) { }
+foreach (var delay in new[] { TimeSpan.Zero, TimeSpan.FromSeconds(-1), TimeSpan.FromDays(2) })
+{
+    try { _ = new ProducerBatcher(client, new(MaxDelay: delay)); throw new Exception("invalid delay accepted"); }
+    catch (ArgumentOutOfRangeException) { }
+}
+
+await using (var batcher = new ProducerBatcher(client, new(MaxBytes: 10, MaxDelay: TimeSpan.FromMilliseconds(10))))
+{
+    // Each UTF-8 key consumes four bytes: these entries must be separate batches.
+    var before = requests;
+    await Task.WhenAll(batcher.PublishAsync("keys", Array.Empty<byte>(), new(Key: "éé")),
+                       batcher.PublishAsync("keys", Array.Empty<byte>(), new(Key: "éé")));
+    if (requests - before != 2) throw new Exception("byte-boundary split failed");
+}
+
+var stalled = new StalledHandler();
+using (var stalledHttp = new HttpClient(stalled))
+{
+    var batcher = new ProducerBatcher(new SpruceClient("https://spruce.invalid", stalledHttp), new(MaxMessages: 1, QueueDepth: 1));
+    var first = batcher.PublishAsync("t", new byte[] { 1 });
+    await stalled.Entered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+    var second = batcher.PublishAsync("t", new byte[] { 2 });
+    var waiting = batcher.PublishAsync("t", new byte[] { 3 });
+    var closing = batcher.DisposeAsync().AsTask();
+    try { await waiting.WaitAsync(TimeSpan.FromSeconds(1)); throw new Exception("waiting admission survived close"); }
+    catch (OperationCanceledException) { }
+    stalled.Release.TrySetResult();
+    await Task.WhenAll(first, second, closing).WaitAsync(TimeSpan.FromSeconds(2));
+}
+var timersBefore = Timer.ActiveCount;
+await using (var batcher = new ProducerBatcher(client, new(MaxMessages: 2, MaxDelay: TimeSpan.FromDays(1))))
+{
+    for (var i = 0; i < 32; i++)
+    {
+        var first = batcher.PublishAsync("timers", new byte[] { 1 });
+        await Task.Delay(2);
+        await Task.WhenAll(first, batcher.PublishAsync("timers", new byte[] { 2 }));
+    }
+}
+if (Timer.ActiveCount > timersBefore + 8) throw new Exception("completed batches retained deadline timers");
 Console.WriteLine("C# producer batcher conformance passed");
 
 sealed class StubHandler(Func<HttpRequestMessage, Task<HttpResponseMessage>> responder) : HttpMessageHandler
 {
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => responder(request);
+}
+
+sealed class StalledHandler : HttpMessageHandler
+{
+    public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        Entered.TrySetResult();
+        await Release.Task.WaitAsync(cancellationToken);
+        return new HttpResponseMessage(HttpStatusCode.Accepted) { Content = JsonContent.Create(new { ids = new[] { "id" } }) };
+    }
 }

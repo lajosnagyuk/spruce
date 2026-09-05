@@ -112,31 +112,35 @@ type Delivery struct {
 	Payload    []byte            `json:"-"`
 	origin     string
 	sequence   uint64
+	expiresAt  int64
 }
 
 type cache struct {
-	mu              sync.Mutex
-	items           map[string]*Message
-	order           []*Message
-	orderHead       int
-	expiry          expiryHeap
-	expiryItems     map[int64]*expiryItem
-	tombstones      int
-	topics          map[string][]*Message
-	topicTombstones map[string]int
-	frontiers       map[string]*topicFrontier
-	frontierLimit   int
-	unsafe          map[string]map[string]int64
-	topicSequences  map[string]*topicSequence
-	receivedThrough map[string]uint64
-	reorder         map[string]map[uint64]*Message
-	reorderBytes    int64
-	reorderLimit    int
-	bytes           int64
-	maxBytes        int64
-	rejectPressure  bool
-	evicted         atomic.Uint64
-	expired         atomic.Uint64
+	mu                 sync.Mutex
+	items              map[string]*Message
+	order              []*Message
+	orderHead          int
+	expiry             expiryHeap
+	expiryItems        map[int64]*expiryItem
+	tombstones         int
+	topics             map[string][]*Message
+	topicTombstones    map[string]int
+	frontiers          map[string]*topicFrontier
+	frontierLimit      int
+	unsafe             map[string]map[string]int64
+	topicSequences     map[string]*topicSequence
+	receivedThrough    map[string]uint64
+	receivedUntil      map[string]int64
+	nextMetadataExpiry int64
+	reorder            map[string]map[uint64]*Message
+	reorderSince       map[string]int64
+	reorderBytes       int64
+	reorderLimit       int
+	bytes              int64
+	maxBytes           int64
+	rejectPressure     bool
+	evicted            atomic.Uint64
+	expired            atomic.Uint64
 }
 
 type topicSequence struct {
@@ -185,7 +189,7 @@ func newCache(max int64) *cache {
 	if limit < 1024 {
 		limit = 1024
 	}
-	return &cache{items: make(map[string]*Message), expiryItems: make(map[int64]*expiryItem), topics: make(map[string][]*Message), topicTombstones: make(map[string]int), frontiers: make(map[string]*topicFrontier), frontierLimit: limit, unsafe: make(map[string]map[string]int64), topicSequences: make(map[string]*topicSequence), receivedThrough: make(map[string]uint64), reorder: make(map[string]map[uint64]*Message), reorderLimit: 4096, maxBytes: max}
+	return &cache{items: make(map[string]*Message), expiryItems: make(map[int64]*expiryItem), topics: make(map[string][]*Message), topicTombstones: make(map[string]int), frontiers: make(map[string]*topicFrontier), frontierLimit: limit, unsafe: make(map[string]map[string]int64), topicSequences: make(map[string]*topicSequence), receivedThrough: make(map[string]uint64), receivedUntil: make(map[string]int64), reorder: make(map[string]map[uint64]*Message), reorderSince: make(map[string]int64), reorderLimit: 4096, maxBytes: max}
 }
 
 func (c *cache) markUnsafeLocked(topic, source string, until int64) {
@@ -494,32 +498,44 @@ func (c *cache) unlinkExpiryLocked(m *Message) {
 
 func (c *cache) expire(now int64) { c.mu.Lock(); c.expireLocked(now); c.mu.Unlock() }
 func (c *cache) expireLocked(now int64) {
-	for topic, frontier := range c.frontiers {
-		if frontier.ExpiresAt <= now {
-			delete(c.frontiers, topic)
-		}
-	}
-	for topic := range c.unsafe {
-		c.topicUnsafeLocked(topic, now)
-	}
-	for topic, sequence := range c.topicSequences {
-		if sequence.expiresAt <= now && len(c.topics[topic]) == 0 {
-			delete(c.topicSequences, topic)
-		}
-	}
-	for origin, gaps := range c.reorder {
-		topic := ""
-		for sequence, m := range gaps {
-			topic = m.Topic
-			if m.ExpiresAt <= now {
-				c.reorderBytes -= messageSize(m)
-				delete(gaps, sequence)
+	// Payload expiry remains exact; historical metadata needs only the maintenance
+	// cadence, not a full scan on every publication.
+	if now >= c.nextMetadataExpiry {
+		c.nextMetadataExpiry = now + 1000
+		for origin, until := range c.receivedUntil {
+			if until <= now && len(c.reorder[origin]) == 0 {
+				delete(c.receivedUntil, origin)
+				delete(c.receivedThrough, origin)
 			}
 		}
-		if len(gaps) == 0 {
-			delete(c.reorder, origin)
-			if topic != "" {
-				c.clearUnsafeLocked(topic, "gap:"+origin)
+		for topic, frontier := range c.frontiers {
+			if frontier.ExpiresAt <= now {
+				delete(c.frontiers, topic)
+			}
+		}
+		for topic := range c.unsafe {
+			c.topicUnsafeLocked(topic, now)
+		}
+		for topic, sequence := range c.topicSequences {
+			if sequence.expiresAt <= now && len(c.topics[topic]) == 0 {
+				delete(c.topicSequences, topic)
+			}
+		}
+		for origin, gaps := range c.reorder {
+			topic := ""
+			for sequence, m := range gaps {
+				topic = m.Topic
+				if m.ExpiresAt <= now {
+					c.reorderBytes -= messageSize(m)
+					delete(gaps, sequence)
+				}
+			}
+			if len(gaps) == 0 {
+				delete(c.reorder, origin)
+				delete(c.reorderSince, origin)
+				if topic != "" {
+					c.clearUnsafeLocked(topic, "gap:"+origin)
+				}
 			}
 		}
 	}
@@ -619,6 +635,9 @@ func (c *cache) page(after string, maxBytes int64) ([]*Message, string, bool) {
 		if m := c.order[i]; m != nil {
 			sz := messageSize(m)
 			if bytes+sz > maxBytes {
+				if len(out) == 0 {
+					return nil, "", false
+				}
 				break
 			}
 			out, bytes, next = append(out, m), bytes+sz, m.ID
@@ -732,18 +751,25 @@ func (h *pendingHeap) Pop() any {
 }
 
 type peer struct {
-	url              string
-	ch               chan []*Message
-	queuedBytes      atomic.Int64
-	actionBytes      atomic.Int64
-	acks             chan actionBatch
-	nacks            chan actionBatch
-	v2               atomic.Bool
-	legacy           atomic.Bool
-	probeMu          sync.Mutex
-	lastV2Probe      atomic.Int64
-	unavailableUntil atomic.Int64
-	copySlots        chan struct{}
+	url                string
+	ch                 chan []*Message
+	queuedBytes        atomic.Int64
+	actionBytes        atomic.Int64
+	acks               chan actionBatch
+	nacks              chan actionBatch
+	v2                 atomic.Bool
+	legacy             atomic.Bool
+	probeMu            sync.Mutex
+	lastV2Probe        atomic.Int64
+	unavailableUntil   atomic.Int64
+	repairVersion      atomic.Uint64
+	repairCompleted    atomic.Uint64
+	repairCursor       string
+	repairStarted      uint64
+	gapRepairVersion   atomic.Uint64
+	gapRepairCompleted atomic.Uint64
+	gapRepairAfter     atomic.Int64
+	copySlots          chan struct{}
 }
 
 func writePeerBatchV1(w io.Writer, messages []*Message) error {
@@ -875,10 +901,14 @@ type idempotencyEntry struct {
 	fingerprint [32]byte
 	inProgress  bool
 }
-type idempotencyOrderEntry struct{ key, id string }
+type idempotencyOrderEntry struct {
+	key   string
+	entry *idempotencyEntry
+}
 
 type Metrics struct {
 	GroupExpired                                                                                      atomic.Uint64
+	RepairPages, RepairMessages, RepairErrors                                                         atomic.Uint64
 	Published, PublishBytes, Rejected, OverloadRejected, CursorExpired, Replicated, ReplicationErrors atomic.Uint64
 	ReplicationDropped, ReplicationPressureRejected, DeliveryPressureRejected                         atomic.Uint64
 	AckActionDropped, NackActionDropped                                                               atomic.Uint64
@@ -902,6 +932,7 @@ type Broker struct {
 	topicBroadcast        map[string]map[string]*subscriber
 	topicGroups           map[string]map[string]map[string]*subscriber
 	groupWork             map[checkpointScope]*groupWorkState
+	groupWorkByTopic      map[string]map[string]*groupWorkState
 	groupWake             chan struct{}
 	groupMemoryBytes      int64
 	pending               map[string]*pending
@@ -1035,6 +1066,7 @@ func New(cfg Config) *Broker {
 		requestSlots: make(chan struct{}, cfg.MaxConcurrentRequests), streamSlots: make(chan struct{}, cfg.MaxStreams), digestSlot: make(chan struct{}, 1), replicationFreed: make(chan struct{}, 1)}
 	b.cache.rejectPressure = true
 	b.groupWork = make(map[checkpointScope]*groupWorkState)
+	b.groupWorkByTopic = make(map[string]map[string]*groupWorkState)
 	b.groupWake = make(chan struct{}, 1)
 	b.internalSlots = make(chan struct{}, cfg.MaxInternalRequests)
 	if _, err := rand.Read(b.boot[:]); err != nil {
@@ -1222,6 +1254,7 @@ func (b *Broker) routes() {
 	b.mux.HandleFunc("POST /v1/deliveries/ack", b.ack)
 	b.mux.HandleFunc("POST /v1/deliveries/nack", b.nack)
 	b.mux.HandleFunc("POST /internal/replicate", b.replicate)
+	b.mux.HandleFunc("POST /internal/repair", b.replicate)
 	b.mux.HandleFunc("GET /internal/snapshot", b.snapshot)
 	b.mux.HandleFunc("GET /internal/checkpoints", b.checkpointSnapshot)
 	b.mux.HandleFunc("GET /internal/replay-frontiers", b.replayFrontierSnapshot)
@@ -1347,7 +1380,7 @@ func (b *Broker) publishBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		var size [4]byte
 		_, err := io.ReadFull(reader, size[:])
-		if errors.Is(err, io.EOF) {
+		if errors.Is(err, io.EOF) && version != "2" {
 			break
 		}
 		if err != nil {
@@ -1376,6 +1409,9 @@ func (b *Broker) publishBatch(w http.ResponseWriter, r *http.Request) {
 	if len(payloads) == maxBatchMessages {
 		if _, err := reader.Peek(1); err == nil {
 			problem(w, 413, "too_many_batch_messages")
+			return
+		} else if !errors.Is(err, io.EOF) {
+			problem(w, 400, "invalid_batch")
 			return
 		}
 	}
@@ -1500,7 +1536,7 @@ func (b *Broker) beginIdempotency(ctx context.Context, key, id string, expiresAt
 			evicted := false
 			for i, candidate := range b.idempotencyOrder {
 				current := b.idempotency[candidate.key]
-				if current == nil || current.id != candidate.id {
+				if current == nil || current != candidate.entry {
 					continue
 				}
 				if current.inProgress {
@@ -1518,14 +1554,15 @@ func (b *Broker) beginIdempotency(ctx context.Context, key, id string, expiresAt
 		}
 		entry := &idempotencyEntry{id: id, expiresAt: expiresAt, ready: make(chan struct{}), fingerprint: fingerprint, inProgress: true}
 		b.idempotency[key] = entry
-		b.idempotencyOrder = append(b.idempotencyOrder, idempotencyOrderEntry{key: key, id: id})
+		b.idempotencyOrder = append(b.idempotencyOrder, idempotencyOrderEntry{key: key, entry: entry})
 		if len(b.idempotencyOrder) > 2*b.cfg.IdempotencyEntries {
 			compacted := b.idempotencyOrder[:0]
 			for _, item := range b.idempotencyOrder {
-				if current := b.idempotency[item.key]; current != nil && current.id == item.id {
+				if current := b.idempotency[item.key]; current != nil && current == item.entry {
 					compacted = append(compacted, item)
 				}
 			}
+			clear(b.idempotencyOrder[len(compacted):])
 			b.idempotencyOrder = compacted
 		}
 		b.mu.Unlock()
@@ -1762,6 +1799,9 @@ func (b *Broker) acceptLocked(m *Message) (bool, error) {
 	if m.Origin == "" && b.cache.topicSequences[m.Topic] == nil && len(b.cache.topicSequences) >= b.cache.frontierLimit {
 		return false, errors.New("topic sequence capacity")
 	}
+	if !b.cache.originCapacityLocked([]*Message{m}) {
+		return false, errRetentionCapacity
+	}
 	if err := b.prepareGroupWork([]*Message{m}); err != nil {
 		return false, err
 	}
@@ -1778,7 +1818,7 @@ func (b *Broker) acceptLocked(m *Message) (bool, error) {
 		state.next++
 		state.expiresAt = max(state.expiresAt, m.ExpiresAt)
 		m.Origin, m.Sequence = state.origin, state.next
-		b.cache.receivedThrough[m.Origin] = m.Sequence
+		b.cache.recordReceivedLocked(m)
 	}
 	inserted, err := b.cache.insertLocked(m)
 	if err != nil || !inserted {
@@ -1794,6 +1834,10 @@ func (b *Broker) acceptLocked(m *Message) (bool, error) {
 func (b *Broker) acceptBatch(messages []*Message) error {
 	b.cache.mu.Lock()
 	defer b.cache.mu.Unlock()
+	return b.acceptBatchLocked(messages, false)
+}
+
+func (b *Broker) acceptBatchLocked(messages []*Message, repair bool) error {
 	b.cache.expireLocked(time.Now().UnixMilli())
 	// Admission must precede sequence assignment: rejected batches must not
 	// leave holes that replicas can never fill.
@@ -1815,16 +1859,36 @@ func (b *Broker) acceptBatch(messages []*Message) error {
 	var added int64
 	for _, m := range messages {
 		if b.cache.items[m.ID] == nil {
-			added += messageSize(m)
+			buffered := b.cache.reorder[m.Origin][m.Sequence]
+			if !repair || buffered == nil || buffered.ID != m.ID {
+				added += messageSize(m)
+			}
 		}
 	}
 	if b.cache.bytes+b.cache.reorderBytes+added > b.cache.maxBytes {
+		return errRetentionCapacity
+	}
+	if !b.cache.originCapacityLocked(messages) {
 		return errRetentionCapacity
 	}
 	if err := b.prepareGroupWork(messages); err != nil {
 		return err
 	}
 	for _, m := range messages {
+		if repair {
+			if buffered := b.cache.reorder[m.Origin][m.Sequence]; buffered != nil && buffered.ID == m.ID {
+				delete(b.cache.reorder[m.Origin], m.Sequence)
+				b.cache.reorderBytes -= messageSize(buffered)
+				if len(b.cache.reorder[m.Origin]) == 0 {
+					delete(b.cache.reorder, m.Origin)
+					delete(b.cache.reorderSince, m.Origin)
+					b.cache.clearUnsafeLocked(m.Topic, "gap:"+m.Origin)
+				}
+			}
+			if m.Sequence > b.cache.receivedThrough[m.Origin]+1 {
+				b.cache.markUnsafeLocked(m.Topic, "repair:"+m.Origin, m.ExpiresAt)
+			}
+		}
 		if existing := b.cache.items[m.ID]; existing != nil {
 			m.Origin, m.Sequence = existing.Origin, existing.Sequence
 			continue
@@ -1842,9 +1906,9 @@ func (b *Broker) acceptBatch(messages []*Message) error {
 			state.next++
 			state.expiresAt = max(state.expiresAt, m.ExpiresAt)
 			m.Origin, m.Sequence = state.origin, state.next
-			b.cache.receivedThrough[m.Origin] = m.Sequence
+			b.cache.recordReceivedLocked(m)
 		} else {
-			b.cache.receivedThrough[m.Origin] = max(b.cache.receivedThrough[m.Origin], m.Sequence)
+			b.cache.recordReceivedLocked(m)
 		}
 	}
 	inserted := b.cache.insertBatchLocked(messages)
@@ -1874,6 +1938,9 @@ func (b *Broker) acceptReplicatedBatch(messages []*Message) error {
 		if m.Origin == "" || m.Sequence == 0 || messageSize(m) > b.cache.maxBytes {
 			return errors.New("invalid replicated sequence")
 		}
+	}
+	if !b.cache.originCapacityLocked(messages) {
+		return errRetentionCapacity
 	}
 	var added int64
 	seen := make(map[sequenceKey]struct{}, len(messages))
@@ -1930,6 +1997,9 @@ func (b *Broker) acceptReplicatedBatch(messages []*Message) error {
 				return errRetentionCapacity
 			}
 			gaps[m.Sequence] = m
+			if b.cache.reorderSince[m.Origin] == 0 {
+				b.cache.reorderSince[m.Origin] = now
+			}
 			b.cache.reorderBytes += messageSize(m)
 			b.cache.markUnsafeLocked(m.Topic, "gap:"+m.Origin, m.ExpiresAt)
 			continue
@@ -1950,7 +2020,7 @@ func (b *Broker) acceptReplicatedBatch(messages []*Message) error {
 			if err != nil {
 				return err
 			}
-			b.cache.receivedThrough[current.Origin] = current.Sequence
+			b.cache.recordReceivedLocked(current)
 			if inserted {
 				b.deliver(current, "", 1)
 			} else {
@@ -1963,6 +2033,7 @@ func (b *Broker) acceptReplicatedBatch(messages []*Message) error {
 			}
 			if len(b.cache.reorder[current.Origin]) == 0 {
 				delete(b.cache.reorder, current.Origin)
+				delete(b.cache.reorderSince, current.Origin)
 				b.cache.clearUnsafeLocked(current.Topic, "gap:"+current.Origin)
 			}
 			current = next
@@ -2003,6 +2074,7 @@ peerLoop:
 			queued := p.queuedBytes.Load()
 			if queued+bytes > b.cfg.ReplicationQueueBytes {
 				b.metrics.ReplicationDropped.Add(uint64(len(messages)))
+				p.repairVersion.Add(1)
 				break
 			}
 			if !p.queuedBytes.CompareAndSwap(queued, queued+bytes) {
@@ -2013,6 +2085,7 @@ peerLoop:
 			default:
 				p.queuedBytes.Add(-bytes)
 				b.metrics.ReplicationDropped.Add(uint64(len(messages)))
+				p.repairVersion.Add(1)
 			}
 			break
 		}
@@ -2330,16 +2403,28 @@ func (b *Broker) sendPeerBody(ctx context.Context, p *peer, body []byte, count i
 		return false
 	}
 	p.unavailableUntil.Store(0)
+	if resp.Header.Get("Spruce-Repair-Required") == "true" {
+		p.gapRepairVersion.Add(1)
+		p.gapRepairAfter.CompareAndSwap(0, time.Now().Add(time.Second).UnixNano())
+	}
 	b.metrics.Replicated.Add(uint64(count))
 	return true
 }
 
 func (b *Broker) peerLoop(p *peer) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 	var encoded bytes.Buffer
 	for {
 		select {
 		case <-b.stop:
 			return
+		case <-ticker.C:
+			for range 4 {
+				if !b.repairPeerStep(p) {
+					break
+				}
+			}
 		case batch := <-p.ch:
 			b.probePeerV2(context.Background(), p)
 			encoded.Reset()
@@ -2379,6 +2464,7 @@ func (b *Broker) peerLoop(p *peer) {
 			}
 			if !replicated {
 				b.metrics.ReplicationDropped.Add(uint64(len(batch)))
+				p.repairVersion.Add(1)
 			}
 			p.queuedBytes.Add(-batchBytes(batch))
 			b.signalReplicationFreed()
@@ -2543,6 +2629,20 @@ func (b *Broker) peerCapabilities(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Spruce-Peer-Version", "2")
+	required := "false"
+	b.cache.mu.Lock()
+	for origin, gaps := range b.cache.reorder {
+		if len(gaps) == 0 {
+			continue
+		}
+		required = "pending"
+		if time.Now().UnixMilli()-b.cache.reorderSince[origin] >= 1000 {
+			required = "true"
+			break
+		}
+	}
+	b.cache.mu.Unlock()
+	w.Header().Set("Spruce-Repair-Required", required)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -2793,7 +2893,7 @@ func (b *Broker) replicate(w http.ResponseWriter, r *http.Request) {
 		b.cache.mu.Unlock()
 	}
 	for _, m := range messages {
-		if !validTopic(m.Topic) || m.ExpiresAt > time.Now().Add(b.cfg.MaxTTL).UnixMilli() || messageSize(m) > b.cfg.CacheBytes {
+		if !validTopic(m.Topic) || m.ExpiresAt > time.Now().Add(b.cfg.MaxTTL).UnixMilli() || messageSize(m) > b.cfg.CacheBytes || (v2 && (m.Origin == "" || m.Sequence == 0)) {
 			problem(w, 400, "invalid_message")
 			return
 		}
@@ -2805,8 +2905,26 @@ func (b *Broker) replicate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var acceptErr error
-	if v2 {
+	if r.URL.Path == "/internal/repair" {
+		if !v2 {
+			problem(w, 400, "repair_requires_v2")
+			return
+		}
+		b.cache.mu.Lock()
+		acceptErr = b.acceptBatchLocked(live, true)
+		b.cache.mu.Unlock()
+	} else if v2 {
 		acceptErr = b.acceptReplicatedBatch(live)
+		// Buffered copies are retained, but a missing predecessor may have
+		// expired upstream. Ask the sender to repair even without a dropped RPC.
+		b.cache.mu.Lock()
+		for _, m := range live {
+			if b.cache.reorder[m.Origin][m.Sequence] != nil {
+				w.Header().Set("Spruce-Repair-Required", "true")
+				break
+			}
+		}
+		b.cache.mu.Unlock()
 	} else {
 		acceptErr = b.acceptBatch(live)
 	}
@@ -3132,6 +3250,12 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusConflict, "cursor_expired")
 		return
 	}
+	streamCursor := newStreamCursor(cursor, b.cache.receivedUntil)
+	for origin, sequence := range cursor {
+		if b.cache.receivedThrough[origin] < sequence {
+			streamCursor.expires[origin] = 0
+		}
+	}
 	b.mu.Lock()
 	if b.draining.Load() {
 		b.mu.Unlock()
@@ -3235,16 +3359,14 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 		case <-streamCtx.Done():
 			return false
 		}
-		nextCursor := cloneFrontier(cursor)
-		nextCursor[d.origin] = max(nextCursor[d.origin], d.sequence)
-		encoded := encodeReplayCursor(nextCursor)
+		encoded := streamCursor.advance(d, time.Now().UnixMilli())
 		if encoded == "" {
 			b.cache.mu.Lock()
 			b.cache.markUnsafeLocked(m.Topic, "cursor-capacity", m.ExpiresAt)
 			b.cache.mu.Unlock()
 			return false
 		}
-		cursor, d.Cursor = nextCursor, encoded
+		d.Cursor = encoded
 		if err := writeFrame(bw, d); err != nil {
 			return false
 		}
@@ -3295,13 +3417,13 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 		case <-streamCtx.Done():
 			return
 		case d := <-s.ch:
-			nextCursor := cloneFrontier(cursor)
-			nextCursor[d.origin] = max(nextCursor[d.origin], d.sequence)
-			d.Cursor = encodeReplayCursor(nextCursor)
+			d.Cursor = streamCursor.advance(d, time.Now().UnixMilli())
 			if d.Cursor == "" {
+				b.cache.mu.Lock()
+				b.cache.markUnsafeLocked(topic, "cursor-capacity", time.Now().Add(b.cfg.MaxTTL).UnixMilli())
+				b.cache.mu.Unlock()
 				return
 			}
-			cursor = nextCursor
 			_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := writeFrame(bw, d); err != nil {
 				return
@@ -3309,13 +3431,13 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 			for range 127 {
 				select {
 				case next := <-s.ch:
-					nextCursor := cloneFrontier(cursor)
-					nextCursor[next.origin] = max(nextCursor[next.origin], next.sequence)
-					next.Cursor = encodeReplayCursor(nextCursor)
+					next.Cursor = streamCursor.advance(next, time.Now().UnixMilli())
 					if next.Cursor == "" {
+						b.cache.mu.Lock()
+						b.cache.markUnsafeLocked(topic, "cursor-capacity", time.Now().Add(b.cfg.MaxTTL).UnixMilli())
+						b.cache.mu.Unlock()
 						return
 					}
-					cursor = nextCursor
 					if err := writeFrame(bw, next); err != nil {
 						return
 					}
@@ -3409,10 +3531,8 @@ func (b *Broker) putCheckpointLocked(checkpoint groupCheckpoint, now int64) {
 			}
 		}
 	}
-	if b.checkpointHead > b.cfg.CheckpointEntries && b.checkpointHead*2 > len(b.checkpointOrder) {
-		copy(b.checkpointOrder, b.checkpointOrder[b.checkpointHead:])
-		b.checkpointOrder = b.checkpointOrder[:len(b.checkpointOrder)-b.checkpointHead]
-		b.checkpointHead = 0
+	if len(b.checkpointOrder) > 2*b.cfg.CheckpointEntries {
+		b.compactCheckpointsLocked(now)
 	}
 }
 
@@ -3712,6 +3832,7 @@ func (b *Broker) maintenance() {
 			b.cache.expire(now.UnixMilli())
 			var retry []*pending
 			b.mu.Lock()
+			b.compactCheckpointsLocked(now.UnixMilli())
 			for b.pendingDeadlines.Len() > 0 && !b.pendingDeadlines[0].at.After(now) {
 				deadline := heap.Pop(&b.pendingDeadlines).(*pendingDeadline)
 				p := b.pending[deadline.id]
@@ -3803,6 +3924,10 @@ func (b *Broker) status(w http.ResponseWriter, _ *http.Request) {
 		actionQueueBytes += p.actionBytes.Load()
 	}
 	v["replication_queue_bytes"] = replicationQueueBytes
+	v["repair_pending_peers"] = b.repairPendingPeers()
+	v["repair_pages"] = b.metrics.RepairPages.Load()
+	v["repair_messages"] = b.metrics.RepairMessages.Load()
+	v["repair_errors"] = b.metrics.RepairErrors.Load()
 	v["replication_queue_max_peer_bytes"] = replicationQueueMaxPeerBytes
 	v["replication_queue_capacity_bytes"] = b.cfg.ReplicationQueueBytes * int64(len(b.peers))
 	v["replication_queue_high_water_bytes"] = b.replicationHighWaterBytes()
@@ -3912,6 +4037,7 @@ func (b *Broker) prometheus(w http.ResponseWriter, _ *http.Request) {
 	_, _ = fmt.Fprintf(w, "# TYPE spruce_group_outstanding_messages gauge\nspruce_group_outstanding_messages %d\n# TYPE spruce_group_active_keys gauge\nspruce_group_active_keys %d\n# TYPE spruce_registered_groups gauge\nspruce_registered_groups %d\n", groupEntries, groupKeys, registeredGroups)
 	_, _ = fmt.Fprintf(w, "# TYPE spruce_group_memory_bytes gauge\nspruce_group_memory_bytes %d\n", groupMemoryBytes)
 	_, _ = fmt.Fprintf(w, "# TYPE spruce_group_expired_messages_total counter\nspruce_group_expired_messages_total %d\n", b.metrics.GroupExpired.Load())
+	_, _ = fmt.Fprintf(w, "# TYPE spruce_repair_pending_peers gauge\nspruce_repair_pending_peers %d\n# TYPE spruce_repair_pages_total counter\nspruce_repair_pages_total %d\n# TYPE spruce_repair_messages_total counter\nspruce_repair_messages_total %d\n# TYPE spruce_repair_errors_total counter\nspruce_repair_errors_total %d\n", b.repairPendingPeers(), b.metrics.RepairPages.Load(), b.metrics.RepairMessages.Load(), b.metrics.RepairErrors.Load())
 	b.writeHistogram(w, "spruce_publish_request_duration_microseconds", &b.metrics.PublishLatency)
 	_, _ = fmt.Fprintf(w, "# TYPE spruce_stream_memory_bytes gauge\nspruce_stream_memory_bytes %d\n# TYPE spruce_stream_memory_capacity_bytes gauge\nspruce_stream_memory_capacity_bytes %d\n", b.streamMemoryBytes.Load(), b.cfg.StreamMemoryBytes)
 	b.writeHistogram(w, "spruce_replication_request_duration_microseconds", &b.metrics.ReplicationLatency)

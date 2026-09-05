@@ -29,6 +29,7 @@ type Client struct {
 	HTTP                     *http.Client
 	OnEvent                  func(ClientEvent)
 	AllowInsecureCredentials bool
+	StreamReadTimeout        time.Duration // Defaults to 45s; bounds a stalled frame read, not handler execution.
 }
 type ClientEvent struct {
 	Operation  string
@@ -736,8 +737,17 @@ func (c *Client) subscribeOnce(ctx context.Context, o SubscribeOptions, handler 
 			}
 		}
 	}
+	readTimeout := c.StreamReadTimeout
+	if readTimeout <= 0 {
+		readTimeout = 45 * time.Second
+	}
+	idle := time.AfterFunc(time.Hour, cancel)
+	idle.Stop()
+	defer idle.Stop()
 	for {
+		idle.Reset(readTimeout)
 		d, err := readFrame(br, o.MaxPayloadBytes)
+		idle.Stop()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				if !drainWorkers() {

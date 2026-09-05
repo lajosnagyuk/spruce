@@ -87,3 +87,20 @@ func BenchmarkCompression(b *testing.B) {
 		}
 	}
 }
+
+func TestLiteralCompressionEnvelopeRoundTripsUnchanged(t *testing.T) {
+	inner, err := compressPayload(bytes.Repeat([]byte("opaque"), 1000), CompressionGzip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, algorithm := range []string{"", CompressionOff, CompressionGzip, CompressionZstd} {
+		wire, err := compressPayload(inner, algorithm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := decompressPayload(wire, 1<<20)
+		if err != nil || !bytes.Equal(got, inner) {
+			t.Fatalf("literal envelope changed with %q: %v", algorithm, err)
+		}
+	}
+}

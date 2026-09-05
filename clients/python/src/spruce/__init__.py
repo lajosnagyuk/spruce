@@ -46,11 +46,13 @@ def _zstd_decompressor(maximum: int):
 
 
 def _compress_payload(payload: bytes, algorithm: str) -> bytes:
-    if len(payload) < 1024 or algorithm == "off":
-        return payload
     algorithm = algorithm or "zstd"
-    if algorithm not in ("gzip", "zstd"):
+    if algorithm not in ("off", "gzip", "zstd"):
         raise ValueError(f"unsupported compression {algorithm!r}")
+    literal_envelope = len(payload) >= len(_COMPRESSION_MAGIC) + 5 and payload.startswith(_COMPRESSION_MAGIC)
+    if not literal_envelope and (len(payload) < 1024 or algorithm == "off"):
+        return payload
+    if literal_envelope and algorithm == "off": algorithm = "gzip"
     if algorithm == "gzip":
         compressed = gzip.compress(payload, compresslevel=1, mtime=0)
         codec = b"\x01"
@@ -58,6 +60,9 @@ def _compress_payload(payload: bytes, algorithm: str) -> bytes:
         compressed = _zstd_compressor().compress(payload)
         codec = b"\x02"
     encoded = _COMPRESSION_MAGIC + codec + struct.pack(">I", len(payload)) + compressed
+    if literal_envelope:
+        if len(encoded) > MAX_MESSAGE_BYTES: raise ValueError("escaped payload exceeds 1 MiB wire limit")
+        return encoded
     minimum_saving = max(128, len(payload) // 10)
     return encoded if len(encoded) <= len(payload) - minimum_saving else payload
 
@@ -190,7 +195,9 @@ class _NoDowngrade(urllib.request.HTTPRedirectHandler):
 
 
 class Client:
-    def __init__(self, base_url: str, *, token: str = "", username: str = "", password: str = "", allow_insecure_credentials: bool = False, timeout: float = 30.0, ssl_context: ssl.SSLContext | None = None, on_event: Callable[[ClientEvent], None] | None = None) -> None:
+    def __init__(self, base_url: str, *, token: str = "", username: str = "", password: str = "", allow_insecure_credentials: bool = False, timeout: float = 30.0, ssl_context: ssl.SSLContext | None = None, on_event: Callable[[ClientEvent], None] | None = None, stream_read_timeout: float = 45.0) -> None:
+        if not 0 < stream_read_timeout < float("inf"): raise ValueError("stream_read_timeout must be positive and finite")
+        self.stream_read_timeout = stream_read_timeout
         self.base_url = base_url.rstrip("/")
         self.token, self.username, self.password = token, username, password
         self.allow_insecure_credentials, self.timeout, self.on_event = allow_insecure_credentials, timeout, on_event
@@ -369,7 +376,7 @@ class Client:
                     next_progress += 1
             try:
                 connected_at, connected_cursor = time.monotonic(), cursor
-                response = self._request("GET", "/v1/subscriptions/stream?" + urllib.parse.urlencode(query), headers={"Spruce-Delivery-Affinity": _completion_affinity(options.topic, options.group)}, timeout=None, operation="subscribe")
+                response = self._request("GET", "/v1/subscriptions/stream?" + urllib.parse.urlencode(query), headers={"Spruce-Delivery-Affinity": _completion_affinity(options.topic, options.group)}, timeout=self.stream_read_timeout, operation="subscribe")
                 if not cursor: cursor = response.headers.get("Spruce-Cursor", "")
                 self._emit("subscription_connected", connected_at, 200, None)
                 connection_done = threading.Event()
@@ -546,28 +553,49 @@ class BatcherOptions:
 
 class ProducerBatcher:
     def __init__(self, client: Client, options: BatcherOptions = BatcherOptions()) -> None:
-        if not 1 <= options.max_messages <= 4096 or not 5 <= options.max_bytes <= MAX_BATCH_BYTES or options.max_delay <= 0 or options.queue_depth < 1: raise ValueError("invalid batcher options")
+        if not 1 <= options.max_messages <= 4096 or not 5 <= options.max_bytes <= MAX_BATCH_BYTES or not 0 < options.max_delay <= 86400 or not 1 <= options.queue_depth <= 65536: raise ValueError("invalid batcher options")
         self.client, self.options, self._queue, self._closed = client, options, queue.Queue(options.queue_depth), False
+        self._admission = threading.Condition()
+        self._close_error: BaseException | None = None
         self._thread = threading.Thread(target=self._run, daemon=True); self._thread.start()
+
+    def _submit(self, create, timeout: float | None) -> None:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._admission:
+            while self._queue.full() and not self._closed:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0: raise queue.Full
+                self._admission.wait(remaining)
+            if self._closed: raise RuntimeError("producer batcher is closed")
+            # Copy only after admission; blocked callers retain no owned payload.
+            self._queue.put_nowait(create())
+            self._admission.notify_all()
+
     def publish(self, topic: str, payload: bytes, options: PublishOptions = PublishOptions(), timeout: float | None = None) -> PublishResult:
-        if self._closed: raise RuntimeError("producer batcher is closed")
         key_bytes = len(options.key.encode())
         if not topic or len(payload) > MAX_MESSAGE_BYTES or key_bytes > 8192 or len(payload) + key_bytes + 6 > self.options.max_bytes: raise ValueError("invalid batch publish")
         if options.idempotency_key or options.ack not in ("", "local"): raise ValueError("options are incompatible with batch publishing")
-        result: queue.Queue = queue.Queue(1); self._queue.put((topic, bytes(payload), options, result), timeout=timeout); value = result.get(timeout=timeout)
+        result: queue.Queue = queue.Queue(1)
+        self._submit(lambda: (topic, bytes(payload), options, result), timeout)
+        value = result.get(timeout=timeout)
         if isinstance(value, BaseException): raise value
         return value
+
     def flush(self, timeout: float | None = None) -> None:
-        result: queue.Queue = queue.Queue(1); self._queue.put((None, None, None, result), timeout=timeout); value = result.get(timeout=timeout)
+        result: queue.Queue = queue.Queue(1)
+        self._submit(lambda: (None, None, None, result), timeout)
+        value = result.get(timeout=timeout)
         if value: raise value
+
     def close(self, timeout: float | None = 30.0) -> None:
-        if self._closed: return
-        error = None
-        try: self.flush(timeout)
-        except BaseException as exc: error = exc
-        self._closed = True; self._queue.put((False, None, None, None)); self._thread.join(timeout)
+        with self._admission:
+            self._closed = True
+            self._admission.notify_all()
+        # The worker drains accepted commands and exits. No sentinel needs a
+        # potentially full queue slot, and repeated close can wait for completion.
+        self._thread.join(timeout)
         if self._thread.is_alive(): raise TimeoutError("producer batcher did not stop")
-        if error: raise error
+        if self._close_error: raise self._close_error
     def __enter__(self): return self
     def __exit__(self, exc_type, exc, tb): self.close()
     def _run(self) -> None:
@@ -578,16 +606,26 @@ class ProducerBatcher:
             batch, pending, pending_bytes, deadline = pending, [], 0, None
             try:
                 values = self.client.publish_batch_entries(batch[0][0], [BatchEntry(item[1], item[2].key) for item in batch], replace(batch[0][2], key=""))
+                if len(values) != len(batch): raise ValueError("Spruce returned an invalid batch result count")
                 for item, value in zip(batch, values): item[3].put(value)
                 return None
             except BaseException as exc:
+                self._close_error = exc
                 for item in batch: item[3].put(exc)
                 return exc
         while True:
-            delay = None if deadline is None else max(0, deadline - time.monotonic())
-            try: item = self._queue.get(timeout=delay)
-            except queue.Empty: flush(); continue
-            if item[0] is False: flush(); return
+            with self._admission:
+                while self._queue.empty() and not self._closed:
+                    remaining = None if deadline is None else deadline - time.monotonic()
+                    if remaining is not None and remaining <= 0: break
+                    self._admission.wait(remaining)
+                stopping = self._closed and self._queue.empty()
+                item = None if self._queue.empty() else self._queue.get_nowait()
+                self._admission.notify_all()
+            if item is None:
+                flush()
+                if stopping: return
+                continue
             if item[0] is None: item[3].put(flush()); continue
             item_bytes = 6 + len(item[2].key.encode()) + len(item[1])
             compatible = not pending or (pending[0][0] == item[0] and replace(pending[0][2], key="") == replace(item[2], key=""))

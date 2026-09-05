@@ -4,8 +4,10 @@ using System.Text;
 using Spruce;
 
 var failures = new List<string>();
+await Run("silent stream reconnect", SilentStreamReconnect, failures);
 await Run("invalid batch", RejectsInvalidBatch, failures);
 await Run("batch v2 per-entry keys", BatchV2PerEntryKeys, failures);
+await Run("literal compression envelope", LiteralCompressionEnvelope, failures);
 await Run("adaptive gzip wire", AdaptiveGzipWire, failures);
 await Run("adaptive zstd wire", AdaptiveZstdWire, failures);
 await Run("batcher coalesces keys and skips queued cancellation", BatcherKeysAndCancellation, failures);
@@ -63,6 +65,25 @@ static async Task BatchV2PerEntryKeys()
     await client.PublishBatchAsync("t", [new BatchEntry(new byte[] { 1 }, "a"), new BatchEntry(new byte[] { 2 }, "b")]);
     Assert(version == "2", "batch v2 header missing");
     Assert(wire is not null && wire.SequenceEqual(new byte[] { 0,1,(byte)'a',0,0,0,1,1, 0,1,(byte)'b',0,0,0,1,2 }), "unexpected batch v2 wire");
+}
+
+static async Task LiteralCompressionEnvelope()
+{
+    byte[]? wire = null;
+    var client = new SpruceClient("https://spruce.invalid", new HttpClient(new StubHandler(request =>
+    {
+        wire = request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+        return Accepted();
+    })));
+    byte[] literal = [0x89, (byte)'S', (byte)'P', (byte)'R', (byte)'U', (byte)'C', (byte)'E', 1, 1, 0, 0, 0, 0];
+    await client.PublishAsync("t", literal, new(Compression: "off"));
+    Assert(wire is not null && wire.Length > 13 && wire[8] == 1, "literal envelope was not escaped with a compatible codec");
+    using var input = new MemoryStream(wire!, 13, wire!.Length - 13);
+    using var gzip = new System.IO.Compression.GZipStream(input, System.IO.Compression.CompressionMode.Decompress);
+    using var decoded = new MemoryStream();
+    await gzip.CopyToAsync(decoded);
+    Assert(decoded.ToArray().SequenceEqual(literal), "literal envelope bytes changed");
+    await Expect<ArgumentException>(() => client.PublishAsync("t", new byte[] { 1 }, new(Compression: "invalid")));
 }
 
 static async Task AdaptiveGzipWire()
@@ -359,6 +380,21 @@ static async Task BoundedOrderedCompletionWindow()
     try { await subscription; } catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
 }
 
+static async Task SilentStreamReconnect()
+{
+    using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+    var connected = 0;
+    using var client = new SpruceClient("https://spruce.invalid", new HttpClient(new StubHandler(_ =>
+        new(HttpStatusCode.OK) { Content = new StreamContent(new SilentStream()) })))
+    {
+        StreamReadTimeout = TimeSpan.FromMilliseconds(50),
+        OnEvent = e => { if (e.Operation == "subscription_connected" && Interlocked.Increment(ref connected) == 2) cancellation.Cancel(); }
+    };
+    try { await client.SubscribeAsync("t", "g", (_, _) => throw new Exception("unexpected delivery"), cancellation.Token); }
+    catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+    Assert(connected >= 2, "silent stream never reconnected");
+}
+
 static Stream Frames(params (string Delivery, string Message, string Key, byte Payload)[] deliveries)
 {
     var output = new MemoryStream();
@@ -406,4 +442,20 @@ sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> respond) 
 {
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
         Task.FromResult(respond(request));
+}
+
+sealed class SilentStream : Stream
+{
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+    public override void Flush() => throw new NotSupportedException();
+    public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    { await Task.Delay(Timeout.Infinite, cancellationToken); return 0; }
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
 }

@@ -61,7 +61,7 @@ http {
       proxy_set_header Connection "";
       proxy_buffering off;
       proxy_connect_timeout 250ms;
-      proxy_read_timeout 1h;
+      proxy_read_timeout 30s;
       proxy_next_upstream error timeout http_502 http_503 http_504;
       proxy_next_upstream_tries 3;
     }
