@@ -30,6 +30,8 @@ reject --set config.publishAdmissionBytes=0
 reject --set config.publishAdmissionWait=0s
 reject --set config.deliveryLagLimit=0s
 reject --set config.goMemoryLimit=0MiB
+reject --set-string config.streamMemoryBytes=262143
+reject --set-string config.streamMemoryBytes=67108864
 # Check the exact boundary and each budget one byte over it, independently of defaults.
 render --set resources.limits.memory=320Mi --set config.goMemoryLimit=176MiB --set-string config.memorySafetyMarginBytes=150994944
 reject --set resources.limits.memory=320Mi --set-string config.goMemoryLimit=184549377 --set-string config.memorySafetyMarginBytes=150994944
@@ -48,7 +50,7 @@ render --set auth.requireExistingSecret=true --set auth.existingSecret=spruce-au
 
 spread=$(helm template spruce "$chart" $base)
 printf '%s\n' "$spread" | grep -q 'whenUnsatisfiable: DoNotSchedule'
-printf '%s\n' "$spread" | grep -q 'map $arg_topic $stream_key'
+printf '%s\n' "$spread" | grep -q 'map $http_spruce_delivery_affinity $stream_key'
 printf '%s\n' "$spread" | grep -q 'map $uri $publish_key'
 printf '%s\n' "$spread" | grep -q '(?<publish_topic>'
 printf '%s\n' "$spread" | grep -q 'hash $stream_key consistent;'
@@ -56,3 +58,8 @@ printf '%s\n' "$spread" | grep -q 'hash $publish_key consistent;'
 
 target=$(SPRUCE_RELEASE=platform SPRUCE_NAMESPACE=events SPRUCE_CLUSTER_DOMAIN=corp.internal SPRUCE_PRINT_TARGETS=1 sh scripts/k3s-rotate-tls.sh)
 test "$target" = 'publish_url=https://platform-spruce-0.platform-spruce-headless.events.svc.corp.internal:8080'
+
+# Configuration outside gateway.* must also restart nginx when its content changes.
+default_checksum=$(helm template spruce "$chart" $base | sed -n 's/.*checksum\/config: //p')
+dns_checksum=$(helm template spruce "$chart" $base --set networkPolicy.dns.serviceName=alternate-dns | sed -n 's/.*checksum\/config: //p')
+test -n "$default_checksum" && test -n "$dns_checksum" && test "$default_checksum" != "$dns_checksum"

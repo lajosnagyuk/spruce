@@ -9,16 +9,28 @@ concurrency:
 permissions:
   contents: read
 jobs:
-  go:
+  go_tests:
+    strategy:
+      matrix:
+        go: ['1.26.x', '1.27.x']
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with: {go-version: '1.26.x'}
+        with: {go-version: "${{ matrix.go }}"}
       - run: go test ./...
       - run: go test -race ./...
       - run: make perf-test
       - run: CGO_ENABLED=0 go build -trimpath ./cmd/spruce
+  go:
+    needs: go_tests
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require both supported Go toolchains
+        env:
+          RESULT: ${{ needs.go_tests.result }}
+        run: test "$RESULT" = success
   dotnet:
     runs-on: ubuntu-latest
     steps:
@@ -44,6 +56,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: azure/setup-helm@bf6a7d304bc2fdb57e0331155b7ebf2c504acf0a # v4
       - run: make helm-test
+      - name: Verify gateway publish retry boundaries
+        run: |
+          python3 scripts/test-gateway-retry.py --engine docker
+          python3 scripts/test-gateway-retry.py --engine docker --helm
       - run: helm lint deploy/helm/spruce --set image.repository=spruce --set image.tag=ci --set image.pullPolicy=Never --set tls.allowInsecureTransport=true --set gateway.allowInsecureClientTransport=true
       - run: |
           for replicas in 1 2 3; do

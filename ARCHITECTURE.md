@@ -11,8 +11,9 @@ implemented system, not a roadmap.
 **Why:** Avoiding disks, databases, consensus, and recovery logs keeps latency low and
 operation simple.
 
-**Consequence:** Pod loss, cache eviction, exhausted queues, or full-cluster restart can
-lose messages. Spruce is not a durable log.
+**Consequence:** Loss of retained copies, TTL expiry, or full-cluster restart can lose
+messages. Capacity pressure rejects new admission; accepted cache entries are retained
+until their original expiry. Spruce is not a durable log.
 
 ## ADR-002: Identical leaderless replicas
 
@@ -28,16 +29,18 @@ is broker-local, so grouped streams require sticky routing by topic and group.
 ## ADR-003: Best-effort delivery with bounded replay
 
 **Decision:** Consumers use binary-framed HTTP streams, explicit ACK/NACK, retries, and
-a timestamp replay cursor. Group ACKs create count-bounded, TTL-bounded in-memory
+an opaque per-origin sequence replay cursor. Group ACKs create count-bounded, TTL-bounded in-memory
 checkpoints that are propagated to peers and included in replica bootstrap. Every queue
 and in-flight window is bounded by count, bytes, or both.
 
-**Why:** A slow consumer must not exhaust broker memory or block producers.
+**Why:** A slow consumer must not exhaust broker memory. Producers receive explicit
+backpressure when the bounded retention or work-index budget is exhausted.
 
 **Consequence:** Delivery is not exactly-once or durable at-least-once. A reconnecting
 group normally skips completed cached messages, but checkpoint propagation, total
-cluster restart, cache expiry, or capacity eviction can still cause duplicates or loss.
-Overflow closes the stream so clients can reconnect and replay what remains cached.
+cluster restart or cache expiry can still cause duplicates or loss. Grouped work waits
+in completion-gated per-key ID queues; broadcast overflow still closes the stream for
+reconnection. Cache pressure no longer evicts retained events.
 First-party clients provide an additional bounded deduplication layer.
 
 ## ADR-004: Opaque payloads and simple HTTP
@@ -49,7 +52,8 @@ metadata, and the unchanged payload.
 **Why:** Any wire format works without schema coupling, while raw HTTPS remains usable
 without a custom library.
 
-**Consequence:** Applications own schemas, compatibility, and payload compression.
+**Consequence:** Applications own schemas and compatibility. First-party clients provide adaptive
+compression; brokers retain the resulting bytes unchanged.
 
 ## ADR-005: Local acknowledgement by default
 
@@ -60,13 +64,17 @@ one peer. Replication queues retry briefly and then report loss through metrics.
 tolerance without introducing quorum machinery.
 
 **Consequence:** Neither mode is durable. Safe publish retries require a stable producer
-ID and idempotency key.
+ID and idempotency key. Their namespace determines a stable message ID across brokers.
+A cached replica retry preserves the original expiry; this is bounded deduplication,
+not consensus over conflicting concurrent publishes or protection after every copy is lost.
 
 ## ADR-006: Explicit resource ceilings
 
 **Decision:** Cache, replication, ACK/NACK propagation, pending delivery, subscriber
 in-flight bytes, request concurrency, stream count, frame size, and idempotency state all
-have hard limits.
+have hard limits. Streams additionally share a byte-admission budget for fixed buffers
+and replay ID indexes. Replay and deferred queues retain IDs instead of pinning expired
+payloads; stalled replay writes have deadlines.
 
 **Why:** Predictable degradation is more valuable than preserving weak guarantees until
 the kernel or Kubernetes kills the process.
@@ -106,12 +114,12 @@ and never re-fans out copied messages.
 a special leader.
 
 **Consequence:** Bootstrap is anti-entropy, not durability. A simultaneous cluster loss,
-TTL expiry, eviction, or a full rolling replacement under traffic can still lose
+TTL expiry or a full rolling replacement under traffic can still lose
 messages. Operators that require zero-loss maintenance must pause publishers.
 
 ## ADR-010: First-party clients remain protocol conveniences
 
-**Decision:** Go, C#, and dependency-free Python clients expose the same publish,
+**Decision:** Go, C#, and Python clients expose the same publish,
 bounded batching, streaming consumption, ACK/NACK, retry, explicit completion,
 deduplication, diagnostics, authentication, and telemetry contracts over HTTPS.
 
@@ -121,3 +129,34 @@ mandatory proprietary transport.
 
 **Consequence:** The HTTP and binary stream protocol remains the compatibility boundary.
 Each client has independent conformance tests and can be replaced by ordinary HTTPS code.
+
+Group replay scans retained IDs regardless of an individual member's opaque cursor,
+then filters group completion checkpoints. The member cursor still detects expired
+history; it cannot prove other members completed earlier events. Retained and new
+group work share bounded per-key queues, and ACK releases each key's successor.
+This local completion gate does not fence another broker or serialize external side effects. SDK handler rejection sends
+a NACK and reconnects without advancing past the failed completion.
+
+Single-message `available` acknowledgement tries peer acceptance within a 100 ms
+confirmation window and reports a lower bound of confirmed copies. A lone broker can
+accept with one copy; unfinished replication remains byte-bounded. Per-peer synchronous
+confirmation has 32 slots, independent of the request concurrency ceiling. Strict
+`one-peer` retries reconfirm instead of reusing historical replicated=true.
+
+Drain rejects new publishes/streams and closes current streams after withdrawing
+readiness, while retaining ACK and peer-recovery access during the grace period.
+See [ADR 0002](docs/adr/0002-memory-availability.md) for the memory-only availability
+contract and the limit on ordering across live network partitions.
+
+Consumer-group delivery is now distributed by a canonical topic/group affinity digest.
+First-party stream and ACK/NACK requests carry the same digest, allowing gateway routing
+to keep completion with the delivery path across language-specific URL encodings. This
+is advisory routing, not cross-broker fencing. Owner-local ACK completion survives a
+full/unreachable peer action queue; checkpoint propagation remains bounded and best-effort.
+Deferred replay flushes before returning to idle live-stream waiting.
+See [ADR 0003](docs/adr/0003-resilience-and-delivery-capacity.md) for accepted scaling,
+ordering and retention direction, including the parts not yet implemented.
+
+[ADR 0004](docs/adr/0004-outstanding-work.md) implements bounded per-key group queues,
+retry-until-completion/expiry and conservative TTL retention. These provide local
+completion ordering without claiming cross-partition fencing of application handlers.

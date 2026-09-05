@@ -64,6 +64,7 @@
         "checkpointEntries": {"$ref": "#/definitions/positiveIntegerString"},
         "maxConcurrentRequests": {"$ref": "#/definitions/positiveIntegerString"},
         "maxStreams": {"$ref": "#/definitions/positiveIntegerString"},
+        "streamMemoryBytes": {"$ref": "#/definitions/positiveIntegerString"},
         "maxInternalRequests": {"$ref": "#/definitions/positiveIntegerString"},
         "publishAdmissionBytes": {"$ref": "#/definitions/positiveIntegerString"},
         "publishAdmissionWait": {"$ref": "#/definitions/duration"},

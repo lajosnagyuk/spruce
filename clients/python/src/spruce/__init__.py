@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from collections import deque
 import gzip
+import hashlib
 import io
 import json
 import queue
@@ -122,6 +123,8 @@ class PublishOptions:
 class PublishResult:
     id: str
     replicated: bool = False
+    confirmed_copies: int = 0
+    degraded: bool = False
 
 @dataclass(frozen=True)
 class BatchEntry:
@@ -156,7 +159,7 @@ class SubscribeOptions:
 
 @dataclass(frozen=True)
 class RetryOptions:
-    max_attempts: int = 3
+    max_attempts: int = 8
     min_backoff: float = 0.05
     max_backoff: float = 2.0
 
@@ -169,6 +172,11 @@ class BrokerStatus:
     peers: int
     consumers: int
     pending_deliveries: int
+    registered_groups: int = 0
+    group_outstanding_messages: int = 0
+    group_active_keys: int = 0
+    group_memory_bytes: int = 0
+    group_expired_messages: int = 0
 
 
 class _NoDowngrade(urllib.request.HTTPRedirectHandler):
@@ -253,7 +261,7 @@ class Client:
         encoded = _compress_payload(bytes(payload), options.compression)
         with self._request("POST", path, encoded, self._option_headers(options), operation="publish") as response:
             value = json.load(response)
-        return PublishResult(value["id"], bool(value.get("replicated", False)))
+        return PublishResult(value["id"], bool(value.get("replicated", False)), int(value.get("confirmed_copies", 0)), bool(value.get("degraded", False)))
 
     def publish_with_retry(self, topic: str, payload: bytes, options: PublishOptions, retry: RetryOptions = RetryOptions()) -> PublishResult:
         if not options.producer_id or not options.idempotency_key: raise ValueError("retry requires producer ID and idempotency key")
@@ -263,7 +271,7 @@ class Client:
             retry_after = 0.0
             try: return self.publish(topic, payload, options)
             except SpruceError as exc:
-                if exc.status_code not in (408, 429, 503) or attempt + 1 == retry.max_attempts: raise
+                if (exc.status_code not in (408, 429) and exc.status_code < 500) or attempt + 1 == retry.max_attempts: raise
                 retry_after = exc.retry_after
             except (OSError, urllib.error.URLError):
                 if attempt + 1 == retry.max_attempts: raise
@@ -292,7 +300,8 @@ class Client:
         with self._request("GET", path, operation=operation) as response: return response.read()
 
     def status(self) -> BrokerStatus:
-        return BrokerStatus(**json.loads(self._get("/v1/status")))
+        value = json.loads(self._get("/v1/status"))
+        return BrokerStatus(**{key: value[key] for key in BrokerStatus.__dataclass_fields__ if key in value})
 
     def check_health(self) -> None:
         self._get("/health/ready")
@@ -306,9 +315,11 @@ class Client:
     def metrics(self) -> str:
         return self._get("/metrics", operation="metrics").decode()
 
-    def _ack(self, action: str, ids: Sequence[str]) -> None:
+    def _ack(self, action: str, ids: Sequence[str], topic: str = "", group: str = "") -> None:
         body = json.dumps({"delivery_ids": list(ids)}, separators=(",", ":")).encode()
-        with self._request("POST", f"/v1/deliveries/{action}", body, {"Content-Type": "application/json"}, timeout=10, operation=action): pass
+        headers = {"Content-Type": "application/json"}
+        if topic: headers.update({"Spruce-Delivery-Affinity": _completion_affinity(topic, group)})
+        with self._request("POST", f"/v1/deliveries/{action}", body, headers, timeout=10, operation=action): pass
 
     @staticmethod
     def _read_exact(stream, length: int) -> bytes:
@@ -339,7 +350,7 @@ class Client:
         stop = stop or threading.Event(); cursor, backoff = options.cursor, 0.05
         member_id = options.member_id or secrets.token_hex(16)
         if len(member_id.encode("utf-8")) > 255: raise ValueError("member_id exceeds 255 UTF-8 bytes")
-        acks, nacks = _AckBatcher(self, "ack"), _AckBatcher(self, "nack")
+        acks, nacks = _AckBatcher(self, "ack", options.topic, options.group), _AckBatcher(self, "nack", options.topic, options.group)
         workers = ThreadPoolExecutor(max_workers=options.concurrency)
         try:
           while not stop.is_set():
@@ -358,13 +369,14 @@ class Client:
                     next_progress += 1
             try:
                 connected_at, connected_cursor = time.monotonic(), cursor
-                response = self._request("GET", "/v1/subscriptions/stream?" + urllib.parse.urlencode(query), timeout=None, operation="subscribe")
+                response = self._request("GET", "/v1/subscriptions/stream?" + urllib.parse.urlencode(query), headers={"Spruce-Delivery-Affinity": _completion_affinity(options.topic, options.group)}, timeout=None, operation="subscribe")
                 if not cursor: cursor = response.headers.get("Spruce-Cursor", "")
                 self._emit("subscription_connected", connected_at, 200, None)
                 connection_done = threading.Event()
+                retry_connection = threading.Event()
                 def interrupt() -> None:
                     while not connection_done.wait(.05):
-                        if stop.is_set():
+                        if stop.is_set() or retry_connection.is_set():
                             response.close()
                             return
                 threading.Thread(target=interrupt, name="spruce-subscription-interrupt", daemon=True).start()
@@ -386,15 +398,17 @@ class Client:
                           delivery = self._read_delivery(response, options.max_payload_bytes)
                           if not delivery.delivery_id: continue
                           sequence += 1
-                          def consume(item=delivery):
+                          def consume(item=delivery, completions=accept_completions, reconnect=retry_connection):
                               try: handler(item)
                               except Exception:
-                                  if accept_completions.is_set(): nacks.submit(item.delivery_id)
-                                  return item.cursor
+                                  if completions.is_set(): nacks.submit(item.delivery_id)
+                                  # A NACK must not advance the replay cursor.
+                                  reconnect.set()
+                                  raise OSError("handler rejected delivery; reconnecting before it")
                               except BaseException as exc:
-                                  if accept_completions.is_set(): nacks.submit(item.delivery_id)
+                                  if completions.is_set(): nacks.submit(item.delivery_id)
                                   raise HandlerPanicError(str(exc)) from exc
-                              if accept_completions.is_set(): acks.submit(item.delivery_id)
+                              if completions.is_set(): acks.submit(item.delivery_id)
                               return item.cursor
                           futures.append((sequence, workers.submit(consume)))
                           while sequence - next_progress + 1 >= completion_capacity and not stop.is_set():
@@ -411,14 +425,23 @@ class Client:
                       connection_done.set()
                   # Drain before executor shutdown: __exit__ waits without a bound.
                   deadline = time.monotonic() + options.drain_timeout
+                  completion_error = None
                   for index, future in futures:
                       try:
                           completed[index] = future.result(timeout=max(0, deadline - time.monotonic()))
                           advance()
                       except TimeoutError as exc:
                           if future.done():
-                              raise
+                              completion_error = completion_error or exc
+                              continue
                           raise HandlerDrainTimeoutError("Spruce handlers did not stop before drain timeout") from exc
+                      except BaseException as exc:
+                          # Drain every worker before reconnecting, even if an
+                          # earlier handler or ACK failed. Do not carry queued
+                          # handlers into the next subscription connection.
+                          completion_error = completion_error or exc
+                  if completion_error is not None:
+                      raise completion_error
                   if stream_error is not None and not stop.is_set():
                       raise stream_error
                 finally:
@@ -466,7 +489,8 @@ class ConsumableDelivery:
 
 
 class _AckBatcher:
-    def __init__(self, client: Client, action: str) -> None:
+    def __init__(self, client: Client, action: str, topic: str = "", group: str = "") -> None:
+        self.topic, self.group = topic, group
         self.client, self.action, self.items, self.closed, self.close_lock = client, action, queue.Queue(1024), threading.Event(), threading.Lock()
         self.thread = threading.Thread(target=self._run, daemon=True); self.thread.start()
     def submit(self, delivery_id: str) -> None:
@@ -492,7 +516,7 @@ class _AckBatcher:
                 if item is None:
                     self.items.put(None); break
                 batch.append(item)
-            try: self.client._ack(self.action, [item[0] for item in batch]); error = None
+            try: self.client._ack(self.action, [item[0] for item in batch], self.topic, self.group); error = None
             except BaseException as exc: error = exc
             for _, result in batch: result.put(error)
 
@@ -575,3 +599,7 @@ class ProducerBatcher:
 
 
 __all__ = ["BatchEntry", "BatcherOptions", "BrokerStatus", "Client", "ClientEvent", "ConsumableDelivery", "Deduper", "Delivery", "HandlerDrainTimeoutError", "HandlerPanicError", "ProducerBatcher", "PublishOptions", "PublishResult", "RetryOptions", "SpruceError", "SubscribeOptions", "__version__"]
+
+
+def _completion_affinity(topic: str, group: str) -> str:
+    return hashlib.sha256((topic + "\0" + (group or "")).encode("utf-8")).hexdigest()

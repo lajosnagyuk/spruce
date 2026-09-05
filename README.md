@@ -6,14 +6,14 @@ It provides opaque binary messages over HTTPS, N producers and consumers, broadc
 
 ## Delivery contract
 
-- Delivery is at least once while a message remains in a replica's bounded cache.
+- Delivery uses memory-bounded ACK/NACK retries and replay. Group work retries until completion or original TTL expiry; broadcasts retain a retry-attempt limit. TTL expiry or loss of every retained copy can prevent delivery. Capacity pressure rejects new writes instead of evicting accepted events.
 - Messages are not persisted. Restarting every replica can lose all cached messages.
 - Group ACK checkpoints are propagated and bootstrapped between replicas on a best-effort basis; NACK retry remains best effort.
 - Consumer groups deliver to one healthy member. Keyed messages use rendezvous hashing so
-  the same key stays with the same member while group membership and owner capacity remain
-  stable; membership changes deterministically remap only part of the key space. A saturated
-  owner may fall back to another healthy member rather than block the group. Ungrouped
-  subscribers receive broadcasts.
+  the same key stays with the same member while membership remains stable. Each broker
+  gates the next keyed event on completion of its predecessor; a saturated member leaves
+  that key queued. These local gates do not fence duplicate attempts or independent live
+  partitions. Ungrouped subscribers receive broadcasts.
 - Reconnecting consumer groups skip acknowledged messages while their bounded in-memory checkpoints and messages remain cached.
 - Duplicate delivery is expected. First-party clients provide bounded client-side deduplication.
 - Payloads are opaque bytes. Spruce does not inspect schemas or formats.
@@ -33,7 +33,9 @@ make smoke
 ```
 
 The Compose cluster exposes an intentionally anonymous HTTP API at
-`http://localhost:8080` for isolated local development only.
+`http://localhost:8080` for isolated local development only. Set `SPRUCE_LOCAL_PORT`
+to choose another loopback port. The gateway reads the container DNS resolver at
+startup and refreshes broker addresses after restarts.
 
 Stop it with:
 
@@ -74,7 +76,11 @@ err = client.Subscribe(ctx, spruce.SubscribeOptions{Topic: "orders", Group: "bil
 
 The producer batcher defaults to 256 messages, 1 MiB including framing, a 250 us
 first-item timer, and bounded backpressure. `PublishRetry` requires a producer ID and
-idempotency key. Use `spruce.NewDeduper` when duplicate handler execution is unsafe.
+idempotency key. That operation receives a stable message ID across brokers; a replica
+with the original cached message preserves its expiry on retry. Never reuse an operation
+key for another event. Conflicts are checked against locally available state, not by
+cluster-wide consensus. Use `spruce.NewDeduper` to suppress repeated message IDs within
+its bounded window; persistent business-side effects still need application idempotency.
 
 ## C# client
 
@@ -101,7 +107,7 @@ Consume a streaming response:
 GET /v1/subscriptions/stream?topic={topic}&group={group}&cursor={opaque-resume-token}
 ```
 
-The stream uses length-delimited binary frames. ACK and NACK endpoints accept batched message IDs. Resume cursors are opaque and must be returned unchanged; timestamp cursors are not supported. The Go, C#, and Python clients handle framing, reconnects, acknowledgement batching, bounded concurrency, and optional deduplication.
+The stream uses length-delimited binary frames. ACK and NACK endpoints accept batched message IDs. Resume cursors are opaque and must be returned unchanged; timestamp cursors are not supported. For consumer groups, recovery scans retained history and filters group completion checkpoints: one member's cursor cannot exclude work assigned to another member. A supplied cursor can still report expired history; it is not a group-wide seek offset. The Go, C#, and Python clients handle framing, reconnects, acknowledgement batching, bounded concurrency, and optional deduplication.
 
 All three clients default to adaptive `zstd` and also support `gzip` and explicit `off`. Compression
 is retained only when it materially reduces the payload, remains opaque to brokers, and
@@ -150,10 +156,9 @@ Recommended starting resources per replica:
 resources:
   requests:
     cpu: 25m
-    memory: 96Mi
+    memory: 224Mi
   limits:
-    cpu: 500m
-    memory: 256Mi
+    memory: 320Mi
 ```
 
 Tune cache, pending-delivery, subscriber, and replication limits together with the pod memory limit. Kubernetes limits are the final safety boundary; Spruce's internal byte limits protect the normal operating envelope.
@@ -174,7 +179,7 @@ Python:
 pip install spruce-client
 ```
 
-The dependency-free Python 3.11+ package provides the same publish, automatic batching,
+The Python 3.11+ package, with its declared Zstandard dependency, provides the same publish, automatic batching,
 streaming consumption, explicit completion, retry, deduplication, diagnostics, and
 credential-safety contracts as Go and C#.
 
@@ -209,6 +214,9 @@ make build
 make test
 make test-race
 make csharp
+python3 -m venv .cache/python
+. .cache/python/bin/activate
+python -m pip install ./clients/python build
 make python
 make image
 make helm-lint
@@ -220,7 +228,7 @@ builds, and Helm validation without creating a Kubernetes cluster. Superseded PR
 are cancelled. The separate **Kubernetes integration** workflow deploys a disposable
 kind cluster for live client conformance and public/internal TLS rotation checks. It
 can run manually and must pass before tagged releases publish any packages.
-A scheduled full-cache soak enforces the bounded memory envelope.
+The manually triggered **Bounded memory soak** workflow checks the tested memory envelope.
 
 ## Repository guide
 
@@ -237,3 +245,27 @@ A scheduled full-cache soak enforces the bounded memory envelope.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+### Degraded memory-only operation
+
+Single-message producers may select `Ack: "available"` (HTTP `Spruce-Ack: available`)
+to keep serving when only one broker remains. The response includes `confirmed_copies`
+and `degraded`. Healthy peers are attempted within a 100 ms confirmation window;
+unfinished copies use bounded background replication. `one-peer` retains its strict
+peer requirement. These receipts do not prevent TTL expiry or later loss of
+all copies. Complete-cluster restart survival is outside the product contract.
+See [ADR 0002](docs/adr/0002-memory-availability.md).
+
+Current gateways distribute topic/group streams across replicas, and first-party SDKs
+route completion using the same canonical affinity digest. This spreads independent
+delivery work while preserving full memory replication for resilience. It does not
+increase retained capacity or provide exclusive group ownership during partitions.
+See [the accepted scaling direction](docs/adr/0003-resilience-and-delivery-capacity.md).
+
+Grouped delivery now queues message IDs per key and waits for completion before sending
+that key's next event. NACK/timeout keeps the head outstanding until completion or its
+original expiry. Brokers retain accepted cache entries until expiry and return explicit
+429 backpressure instead of pressure-evicting older events. Retention includes completed
+history, so size TTL and cache capacity together. See
+[ADR 0004](docs/adr/0004-outstanding-work.md) for bounds, reconnection headroom and the
+limits of local ordering during partitions or overlapping handler attempts.

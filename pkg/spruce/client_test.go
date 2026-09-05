@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-func TestNackAdvancesOrderedCursor(t *testing.T) {
+func TestNackDoesNotAdvanceOrderedCursor(t *testing.T) {
 	var acks, nacks atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -28,6 +28,7 @@ func TestNackAdvancesOrderedCursor(t *testing.T) {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		w.Header().Set("Spruce-Cursor", "initial-cursor")
 		for i := 1; i <= 2; i++ {
 			metadata, _ := json.Marshal(Delivery{DeliveryID: string(rune('a' + i)), MessageID: "m", Topic: "t", CreatedAt: int64(i), Cursor: fmt.Sprintf("cursor-%d", i)})
 			var sizes [8]byte
@@ -37,14 +38,13 @@ func TestNackAdvancesOrderedCursor(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	var handled atomic.Int32
-	last, err := New(server.URL).subscribeOnce(context.Background(), SubscribeOptions{Topic: "t"}, func(context.Context, Delivery) error {
-		if handled.Add(1) == 1 {
+	last, err := New(server.URL).subscribeOnce(context.Background(), SubscribeOptions{Topic: "t"}, func(_ context.Context, d Delivery) error {
+		if d.Cursor == "cursor-1" {
 			return context.Canceled
 		}
 		return nil
 	})
-	if err == nil || last != "cursor-2" || acks.Load() != 1 || nacks.Load() != 1 {
+	if err == nil || last != "initial-cursor" || nacks.Load() != 1 {
 		t.Fatalf("last=%s acks=%d nacks=%d err=%v", last, acks.Load(), nacks.Load(), err)
 	}
 }
@@ -109,6 +109,9 @@ func TestDefaultSubscribeBatchesAcks(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/deliveries/ack" {
+			if r.Header.Get("Spruce-Delivery-Affinity") != completionAffinity("t", "workers") {
+				t.Errorf("missing completion routing scope: %v", r.Header)
+			}
 			calls.Add(1)
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -124,7 +127,7 @@ func TestDefaultSubscribeBatchesAcks(t *testing.T) {
 	}))
 	defer server.Close()
 	c := New(server.URL)
-	last, err := c.subscribeOnce(context.Background(), SubscribeOptions{Topic: "t"}, func(context.Context, Delivery) error { return nil })
+	last, err := c.subscribeOnce(context.Background(), SubscribeOptions{Topic: "t", Group: "workers"}, func(context.Context, Delivery) error { return nil })
 	if err == nil {
 		t.Fatal("expected stream EOF")
 	}
@@ -423,5 +426,58 @@ func TestSubscriptionMemberIdentityBoundsAndReconnectStability(t *testing.T) {
 	err = New(server.URL).Subscribe(context.Background(), SubscribeOptions{Topic: "t"}, func(context.Context, Delivery) error { return nil })
 	if err == nil || len(members) != 3 || members[0] == "" || members[0] != members[1] || members[1] != members[2] {
 		t.Fatalf("members=%v err=%v", members, err)
+	}
+}
+
+func TestPublishRetryHandlesGatewayErrorsWithSameOperation(t *testing.T) {
+	for _, status := range []int{400, 409, 408, 429, 500, 502, 503, 504} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var attempts atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Spruce-Producer-ID") != "producer" || r.Header.Get("Spruce-Idempotency-Key") != "operation" {
+					t.Error("retry changed operation identity")
+				}
+				if attempts.Add(1) == 1 {
+					http.Error(w, "upstream unavailable", status)
+					return
+				}
+				w.WriteHeader(202)
+				_, _ = w.Write([]byte(`{"id":"event"}`))
+			}))
+			defer server.Close()
+			_, err := New(server.URL).PublishRetry(context.Background(), "t", []byte("event"), PublishOptions{ProducerID: "producer", IdempotencyKey: "operation", Compression: "off"}, RetryOptions{MaxAttempts: 2, MinBackoff: time.Millisecond, MaxBackoff: time.Millisecond})
+			if status == 400 || status == 409 {
+				if err == nil || attempts.Load() != 1 {
+					t.Fatal("permanent error retried")
+				}
+			} else if err != nil || attempts.Load() != 2 {
+				t.Fatalf("transient error not recovered: attempts=%d err=%v", attempts.Load(), err)
+			}
+		})
+	}
+}
+
+func TestDefaultPublishRetryOutlastsTransientDrain(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) <= 3 {
+			http.Error(w, "broker_draining", 503)
+			return
+		}
+		w.WriteHeader(202)
+		_, _ = w.Write([]byte(`{"id":"same-operation","confirmed_copies":1,"degraded":true}`))
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	result, err := New(server.URL).PublishRetry(ctx, "t", []byte("event"), PublishOptions{ProducerID: "p", IdempotencyKey: "operation", Ack: "available", Compression: "off"}, RetryOptions{})
+	if err != nil || attempts.Load() != 4 || result.ConfirmedCopies != 1 || !result.Degraded {
+		t.Fatalf("drain recovery: attempts=%d result=%+v err=%v", attempts.Load(), result, err)
+	}
+}
+
+func TestCompletionAffinityUTF8Vector(t *testing.T) {
+	if got := completionAffinity("shared-topic", "group é/+"); got != "e55cbafe41fd93ae0d545bf3d420c3f191bc6b140698f12e2a4e7e9f2794b242" {
+		t.Fatal(got)
 	}
 }

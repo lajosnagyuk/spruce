@@ -6,7 +6,7 @@ using System.Threading.Channels;
 namespace Spruce;
 
 public sealed record ClientEvent(string Operation, TimeSpan Duration, int? StatusCode, Exception? Error);
-public sealed record RetryOptions(int MaxAttempts = 3, TimeSpan? MinBackoff = null, TimeSpan? MaxBackoff = null);
+public sealed record RetryOptions(int MaxAttempts = 8, TimeSpan? MinBackoff = null, TimeSpan? MaxBackoff = null);
 public sealed record SubscribeOptions(
     string Topic,
     string? Group = null,
@@ -23,7 +23,12 @@ public sealed record BrokerStatus(
     [property: JsonPropertyName("cache_limit_bytes")] long CacheLimitBytes,
     [property: JsonPropertyName("peers")] int Peers,
     [property: JsonPropertyName("consumers")] int Consumers,
-    [property: JsonPropertyName("pending_deliveries")] int PendingDeliveries);
+    [property: JsonPropertyName("pending_deliveries")] int PendingDeliveries,
+    [property: JsonPropertyName("registered_groups")] long RegisteredGroups = 0,
+    [property: JsonPropertyName("group_outstanding_messages")] long GroupOutstandingMessages = 0,
+    [property: JsonPropertyName("group_active_keys")] long GroupActiveKeys = 0,
+    [property: JsonPropertyName("group_memory_bytes")] long GroupMemoryBytes = 0,
+    [property: JsonPropertyName("group_expired_messages")] long GroupExpiredMessages = 0);
 
 public sealed class ConsumableDelivery(Delivery delivery)
 {

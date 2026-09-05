@@ -2,7 +2,8 @@
 
 This chart deploys bounded, interchangeable Spruce brokers and a stateless Nginx gateway.
 The gateway consistently routes publishes and subscriptions for the same topic to one
-broker. Partition keys retain per-key ordering within that topic owner; replication is
+broker. Keys provide member affinity while membership and capacity remain stable;
+concurrent client handlers and retries do not guarantee ordered side effects; replication is
 used for bounded replay and broker replacement rather than ordinary delivery routing.
 Release charts are published as `oci://ghcr.io/lajosnagyuk/charts/spruce` with the
 release semantic version as the OCI tag.
@@ -45,6 +46,7 @@ admits it: `kubectl label namespace ingress-nginx spruce.io/ingress-access=true`
 | `config.cacheBytes` | `67108864` | Per-broker payload and metadata cache budget |
 | `config.goMemoryLimit` | `176MiB` | Go runtime soft memory limit; must leave the safety margin below the pod limit |
 | `config.memorySafetyMarginBytes` | `150994944` | Space reserved for stacks, executable mappings, allocator overhead, TLS, and other non-heap memory |
+| `config.streamMemoryBytes` | `16777216` | Aggregate fixed stream buffers and replay ID indexes; independent of pending payload bytes |
 | `config.deliveryLagLimit` | `1s` | Oldest unacknowledged topic delivery age before new publishes receive retryable overload |
 | `resources.requests.memory` | `224Mi` | Broker reservation, sized above the measured hot-topic working set |
 | `resources.limits.memory` | `320Mi` | Broker memory hard limit |
@@ -58,7 +60,7 @@ set `auth.requireExistingSecret=true` and use an externally managed Secret. See
 
 The chart rejects memory configurations where `config.goMemoryLimit` plus
 `config.memorySafetyMarginBytes` exceeds the pod limit. It also requires the cache,
-replication queue, action queue, inflight delivery, publish admission, and safety-margin
+replication queue, action queue, inflight delivery, publish admission, stream memory, and safety-margin
 budgets to fit inside that limit. These are conservative simultaneous upper bounds, not
 a prediction of steady-state RSS. Re-measure peak RSS after changing message sizes or
 concurrency. The default broker spread is strict: a three-replica release needs three

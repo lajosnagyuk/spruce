@@ -10,12 +10,14 @@
 - Label authorized client pods `spruce.io/client-access=true`. Label both the namespace
   and pod identity used by Prometheus `spruce.io/admin-access=true`.
 - Give the container memory headroom above `cacheBytes + maxInflightBytes +
-  replicationQueueBytes`; the default 256 MiB limit is sized for the default 64 MiB cache.
+  replicationQueueBytes`; the default 320 MiB limit is sized for the default 64 MiB cache.
 
 ## Delivery and maintenance
 
-Spruce is at-least-once while data remains in bounded replica memory. Client deduplication
-is required when duplicate handler execution is unsafe. Group ACK checkpoints suppress
+Spruce offers best-effort delivery with bounded retries and replay from replica memory.
+Cache eviction, TTL expiry, exhausted retries and infrastructure failures can prevent
+delivery. Client deduplication suppresses repeated message IDs within its configured
+window; it does not make external side effects exactly-once. Group ACK checkpoints suppress
 completed cached messages after ordinary consumer reconnects and replica replacement,
 but are non-durable and bounded by `config.checkpointEntries`. Abrupt loss of one broker
 delivered zero missing logical messages in the local K3s gate at one message/second; a
@@ -32,6 +34,11 @@ upstream list and roll the gateways, so they are topology maintenance rather tha
 online autoscaling operation. Abort if readiness does not converge within the window,
 replication errors increase, or any queue remains saturated. Never scale down while
 replay state is valuable.
+
+The stream memory budget defaults to 16 MiB. Each stream reserves 256 KiB plus its
+replay ID index, so byte admission can reject streams before `maxStreams` is reached.
+Watch `spruce_stream_memory_bytes` and `spruce_stream_memory_capacity_bytes`;
+`stream_memory_capacity` and `replay_memory_capacity` are retryable 429 responses.
 
 ## Credential rotation
 
@@ -71,3 +78,65 @@ KUBE_CONTEXT=<context> SPRUCE_NAMESPACE=<namespace> SPRUCE_RELEASE=<release> \
 After an incident, confirm all replicas are ready, replication error/drop counters are
 stable, queues return to zero, authenticated publish/consume succeeds, and retired
 credentials fail. There is no backup or restore operation because Spruce persists no data.
+
+## Availability during partial cluster loss
+
+Use single-message `available` acknowledgement when continued service from a lone
+survivor is preferred. Observe `confirmed_copies` and `degraded` on the publish result.
+`one-peer` still requires a fresh peer confirmation, including on retries. Eight default
+publish attempts allow transient drain/routing recovery; configure a caller deadline
+and retry policy to match the application's acceptable wait.
+
+Draining now closes active streams and rejects new publication/subscription admission;
+ACKs and peer recovery remain enabled during the grace period. The Helm gateway's
+rendered configuration checksum triggers rollout for DNS and routing changes.
+
+For isolated test namespaces labelled `spruce.io/test-environment=true`,
+`scripts/k3s-lifecycle.py` runs baseline, scale-to-one/recover, and one/two-container SIGKILL
+cases (`--ssh-user` and optionally `--ssh-identity` select node access). It restores the StatefulSet replica count after scale tests and
+retains job results for an hour. It does not cordon or drain cluster hosts.
+
+Gateway retries of forwarded POSTs are restricted to single-message publishes with
+both operation-identity headers.
+
+### Delivery distribution and completion
+
+Current SDKs send a canonical `Spruce-Delivery-Affinity` digest on streams and ACK/NACK
+requests. The gateway spreads topic/group pairs across brokers and sends scoped
+completion through that same upstream. Coordinate client stream reconnection when
+migrating from older SDKs, whose routing can differ. This does not fence independent
+brokers during partitions. Full replication still stores every event on each broker.
+
+Owner-local ACKs now complete even when peer checkpoint queues are full. Monitor action
+drops: subsequent owner loss can redeliver work whose checkpoint did not propagate.
+
+### Retention and unfinished grouped work
+
+Accepted events now remain cached until their original expiry, even after completion.
+A full retention or group-index budget returns HTTP 429 `retention_capacity`; producers
+must handle rejection and retry the same operation identity. ACK does not immediately
+make cache space available. Choose TTL and memory together: approximately arrival rate
+× retention seconds × accounted message size, plus the separately bounded stream,
+in-flight, replication and runtime memory. The chart still defaults to a one-minute
+TTL; set an explicit window appropriate to the tolerated consumer outage.
+
+Groups now gate each key on completion. NACK and timeout retry its current head;
+MaxAttempts caps the reported group attempt rather than discarding the work. Expiry
+releases the key and may require the consumer to handle a cursor-expired error. Broadcast
+retry limits retain their existing behaviour. A slow grouped key does not impose the
+broadcast topic-wide lag rejection on unrelated keys; actual byte pressure still applies.
+
+Group ID queues share `streamMemoryBytes`, with one stream reservation protected from
+queue usage to permit reconnection. A large backlog can reject additional group/stream
+admission. Group state survives disconnection while it contains work; retained TTL
+history provides recovery on other brokers without distributed group registration.
+
+Monitor `spruce_group_outstanding_messages`, `spruce_group_active_keys`,
+`spruce_group_memory_bytes`, `spruce_registered_groups`, and especially increases in
+`spruce_group_expired_messages_total`. The latter means indexed unfinished work reached
+expiry. Normal cache expiry also includes already completed history and is a different
+signal. Status exposes corresponding fields in all three SDKs.
+
+These gates order distinct event identities at one broker. They do not fence an old
+application handler after timeout or an independently serving partition. Keep side
+effects idempotent; completion gates do not establish exclusive ownership across brokers.

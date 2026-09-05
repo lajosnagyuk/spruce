@@ -1,4 +1,6 @@
 using System.Buffers.Binary;
+using System.Security.Cryptography;
+using System.Text;
 using System.IO.Compression;
 using System.Collections.Concurrent;
 using ZstdSharp;
@@ -10,7 +12,7 @@ using System.Threading.Channels;
 namespace Spruce;
 
 public sealed record PublishOptions(string? Key = null, TimeSpan? Ttl = null, string? ContentType = null, string? Ack = null, string? IdempotencyKey = null, string? ProducerId = null, string? Compression = null);
-public sealed record PublishResult([property: JsonPropertyName("id")] string Id, [property: JsonPropertyName("replicated")] bool Replicated);
+public sealed record PublishResult([property: JsonPropertyName("id")] string Id, [property: JsonPropertyName("replicated")] bool Replicated, [property: JsonPropertyName("confirmed_copies")] int ConfirmedCopies = 0, [property: JsonPropertyName("degraded")] bool Degraded = false);
 public sealed record BatchResult([property: JsonPropertyName("ids")] string[] Ids);
 public sealed record BatchEntry(ReadOnlyMemory<byte> Payload, string? Key = null);
 public sealed record Delivery(
@@ -142,6 +144,7 @@ public sealed partial class SpruceClient : IDisposable
                     $"&member={Uri.EscapeDataString(memberId)}" +
                     (legacyTimestampCursor ? $"&since={since}" : cursor is null ? "" : $"&cursor={Uri.EscapeDataString(cursor)}");
                 using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+                request.Headers.Add("Spruce-Delivery-Affinity", CompletionAffinity(topic, group));
                 Authorize(request);
                 using var response = await SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken, "subscribe");
                 await EnsureSuccessAsync(response, cancellationToken);
@@ -149,8 +152,8 @@ public sealed partial class SpruceClient : IDisposable
                 Emit(new("subscription_connected", TimeSpan.Zero, (int)response.StatusCode, null));
                 await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
                 using var connection = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                await using var acks = new AckBatcher(this, "ack", connection.Token);
-                await using var nacks = new AckBatcher(this, "nack", connection.Token);
+                await using var acks = new AckBatcher(this, "ack", connection.Token, topic, group);
+                await using var nacks = new AckBatcher(this, "nack", connection.Token, topic, group);
                 var deliveryLanes = preserveKeyOrder
                     ? Enumerable.Range(0, concurrency).Select(_ => Channel.CreateBounded<(Delivery Delivery, long Index)>(new BoundedChannelOptions(2) { FullMode = BoundedChannelFullMode.Wait, SingleWriter = true })).ToArray()
                     : [Channel.CreateBounded<(Delivery Delivery, long Index)>(new BoundedChannelOptions(concurrency * 2) { FullMode = BoundedChannelFullMode.Wait, SingleWriter = true })];
@@ -170,8 +173,10 @@ public sealed partial class SpruceClient : IDisposable
                             catch when (!connection.IsCancellationRequested)
                             {
                                 await nacks.SubmitAsync(work.Delivery.DeliveryId, connection.Token);
-                                MarkComplete(work.Index, work.Delivery.Cursor, work.Delivery.CreatedAt);
-                                continue;
+                                // A rejected handler has not completed this position.
+                                // Reconnect before it rather than skip a lost broker retry.
+                                connection.Cancel();
+                                return;
                             }
                             await acks.SubmitAsync(work.Delivery.DeliveryId, connection.Token);
                             MarkComplete(work.Index, work.Delivery.Cursor, work.Delivery.CreatedAt);
@@ -299,11 +304,14 @@ public sealed partial class SpruceClient : IDisposable
         return (int)(hash % (uint)laneCount);
     }
 
-    private async Task AckAsync(string action, IReadOnlyList<string> ids, CancellationToken cancellationToken)
+    private static string CompletionAffinity(string topic, string? group) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(topic + "\0" + (group ?? "")))).ToLowerInvariant();
+
+    private async Task AckAsync(string action, IReadOnlyList<string> ids, CancellationToken cancellationToken, string topic, string? group)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(10));
         using var request = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/v1/deliveries/{action}") { Content = JsonContent.Create(new { delivery_ids = ids }) };
+        request.Headers.Add("Spruce-Delivery-Affinity", CompletionAffinity(topic, group));
         Authorize(request);
         using var response = await SendAsync(request, HttpCompletionOption.ResponseContentRead, timeout.Token, action);
         await EnsureSuccessAsync(response, timeout.Token);
@@ -427,14 +435,17 @@ public sealed partial class SpruceClient : IDisposable
         private sealed record Item(string Id, TaskCompletionSource Completion);
         private readonly SpruceClient _client;
         private readonly string _action;
+        private readonly string _topic;
+        private readonly string? _group;
         private readonly Channel<Item> _items = Channel.CreateBounded<Item>(new BoundedChannelOptions(1024) { FullMode = BoundedChannelFullMode.Wait, SingleReader = true });
         private readonly CancellationToken _cancellationToken;
         private readonly Task _worker;
 
-        public AckBatcher(SpruceClient client, string action, CancellationToken cancellationToken)
+        public AckBatcher(SpruceClient client, string action, CancellationToken cancellationToken, string topic, string? group)
         {
             _client = client;
             _action = action;
+            _topic = topic; _group = group;
             _cancellationToken = cancellationToken;
             _worker = RunAsync();
         }
@@ -460,7 +471,7 @@ public sealed partial class SpruceClient : IDisposable
                     await Task.Delay(TimeSpan.FromMilliseconds(0.5), _cancellationToken);
                     while (batch.Count < 256 && _items.Reader.TryRead(out var item)) batch.Add(item);
                     Exception? failure = null;
-                    try { await _client.AckAsync(_action, batch.Select(item => item.Id).ToArray(), _cancellationToken); }
+                    try { await _client.AckAsync(_action, batch.Select(item => item.Id).ToArray(), _cancellationToken, _topic, _group); }
                     catch (Exception ex) { failure = ex; }
                     foreach (var item in batch)
                     {

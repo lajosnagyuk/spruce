@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -44,8 +45,10 @@ type PublishOptions struct {
 	TTL                                                            time.Duration
 }
 type PublishResult struct {
-	ID         string `json:"id"`
-	Replicated bool   `json:"replicated"`
+	ID              string `json:"id"`
+	Replicated      bool   `json:"replicated"`
+	ConfirmedCopies int    `json:"confirmed_copies,omitempty"`
+	Degraded        bool   `json:"degraded,omitempty"`
 }
 
 type BatchResult struct {
@@ -218,7 +221,7 @@ func (c *Client) PublishRetry(ctx context.Context, topic string, payload []byte,
 		return PublishResult{}, errors.New("retry requires producer ID and idempotency key")
 	}
 	if retry.MaxAttempts <= 0 {
-		retry.MaxAttempts = 3
+		retry.MaxAttempts = 8
 	}
 	if retry.MinBackoff <= 0 {
 		retry.MinBackoff = 50 * time.Millisecond
@@ -235,7 +238,7 @@ func (c *Client) PublishRetry(ctx context.Context, topic string, payload []byte,
 			return result, nil
 		}
 		var apiErr *Error
-		if errors.As(err, &apiErr) && apiErr.StatusCode != 408 && apiErr.StatusCode != 429 && apiErr.StatusCode != 503 {
+		if errors.As(err, &apiErr) && apiErr.StatusCode != 408 && apiErr.StatusCode != 429 && apiErr.StatusCode < 500 {
 			return result, err
 		}
 		if attempt+1 == retry.MaxAttempts {
@@ -366,13 +369,17 @@ type ackItem struct {
 }
 
 type ackBatcher struct {
-	c     *Client
-	kind  string
-	items chan ackItem
+	c            *Client
+	kind         string
+	topic, group string
+	items        chan ackItem
 }
 
-func newAckBatcher(ctx context.Context, c *Client, kind string) *ackBatcher {
+func newAckBatcher(ctx context.Context, c *Client, kind string, scope ...string) *ackBatcher {
 	b := &ackBatcher{c: c, kind: kind, items: make(chan ackItem, 1024)}
+	if len(scope) == 2 {
+		b.topic, b.group = scope[0], scope[1]
+	}
 	go b.run(ctx)
 	return b
 }
@@ -433,7 +440,7 @@ func (b *ackBatcher) run(ctx context.Context) {
 		for i := range batch {
 			ids[i] = batch[i].id
 		}
-		err := b.c.ack(ctx, b.kind, ids)
+		err := b.c.ack(ctx, b.kind, ids, b.topic, b.group)
 		for _, item := range batch {
 			item.done <- err
 		}
@@ -525,6 +532,12 @@ func subscriptionMemberID(explicit string) (string, error) {
 var ErrHandlerDrainTimeout = errors.New("spruce: handlers did not stop before drain timeout")
 
 type Status struct {
+	RegisteredGroups         int64 `json:"registered_groups"`
+	GroupOutstandingMessages int64 `json:"group_outstanding_messages"`
+	GroupActiveKeys          int64 `json:"group_active_keys"`
+	GroupMemoryBytes         int64 `json:"group_memory_bytes"`
+	GroupExpiredMessages     int64 `json:"group_expired_messages"`
+
 	Messages            int   `json:"messages"`
 	CacheAccountedBytes int64 `json:"cache_accounted_bytes"`
 	CacheLimitBytes     int64 `json:"cache_limit_bytes"`
@@ -654,6 +667,7 @@ func (c *Client) subscribeOnce(ctx context.Context, o SubscribeOptions, handler 
 		v.Set("cursor", o.Cursor)
 	}
 	req, _ := http.NewRequestWithContext(streamCtx, http.MethodGet, c.BaseURL+"/v1/subscriptions/stream?"+v.Encode(), nil)
+	req.Header.Set("Spruce-Delivery-Affinity", completionAffinity(o.Topic, o.Group))
 	if err := c.authorize(req); err != nil {
 		return o.Cursor, err
 	}
@@ -679,8 +693,8 @@ func (c *Client) subscribeOnce(ctx context.Context, o SubscribeOptions, handler 
 	sem := make(chan struct{}, o.Concurrency)
 	progressWindow := make(chan struct{}, o.Concurrency)
 	workerErrors := make(chan error, 1)
-	acks := newAckBatcher(streamCtx, c, "ack")
-	nacks := newAckBatcher(streamCtx, c, "nack")
+	acks := newAckBatcher(streamCtx, c, "ack", o.Topic, o.Group)
+	nacks := newAckBatcher(streamCtx, c, "nack", o.Topic, o.Group)
 	var progressMu sync.Mutex
 	nextProgress := uint64(1)
 	completed := make(map[uint64]string)
@@ -799,7 +813,9 @@ func (c *Client) subscribeOnce(ctx context.Context, o SubscribeOptions, handler 
 					}
 					return
 				}
-				markComplete(index, d.Cursor)
+				// A NACK is not processing completion. Reconnect from the last
+				// contiguous ACK so losing this broker cannot skip the retry.
+				cancel()
 				return
 			}
 			if e := acks.submit(streamCtx, d.DeliveryID); e != nil {
@@ -835,10 +851,13 @@ func readFrame(r io.Reader, maxPayloadBytes int) (Delivery, error) {
 	_, e := io.ReadFull(r, d.Payload)
 	return d, e
 }
-func (c *Client) ack(ctx context.Context, kind string, ids []string) error {
+func (c *Client) ack(ctx context.Context, kind string, ids []string, scope ...string) error {
 	body, _ := json.Marshal(map[string][]string{"delivery_ids": ids})
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/v1/deliveries/"+kind, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	if len(scope) == 2 && scope[0] != "" {
+		req.Header.Set("Spruce-Delivery-Affinity", completionAffinity(scope[0], scope[1]))
+	}
 	if e := c.authorize(req); e != nil {
 		return e
 	}
@@ -893,4 +912,9 @@ func (d *Deduper) Seen(id string) bool {
 		}
 	}
 	return false
+}
+
+func completionAffinity(topic, group string) string {
+	sum := sha256.Sum256([]byte(topic + "\x00" + group))
+	return hex.EncodeToString(sum[:])
 }
