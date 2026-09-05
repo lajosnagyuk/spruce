@@ -10,12 +10,14 @@
 - Label authorized client pods `spruce.io/client-access=true`. Label both the namespace
   and pod identity used by Prometheus `spruce.io/admin-access=true`.
 - Give the container memory headroom above `cacheBytes + maxInflightBytes +
-  replicationQueueBytes`; the default 256 MiB limit is sized for the default 64 MiB cache.
+  replicationQueueBytes`; the default 320 MiB limit is sized for the default 64 MiB cache.
 
 ## Delivery and maintenance
 
-Spruce is at-least-once while data remains in bounded replica memory. Client deduplication
-is required when duplicate handler execution is unsafe. Group ACK checkpoints suppress
+Spruce offers best-effort delivery with bounded retries and replay from replica memory.
+Cache eviction, TTL expiry, exhausted retries and infrastructure failures can prevent
+delivery. Client deduplication suppresses repeated message IDs within its configured
+window; it does not make external side effects exactly-once. Group ACK checkpoints suppress
 completed cached messages after ordinary consumer reconnects and replica replacement,
 but are non-durable and bounded by `config.checkpointEntries`. Abrupt loss of one broker
 delivered zero missing logical messages in the local K3s gate at one message/second; a
@@ -32,6 +34,11 @@ upstream list and roll the gateways, so they are topology maintenance rather tha
 online autoscaling operation. Abort if readiness does not converge within the window,
 replication errors increase, or any queue remains saturated. Never scale down while
 replay state is valuable.
+
+The stream memory budget defaults to 16 MiB. Each stream reserves 256 KiB plus its
+replay ID index, so byte admission can reject streams before `maxStreams` is reached.
+Watch `spruce_stream_memory_bytes` and `spruce_stream_memory_capacity_bytes`;
+`stream_memory_capacity` and `replay_memory_capacity` are retryable 429 responses.
 
 ## Credential rotation
 

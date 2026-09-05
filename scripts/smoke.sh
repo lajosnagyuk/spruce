@@ -5,5 +5,5 @@ curl -fsS --retry 5 --retry-all-errors --max-time 2 "$base/health/ready" >/dev/n
 key="smoke-$(date +%s)-$$"
 id=$(curl -fsS --retry 5 --retry-all-errors --max-time 2 -X POST -H 'Content-Type: application/octet-stream' -H 'Spruce-Producer-ID: smoke' -H "Spruce-Idempotency-Key: $key" --data-binary 'smoke-test' "$base/v1/topics/smoke/messages" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
 test -n "$id"
-curl -fsS --retry 5 --retry-all-errors --max-time 2 "$base/metrics" | grep -q 'spruce_publish_total'
+# Administrative metrics are intentionally not exposed through the public gateway.
 printf 'published %s\n' "$id"

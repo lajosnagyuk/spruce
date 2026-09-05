@@ -16,6 +16,7 @@ await Run("ack failure cancellation", AckFailureCancellation, failures);
 await Run("terminal drain timeout", TerminalDrainTimeout, failures);
 await Run("basic auth and structured error", BasicAuthAndStructuredError, failures);
 await Run("deduper", DeduperBehavior, failures);
+await Run("NACK retains reconnect cursor", NackRetainsReconnectCursor, failures);
 await Run("subscription duplicate suppression", SubscriptionDuplicateSuppression, failures);
 await Run("retry diagnostics and telemetry", RetryDiagnosticsTelemetry, failures);
 await Run("explicit stream completion", ExplicitStreamCompletion, failures);
@@ -215,13 +216,37 @@ static Task DeduperBehavior()
     return Task.CompletedTask;
 }
 
+static async Task NackRetainsReconnectCursor()
+{
+    using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+    var streams = 0;
+    string? reconnectQuery = null;
+    var client = new SpruceClient("https://spruce.invalid", new HttpClient(new StubHandler(request =>
+    {
+        if (request.RequestUri!.AbsolutePath.EndsWith("/nack")) return new(HttpStatusCode.NoContent);
+        if (request.RequestUri.AbsolutePath.EndsWith("/ack")) return new(HttpStatusCode.NoContent);
+        if (++streams == 2) { reconnectQuery = request.RequestUri.Query; cancellation.Cancel(); }
+        var metadata = Encoding.UTF8.GetBytes("{\"delivery_id\":\"d1\",\"message_id\":\"m1\",\"topic\":\"t\",\"cursor\":\"failed-cursor\"}");
+        var body = new byte[8 + metadata.Length];
+        BinaryPrimitives.WriteUInt32BigEndian(body.AsSpan(0, 4), (uint)metadata.Length);
+        metadata.CopyTo(body, 8);
+        var response = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(body) };
+        response.Headers.Add("Spruce-Cursor", "initial-cursor");
+        return response;
+    })));
+    try { await client.SubscribeAsync("t", "g", (_, _) => throw new InvalidOperationException("retry me"), cancellation.Token, concurrency: 1); }
+    catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+    Assert(streams >= 2, "handler failure did not reconnect");
+    Assert(reconnectQuery?.Contains("cursor=initial-cursor") == true, $"NACK skipped failed event: {reconnectQuery}");
+}
+
 static async Task SubscriptionDuplicateSuppression()
 {
     using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(2));
     var calls = 0;
     var acks = 0;
     var nacks = 0;
-    var stream = Frames(("d1", "m1", "same", (byte)1), ("d2", "m1", "same", (byte)1), ("d3", "m1", "same", (byte)1));
+
     var client = new SpruceClient("https://spruce.invalid", new HttpClient(new StubHandler(request =>
     {
         if (request.RequestUri!.AbsolutePath.EndsWith("/ack"))
@@ -230,7 +255,7 @@ static async Task SubscriptionDuplicateSuppression()
             return new(HttpStatusCode.NoContent);
         }
         if (request.RequestUri.AbsolutePath.EndsWith("/nack")) { Interlocked.Increment(ref nacks); return new(HttpStatusCode.NoContent); }
-        return new(HttpStatusCode.OK) { Content = new StreamContent(stream) };
+        return new(HttpStatusCode.OK) { Content = new StreamContent(Frames(("d1", "m1", "same", (byte)1), ("d2", "m1", "same", (byte)1), ("d3", "m1", "same", (byte)1))) };
     })));
     try
     {

@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-func TestNackAdvancesOrderedCursor(t *testing.T) {
+func TestNackDoesNotAdvanceOrderedCursor(t *testing.T) {
 	var acks, nacks atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -28,6 +28,7 @@ func TestNackAdvancesOrderedCursor(t *testing.T) {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		w.Header().Set("Spruce-Cursor", "initial-cursor")
 		for i := 1; i <= 2; i++ {
 			metadata, _ := json.Marshal(Delivery{DeliveryID: string(rune('a' + i)), MessageID: "m", Topic: "t", CreatedAt: int64(i), Cursor: fmt.Sprintf("cursor-%d", i)})
 			var sizes [8]byte
@@ -37,14 +38,13 @@ func TestNackAdvancesOrderedCursor(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	var handled atomic.Int32
-	last, err := New(server.URL).subscribeOnce(context.Background(), SubscribeOptions{Topic: "t"}, func(context.Context, Delivery) error {
-		if handled.Add(1) == 1 {
+	last, err := New(server.URL).subscribeOnce(context.Background(), SubscribeOptions{Topic: "t"}, func(_ context.Context, d Delivery) error {
+		if d.Cursor == "cursor-1" {
 			return context.Canceled
 		}
 		return nil
 	})
-	if err == nil || last != "cursor-2" || acks.Load() != 1 || nacks.Load() != 1 {
+	if err == nil || last != "initial-cursor" || nacks.Load() != 1 {
 		t.Fatalf("last=%s acks=%d nacks=%d err=%v", last, acks.Load(), nacks.Load(), err)
 	}
 }
@@ -423,5 +423,33 @@ func TestSubscriptionMemberIdentityBoundsAndReconnectStability(t *testing.T) {
 	err = New(server.URL).Subscribe(context.Background(), SubscribeOptions{Topic: "t"}, func(context.Context, Delivery) error { return nil })
 	if err == nil || len(members) != 3 || members[0] == "" || members[0] != members[1] || members[1] != members[2] {
 		t.Fatalf("members=%v err=%v", members, err)
+	}
+}
+
+func TestPublishRetryHandlesGatewayErrorsWithSameOperation(t *testing.T) {
+	for _, status := range []int{400, 409, 408, 429, 500, 502, 503, 504} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var attempts atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Spruce-Producer-ID") != "producer" || r.Header.Get("Spruce-Idempotency-Key") != "operation" {
+					t.Error("retry changed operation identity")
+				}
+				if attempts.Add(1) == 1 {
+					http.Error(w, "upstream unavailable", status)
+					return
+				}
+				w.WriteHeader(202)
+				_, _ = w.Write([]byte(`{"id":"event"}`))
+			}))
+			defer server.Close()
+			_, err := New(server.URL).PublishRetry(context.Background(), "t", []byte("event"), PublishOptions{ProducerID: "producer", IdempotencyKey: "operation", Compression: "off"}, RetryOptions{MaxAttempts: 2, MinBackoff: time.Millisecond, MaxBackoff: time.Millisecond})
+			if status == 400 || status == 409 {
+				if err == nil || attempts.Load() != 1 {
+					t.Fatal("permanent error retried")
+				}
+			} else if err != nil || attempts.Load() != 2 {
+				t.Fatalf("transient error not recovered: attempts=%d err=%v", attempts.Load(), err)
+			}
+		})
 	}
 }

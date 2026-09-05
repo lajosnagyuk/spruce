@@ -170,8 +170,10 @@ public sealed partial class SpruceClient : IDisposable
                             catch when (!connection.IsCancellationRequested)
                             {
                                 await nacks.SubmitAsync(work.Delivery.DeliveryId, connection.Token);
-                                MarkComplete(work.Index, work.Delivery.Cursor, work.Delivery.CreatedAt);
-                                continue;
+                                // A rejected handler has not completed this position.
+                                // Reconnect before it rather than skip a lost broker retry.
+                                connection.Cancel();
+                                return;
                             }
                             await acks.SubmitAsync(work.Delivery.DeliveryId, connection.Token);
                             MarkComplete(work.Index, work.Delivery.Cursor, work.Delivery.CreatedAt);

@@ -14,6 +14,7 @@ build:
 	go build -trimpath -o $(BIN)/spruce-consumer ./cmd/spruce-consumer
 	go build -trimpath -o $(BIN)/spruce-bench ./cmd/spruce-bench
 	go build -trimpath -o $(BIN)/spruce-integration ./cmd/spruce-integration
+	go build -trimpath -o $(BIN)/spruce-lifecycle ./cmd/spruce-lifecycle
 	go build -trimpath -o $(BIN)/spruce-binary-soak ./cmd/spruce-binary-soak
 
 binary-curve: build

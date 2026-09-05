@@ -263,7 +263,7 @@ class Client:
             retry_after = 0.0
             try: return self.publish(topic, payload, options)
             except SpruceError as exc:
-                if exc.status_code not in (408, 429, 503) or attempt + 1 == retry.max_attempts: raise
+                if (exc.status_code not in (408, 429) and exc.status_code < 500) or attempt + 1 == retry.max_attempts: raise
                 retry_after = exc.retry_after
             except (OSError, urllib.error.URLError):
                 if attempt + 1 == retry.max_attempts: raise
@@ -362,9 +362,10 @@ class Client:
                 if not cursor: cursor = response.headers.get("Spruce-Cursor", "")
                 self._emit("subscription_connected", connected_at, 200, None)
                 connection_done = threading.Event()
+                retry_connection = threading.Event()
                 def interrupt() -> None:
                     while not connection_done.wait(.05):
-                        if stop.is_set():
+                        if stop.is_set() or retry_connection.is_set():
                             response.close()
                             return
                 threading.Thread(target=interrupt, name="spruce-subscription-interrupt", daemon=True).start()
@@ -386,15 +387,17 @@ class Client:
                           delivery = self._read_delivery(response, options.max_payload_bytes)
                           if not delivery.delivery_id: continue
                           sequence += 1
-                          def consume(item=delivery):
+                          def consume(item=delivery, completions=accept_completions, reconnect=retry_connection):
                               try: handler(item)
                               except Exception:
-                                  if accept_completions.is_set(): nacks.submit(item.delivery_id)
-                                  return item.cursor
+                                  if completions.is_set(): nacks.submit(item.delivery_id)
+                                  # A NACK must not advance the replay cursor.
+                                  reconnect.set()
+                                  raise OSError("handler rejected delivery; reconnecting before it")
                               except BaseException as exc:
-                                  if accept_completions.is_set(): nacks.submit(item.delivery_id)
+                                  if completions.is_set(): nacks.submit(item.delivery_id)
                                   raise HandlerPanicError(str(exc)) from exc
-                              if accept_completions.is_set(): acks.submit(item.delivery_id)
+                              if completions.is_set(): acks.submit(item.delivery_id)
                               return item.cursor
                           futures.append((sequence, workers.submit(consume)))
                           while sequence - next_progress + 1 >= completion_capacity and not stop.is_set():
@@ -411,14 +414,23 @@ class Client:
                       connection_done.set()
                   # Drain before executor shutdown: __exit__ waits without a bound.
                   deadline = time.monotonic() + options.drain_timeout
+                  completion_error = None
                   for index, future in futures:
                       try:
                           completed[index] = future.result(timeout=max(0, deadline - time.monotonic()))
                           advance()
                       except TimeoutError as exc:
                           if future.done():
-                              raise
+                              completion_error = completion_error or exc
+                              continue
                           raise HandlerDrainTimeoutError("Spruce handlers did not stop before drain timeout") from exc
+                      except BaseException as exc:
+                          # Drain every worker before reconnecting, even if an
+                          # earlier handler or ACK failed. Do not carry queued
+                          # handlers into the next subscription connection.
+                          completion_error = completion_error or exc
+                  if completion_error is not None:
+                      raise completion_error
                   if stream_error is not None and not stop.is_set():
                       raise stream_error
                 finally:

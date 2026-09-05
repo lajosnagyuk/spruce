@@ -66,6 +66,7 @@ type Config struct {
 	CheckpointEntries          int
 	MaxConcurrentRequests      int
 	MaxStreams                 int
+	StreamMemoryBytes          int64
 	MaxInternalRequests        int
 	PublishAdmissionBytes      int64
 	PublishAdmissionWait       time.Duration
@@ -78,7 +79,7 @@ func DefaultConfig() Config {
 		MaxMessage: 1 << 20, QueueDepth: 4096, ReplicationQueueBytes: 64 << 20, ActionQueueBytes: 4 << 20,
 		MaxInflightBytes: 64 << 20, MaxSubscriberInflightBytes: 16 << 20, AckDeadline: 30 * time.Second, MaxAttempts: 8,
 		IdempotencyEntries: 65536, CheckpointEntries: 65536, MaxConcurrentRequests: 4096, MaxStreams: 1024, MaxInternalRequests: 1024,
-		PublishAdmissionBytes: 32 << 20, PublishAdmissionWait: 100 * time.Millisecond, DeliveryLagLimit: time.Second}
+		PublishAdmissionBytes: 32 << 20, PublishAdmissionWait: 100 * time.Millisecond, DeliveryLagLimit: time.Second, StreamMemoryBytes: 16 << 20}
 }
 
 type Message struct {
@@ -361,11 +362,16 @@ func (c *cache) putBatchLocked(messages []*Message, now int64) ([]bool, error) {
 		}
 		total += sz
 	}
+	return c.insertBatchLocked(messages), nil
+}
+
+// The caller holds c.mu and has already validated the aggregate byte budget.
+func (c *cache) insertBatchLocked(messages []*Message) []bool {
 	inserted := make([]bool, len(messages))
 	for i, m := range messages {
 		inserted[i], _ = c.insertLocked(m)
 	}
-	return inserted, nil
+	return inserted
 }
 
 func (c *cache) dropOldestLocked() {
@@ -638,7 +644,7 @@ type subscriber struct {
 	cancel           context.CancelFunc
 	detached         bool
 	replaying        bool
-	deferred         []*Message
+	deferred         []string
 }
 
 type deliveryCandidate struct {
@@ -731,6 +737,8 @@ type peer struct {
 	acks        chan actionBatch
 	nacks       chan actionBatch
 	v2          atomic.Bool
+	legacy      atomic.Bool
+	probeMu     sync.Mutex
 	lastV2Probe atomic.Int64
 }
 
@@ -907,6 +915,7 @@ type Broker struct {
 	admissionWaiters      []*publishAdmissionWaiter
 	replicationFreed      chan struct{}
 	streamSlots           chan struct{}
+	streamMemoryBytes     atomic.Int64
 	internalSlots         chan struct{}
 	digestSlot            chan struct{}
 	ready                 atomic.Bool
@@ -974,6 +983,12 @@ func New(cfg Config) *Broker {
 	if cfg.MaxStreams <= 0 {
 		cfg.MaxStreams = DefaultConfig().MaxStreams
 	}
+	if cfg.StreamMemoryBytes <= 0 {
+		cfg.StreamMemoryBytes = DefaultConfig().StreamMemoryBytes
+	}
+	if cfg.StreamMemoryBytes < streamMemoryReservation {
+		panic("spruce: stream memory budget must fit at least one stream")
+	}
 	if cfg.MaxInternalRequests <= 0 {
 		cfg.MaxInternalRequests = DefaultConfig().MaxInternalRequests
 	}
@@ -1018,7 +1033,6 @@ func New(cfg Config) *Broker {
 		u = strings.TrimRight(strings.TrimSpace(u), "/")
 		if u != "" {
 			p := &peer{url: u, ch: make(chan []*Message, cfg.QueueDepth), acks: make(chan actionBatch, 1024), nacks: make(chan actionBatch, 1024)}
-			p.lastV2Probe.Store(time.Now().UnixMilli())
 			b.peers = append(b.peers, p)
 		}
 	}
@@ -1575,7 +1589,8 @@ func (b *Broker) publish(w http.ResponseWriter, r *http.Request) {
 	var idempotency *idempotencyEntry
 	idempotencyCacheKey := ""
 	if idempotencyKey != "" {
-		idempotencyCacheKey = topic + "\x00" + producerID + "\x00" + idempotencyKey
+		id = idempotentMessageID(topic, producerID, idempotencyKey)
+		idempotencyCacheKey = id
 		var owner bool
 		fingerprint := messageFingerprint(payload, r.Header.Get("Spruce-Key"), r.Header.Get("Content-Type"), ttl)
 		idempotency, owner, err = b.beginIdempotency(r.Context(), idempotencyCacheKey, id, now.Add(ttl).UnixMilli(), fingerprint)
@@ -1624,15 +1639,32 @@ func (b *Broker) publish(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusTooManyRequests, "replication_overloaded")
 		return
 	}
-	if _, err = b.accept(m); err != nil {
+	var inserted bool
+	if idempotencyKey != "" {
+		m, inserted, err = b.acceptIdempotent(m, ttl)
+	} else {
+		inserted, err = b.accept(m)
+	}
+	if err != nil {
 		b.releaseReplicationReservation(reservedPeer, replicationBytes)
 		b.finishIdempotency(idempotencyCacheKey, idempotency, false, false)
 		b.metrics.Rejected.Add(1)
-		problem(w, 507, "cache_capacity")
+		if errors.Is(err, errIdempotencyConflict) {
+			problem(w, 409, "idempotency_conflict")
+		} else {
+			problem(w, 507, "cache_capacity")
+		}
 		return
 	}
-	b.metrics.Published.Add(1)
-	b.metrics.PublishBytes.Add(uint64(len(payload)))
+	if idempotency != nil {
+		b.mu.Lock()
+		idempotency.expiresAt = m.ExpiresAt
+		b.mu.Unlock()
+	}
+	if inserted {
+		b.metrics.Published.Add(1)
+		b.metrics.PublishBytes.Add(uint64(len(payload)))
+	}
 	replicated := false
 	if ack == "one-peer" && len(b.peers) > 0 {
 		replicated = b.replicateOne(r.Context(), m)
@@ -1648,12 +1680,24 @@ func (b *Broker) publish(w http.ResponseWriter, r *http.Request) {
 	b.finishIdempotency(idempotencyCacheKey, idempotency, true, replicated)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(202)
-	_ = json.NewEncoder(w).Encode(map[string]any{"id": m.ID, "replicated": replicated})
+	_ = json.NewEncoder(w).Encode(map[string]any{"id": m.ID, "replicated": replicated, "deduplicated": !inserted})
 }
 
 func (b *Broker) accept(m *Message) (bool, error) {
 	b.cache.mu.Lock()
 	defer b.cache.mu.Unlock()
+	return b.acceptLocked(m)
+}
+
+func (b *Broker) acceptLocked(m *Message) (bool, error) {
+	b.cache.expireLocked(time.Now().UnixMilli())
+	if messageSize(m) > b.cache.maxBytes {
+		return false, errors.New("message exceeds cache capacity")
+	}
+	if _, exists := b.cache.items[m.ID]; exists {
+		b.metrics.Duplicate.Add(1)
+		return false, nil
+	}
 	if m.Origin == "" {
 		state := b.cache.topicSequences[m.Topic]
 		if state == nil {
@@ -1669,7 +1713,7 @@ func (b *Broker) accept(m *Message) (bool, error) {
 		m.Origin, m.Sequence = state.origin, state.next
 		b.cache.receivedThrough[m.Origin] = m.Sequence
 	}
-	inserted, err := b.cache.putLocked(m, time.Now().UnixMilli())
+	inserted, err := b.cache.insertLocked(m)
 	if err != nil || !inserted {
 		if !inserted && err == nil {
 			b.metrics.Duplicate.Add(1)
@@ -1683,6 +1727,24 @@ func (b *Broker) accept(m *Message) (bool, error) {
 func (b *Broker) acceptBatch(messages []*Message) error {
 	b.cache.mu.Lock()
 	defer b.cache.mu.Unlock()
+	b.cache.expireLocked(time.Now().UnixMilli())
+	// Admission must precede sequence assignment: rejected batches must not
+	// leave holes that replicas can never fill.
+	var total int64
+	newTopics := make(map[string]struct{})
+	for _, m := range messages {
+		size := messageSize(m)
+		if size > b.cache.maxBytes || total > b.cache.maxBytes-size {
+			return errors.New("message exceeds cache capacity")
+		}
+		total += size
+		if m.Origin == "" && b.cache.topicSequences[m.Topic] == nil {
+			newTopics[m.Topic] = struct{}{}
+		}
+	}
+	if len(b.cache.topicSequences)+len(newTopics) > b.cache.frontierLimit {
+		return errors.New("topic sequence capacity")
+	}
 	for _, m := range messages {
 		if m.Origin == "" {
 			state := b.cache.topicSequences[m.Topic]
@@ -1702,10 +1764,7 @@ func (b *Broker) acceptBatch(messages []*Message) error {
 			b.cache.receivedThrough[m.Origin] = max(b.cache.receivedThrough[m.Origin], m.Sequence)
 		}
 	}
-	inserted, err := b.cache.putBatchLocked(messages, time.Now().UnixMilli())
-	if err != nil {
-		return err
-	}
+	inserted := b.cache.insertBatchLocked(messages)
 	for i, m := range messages {
 		if inserted[i] {
 			b.deliver(m, "", 1)
@@ -1791,11 +1850,18 @@ func (b *Broker) enqueuePeers(m *Message) {
 }
 
 func (b *Broker) enqueuePeerBatch(messages []*Message, reservedPeer *peer) {
+	b.enqueuePeerBatchExcept(messages, reservedPeer, nil)
+}
+
+func (b *Broker) enqueuePeerBatchExcept(messages []*Message, reservedPeer, confirmedPeer *peer) {
 	var bytes int64
 	for _, m := range messages {
 		bytes += messageSize(m)
 	}
 	for _, p := range b.peers {
+		if p == confirmedPeer {
+			continue
+		}
 		if p == reservedPeer {
 			select {
 			case p.ch <- messages:
@@ -2096,7 +2162,8 @@ func (b *Broker) sendPeerBatch(ctx context.Context, p *peer, messages []*Message
 	b.probePeerV2(ctx, p)
 	var body bytes.Buffer
 	var err error
-	if p.v2.Load() {
+	v2 := p.v2.Load() || !p.legacy.Load()
+	if v2 {
 		err = writePeerBatch(&body, messages)
 	} else {
 		err = writePeerBatchV1(&body, messages)
@@ -2105,22 +2172,24 @@ func (b *Broker) sendPeerBatch(ctx context.Context, p *peer, messages []*Message
 		b.metrics.ReplicationErrors.Add(uint64(len(messages)))
 		return false
 	}
-	return b.sendPeerBody(ctx, p, body.Bytes(), len(messages))
+	return b.sendPeerBody(ctx, p, body.Bytes(), len(messages), v2)
 }
 
-func (b *Broker) sendPeerBody(ctx context.Context, p *peer, body []byte, count int) bool {
+func (b *Broker) sendPeerBody(ctx context.Context, p *peer, body []byte, count int, v2 bool) bool {
 	started := time.Now()
 	defer func() { b.metrics.ReplicationLatency.observe(time.Since(started)) }()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, p.url+"/internal/replicate", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/vnd.spruce.peer")
 	req.Header.Set("Spruce-Peer-Token", b.cfg.PeerToken)
 	req.Header.Set("Spruce-Cluster-ID", b.cfg.ClusterID)
-	if p.v2.Load() {
+	if v2 {
 		req.Header.Set("Spruce-Peer-Version", "2")
 	}
 	resp, err := b.client.Do(req)
 	if err != nil {
-		b.metrics.ReplicationErrors.Add(1)
+		if !errors.Is(err, context.Canceled) {
+			b.metrics.ReplicationErrors.Add(1)
+		}
 		return false
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
@@ -2143,7 +2212,8 @@ func (b *Broker) peerLoop(p *peer) {
 			b.probePeerV2(context.Background(), p)
 			encoded.Reset()
 			var err error
-			if p.v2.Load() {
+			v2 := p.v2.Load() || !p.legacy.Load()
+			if v2 {
 				err = writePeerBatch(&encoded, batch)
 			} else {
 				err = writePeerBatchV1(&encoded, batch)
@@ -2156,7 +2226,7 @@ func (b *Broker) peerLoop(p *peer) {
 			}
 			replicated := false
 			for attempt := 0; attempt < 3; attempt++ {
-				if b.sendPeerBody(context.Background(), p, encoded.Bytes(), len(batch)) {
+				if b.sendPeerBody(context.Background(), p, encoded.Bytes(), len(batch), v2) {
 					replicated = true
 					break
 				}
@@ -2191,6 +2261,11 @@ func (b *Broker) probePeerV2(ctx context.Context, p *peer) {
 	if p.v2.Load() {
 		return
 	}
+	p.probeMu.Lock()
+	defer p.probeMu.Unlock()
+	if p.v2.Load() {
+		return
+	}
 	now := time.Now().UnixMilli()
 	previous := p.lastV2Probe.Load()
 	if now-previous < 30000 || !p.lastV2Probe.CompareAndSwap(previous, now) {
@@ -2208,6 +2283,10 @@ func (b *Broker) probePeerV2(ctx context.Context, p *peer) {
 	_ = resp.Body.Close()
 	if resp.StatusCode == http.StatusNoContent && resp.Header.Get("Spruce-Peer-Version") == "2" {
 		p.v2.Store(true)
+	} else if resp.StatusCode == http.StatusNotFound {
+		// Only an explicit unsupported endpoint permits legacy fallback.
+		// A timeout or a restarting modern peer must not poison replay safety.
+		p.legacy.Store(true)
 	}
 }
 
@@ -2222,12 +2301,21 @@ func batchBytes(batch []*Message) int64 {
 func (b *Broker) replicateOne(ctx context.Context, m *Message) bool {
 	ctx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 	defer cancel()
-	result := make(chan bool, len(b.peers))
+	result := make(chan *peer, len(b.peers))
 	for _, p := range b.peers {
-		go func(p *peer) { result <- b.sendPeer(ctx, p, m) }(p)
+		go func(p *peer) {
+			if b.sendPeer(ctx, p, m) {
+				result <- p
+			} else {
+				result <- nil
+			}
+		}(p)
 	}
 	for range b.peers {
-		if <-result {
+		if confirmed := <-result; confirmed != nil {
+			// Returning cancels the other synchronous writes. Queue their
+			// copies so cancellation cannot leave permanent sequence holes.
+			b.enqueuePeerBatchExcept([]*Message{m}, nil, confirmed)
 			return true
 		}
 	}
@@ -2631,7 +2719,7 @@ func (b *Broker) deliver(m *Message, onlyGroup string, attempt int) {
 					s.cancel()
 					continue
 				}
-				s.deferred = append(s.deferred, m)
+				s.deferred = append(s.deferred, m.ID)
 				continue
 			}
 			candidates = append(candidates, deliveryCandidate{subscriber: s})
@@ -2643,6 +2731,23 @@ func (b *Broker) deliver(m *Message, onlyGroup string, attempt int) {
 			continue
 		}
 		if b.checkpointActiveLocked(m.Topic, group, m.ID, now) {
+			continue
+		}
+		// While a group is recovering, all new work waits behind its replay.
+		// A newly joined live member must not bypass the replay owner.
+		var replayOwner *subscriber
+		for _, candidate := range indexed {
+			if candidate.replaying {
+				replayOwner = candidate
+				break
+			}
+		}
+		if replayOwner != nil {
+			if len(replayOwner.deferred) >= 256 {
+				replayOwner.cancel()
+			} else {
+				replayOwner.deferred = append(replayOwner.deferred, m.ID)
+			}
 			continue
 		}
 		affinity := deliveryAffinity(m)
@@ -2662,7 +2767,7 @@ func (b *Broker) deliver(m *Message, onlyGroup string, attempt int) {
 				selected.cancel()
 				continue
 			}
-			selected.deferred = append(selected.deferred, m)
+			selected.deferred = append(selected.deferred, m.ID)
 			continue
 		}
 		for _, candidate := range indexed {
@@ -2954,6 +3059,13 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 	}
 	streamCtx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	if !b.reserveStreamMemory(streamMemoryReservation) {
+		w.Header().Set("Retry-After", "1")
+		problem(w, http.StatusTooManyRequests, "stream_memory_capacity")
+		return
+	}
+	reservedMemory := streamMemoryReservation
+	defer func() { b.streamMemoryBytes.Add(-reservedMemory) }()
 	s := &subscriber{id: b.nextID(), affinityID: member, topic: topic, group: group, ch: make(chan Delivery, 256), cancel: cancel, replaying: true}
 	b.cache.mu.Lock()
 	b.cache.expireLocked(time.Now().UnixMilli())
@@ -2966,26 +3078,50 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusConflict, "cursor_expired")
 		return
 	}
-	var replay []*Message
-	if legacy {
-		replay = b.cache.replaySinceLocked(topic, legacySince)
-	} else {
-		replay = b.cache.replayLocked(topic, cursor)
-	}
 	b.mu.Lock()
-	b.fenceAffinityMemberLocked(s)
 	groupReplayOwner := group == "" || len(b.topicGroups[topic][group]) == 0
+	// An existing connection with the same affinity identity will be fenced
+	// below. Its replacement must take over replay when it is the sole member.
+	if group != "" && len(b.topicGroups[topic][group]) == 1 && member != "" {
+		for _, existing := range b.topicGroups[topic][group] {
+			groupReplayOwner = existing.affinityID == member
+		}
+	}
+	var replay []string
+	if groupReplayOwner {
+		indexBytes := int64(len(b.cache.topics[topic])) * 16
+		for _, m := range b.cache.topics[topic] {
+			if m != nil {
+				indexBytes += int64(len(m.ID))
+			}
+		}
+		if !b.reserveStreamMemory(indexBytes) {
+			b.mu.Unlock()
+			b.cache.mu.Unlock()
+			w.Header().Set("Retry-After", "1")
+			problem(w, http.StatusTooManyRequests, "replay_memory_capacity")
+			return
+		}
+		reservedMemory += indexBytes
+		replayCursor := cursor
+		if group != "" && !legacy {
+			// A member's cursor says nothing about work assigned to another
+			// member. Recover the group's retained backlog using checkpoints.
+			replayCursor = nil
+		}
+		replay = b.cache.replayIDsLocked(topic, replayCursor, legacy, legacySince)
+	}
+	b.fenceAffinityMemberLocked(s)
 	if !groupReplayOwner {
-		replay = replay[:0]
 		s.replaying = false
 	}
 	b.addSubscriberLocked(s)
 	if group != "" && groupReplayOwner {
 		kept := replay[:0]
 		now := time.Now().UnixMilli()
-		for _, m := range replay {
-			if !b.checkpointActiveLocked(topic, group, m.ID, now) {
-				kept = append(kept, m)
+		for _, id := range replay {
+			if !b.checkpointActiveLocked(topic, group, id, now) {
+				kept = append(kept, id)
 			}
 		}
 		replay = kept
@@ -3006,9 +3142,13 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 		}
 		b.mu.Unlock()
 		if takeover {
-			for _, m := range b.cache.snapshot(s.topic, 0) {
-				b.deliver(m, s.group, 1)
+			// Reconnect members so one takes over bounded replay. Do not retain
+			// another full payload snapshot in a disconnected handler.
+			b.mu.RLock()
+			for _, member := range b.topicGroups[s.topic][s.group] {
+				member.cancel()
 			}
+			b.mu.RUnlock()
 		}
 	}()
 	w.Header().Set("Content-Type", "application/vnd.spruce.stream")
@@ -3033,7 +3173,14 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 		replayFrames, replayBytes = 0, 0
 		return true
 	}
-	writeReplay := func(m *Message) bool {
+	writeReplay := func(id string) bool {
+		m := b.replayMessage(id)
+		if m == nil {
+			// Close rather than silently skip an evicted/expired replay entry.
+			// An existing cursor will be checked against the loss frontier on reconnect.
+			return false
+		}
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(10 * time.Second))
 		if !b.sendDelivery(s, m, 1) {
 			return false
 		}
@@ -3060,8 +3207,8 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 		replayBytes += messageSize(m)
 		return true
 	}
-	for _, m := range replay {
-		if !writeReplay(m) {
+	for _, id := range replay {
+		if !writeReplay(id) {
 			return
 		}
 		if replayFrames >= 128 || replayBytes >= 256<<10 {
@@ -3073,9 +3220,10 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 	if !flushReplay() {
 		return
 	}
+	replay = nil
 	for {
 		b.mu.Lock()
-		deferred := append([]*Message(nil), s.deferred...)
+		deferred := s.deferred
 		s.deferred = nil
 		if len(deferred) == 0 {
 			s.replaying = false
@@ -3083,8 +3231,8 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		b.mu.Unlock()
-		for _, m := range deferred {
-			if !writeReplay(m) {
+		for _, id := range deferred {
+			if !writeReplay(id) {
 				return
 			}
 		}
@@ -3293,6 +3441,15 @@ func (b *Broker) internalAck(w http.ResponseWriter, r *http.Request) {
 		problem(w, 400, "invalid_ack")
 		return
 	}
+	// The public gateway may send an ACK to a broker that did not deliver it.
+	// Only the delivery owner can derive its group checkpoint. Forward that
+	// checkpoint before removing pending state so a full queue remains retryable.
+	// Checkpoint-only actions cannot generate further forwarding loops.
+	derived := b.checkpointsForAcks(a.DeliveryIDs)
+	if len(derived) > 0 && !b.broadcastAction(r.Context(), "ack", ackRequest{Checkpoints: derived}) {
+		problem(w, 503, "peer_ack_unavailable")
+		return
+	}
 	b.removeAcks(a.DeliveryIDs)
 	b.applyCheckpoints(a.Checkpoints)
 	w.WriteHeader(204)
@@ -3314,7 +3471,7 @@ func (b *Broker) broadcastAction(ctx context.Context, action string, a ackReques
 			queued := p.actionBytes.Load()
 			if queued+bytes > b.cfg.ActionQueueBytes {
 				ok = false
-				b.countDroppedAction(action, len(ids))
+				b.countDroppedAction(action, max(len(ids), len(checkpoints)))
 				break
 			}
 			if p.actionBytes.CompareAndSwap(queued, queued+bytes) {
@@ -3338,7 +3495,7 @@ func (b *Broker) broadcastAction(ctx context.Context, action string, a ackReques
 			return false
 		default:
 			p.actionBytes.Add(-bytes)
-			b.countDroppedAction(action, len(ids))
+			b.countDroppedAction(action, max(len(ids), len(checkpoints)))
 			ok = false
 		}
 	}
@@ -3370,11 +3527,11 @@ func (b *Broker) actionLoop(p *peer, action string, ch <-chan actionBatch) {
 		checkpoints := append([]groupCheckpoint(nil), first.checkpoints...)
 		queuedBytes := first.bytes
 		draining := true
-		for len(ids) < 1024 && draining {
+		for len(ids) < 1024 && len(checkpoints) < 1024 && draining {
 			select {
 			case more := <-ch:
 				room := 1024 - len(ids)
-				if len(more.ids) > room {
+				if len(more.ids) > room || len(checkpoints)+len(more.checkpoints) > 1024 {
 					carry = &more
 					draining = false
 					continue
@@ -3421,7 +3578,7 @@ func (b *Broker) actionLoop(p *peer, action string, ch <-chan actionBatch) {
 			}
 		}
 		if !sent {
-			b.countDroppedAction(action, len(ids))
+			b.countDroppedAction(action, max(len(ids), len(checkpoints)))
 		}
 		p.actionBytes.Add(-queuedBytes)
 	}
@@ -3668,6 +3825,7 @@ func (b *Broker) prometheus(w http.ResponseWriter, _ *http.Request) {
 		_, _ = fmt.Fprintf(w, "# TYPE %s %s\n%s %d\n", v.name, kind, v.name, v.value)
 	}
 	b.writeHistogram(w, "spruce_publish_request_duration_microseconds", &b.metrics.PublishLatency)
+	_, _ = fmt.Fprintf(w, "# TYPE spruce_stream_memory_bytes gauge\nspruce_stream_memory_bytes %d\n# TYPE spruce_stream_memory_capacity_bytes gauge\nspruce_stream_memory_capacity_bytes %d\n", b.streamMemoryBytes.Load(), b.cfg.StreamMemoryBytes)
 	b.writeHistogram(w, "spruce_replication_request_duration_microseconds", &b.metrics.ReplicationLatency)
 	b.writeHistogram(w, "spruce_delivery_ack_duration_microseconds", &b.metrics.AckLatency)
 	var memory runtime.MemStats

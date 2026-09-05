@@ -28,7 +28,7 @@ is broker-local, so grouped streams require sticky routing by topic and group.
 ## ADR-003: Best-effort delivery with bounded replay
 
 **Decision:** Consumers use binary-framed HTTP streams, explicit ACK/NACK, retries, and
-a timestamp replay cursor. Group ACKs create count-bounded, TTL-bounded in-memory
+an opaque per-origin sequence replay cursor. Group ACKs create count-bounded, TTL-bounded in-memory
 checkpoints that are propagated to peers and included in replica bootstrap. Every queue
 and in-flight window is bounded by count, bytes, or both.
 
@@ -49,7 +49,8 @@ metadata, and the unchanged payload.
 **Why:** Any wire format works without schema coupling, while raw HTTPS remains usable
 without a custom library.
 
-**Consequence:** Applications own schemas, compatibility, and payload compression.
+**Consequence:** Applications own schemas and compatibility. First-party clients provide adaptive
+compression; brokers retain the resulting bytes unchanged.
 
 ## ADR-005: Local acknowledgement by default
 
@@ -60,13 +61,17 @@ one peer. Replication queues retry briefly and then report loss through metrics.
 tolerance without introducing quorum machinery.
 
 **Consequence:** Neither mode is durable. Safe publish retries require a stable producer
-ID and idempotency key.
+ID and idempotency key. Their namespace determines a stable message ID across brokers.
+A cached replica retry preserves the original expiry; this is bounded deduplication,
+not consensus over conflicting concurrent publishes or protection after every copy is lost.
 
 ## ADR-006: Explicit resource ceilings
 
 **Decision:** Cache, replication, ACK/NACK propagation, pending delivery, subscriber
 in-flight bytes, request concurrency, stream count, frame size, and idempotency state all
-have hard limits.
+have hard limits. Streams additionally share a byte-admission budget for fixed buffers
+and replay ID indexes. Replay and deferred queues retain IDs instead of pinning evicted
+payloads; stalled replay writes have deadlines.
 
 **Why:** Predictable degradation is more valuable than preserving weak guarantees until
 the kernel or Kubernetes kills the process.
@@ -111,7 +116,7 @@ messages. Operators that require zero-loss maintenance must pause publishers.
 
 ## ADR-010: First-party clients remain protocol conveniences
 
-**Decision:** Go, C#, and dependency-free Python clients expose the same publish,
+**Decision:** Go, C#, and Python clients expose the same publish,
 bounded batching, streaming consumption, ACK/NACK, retry, explicit completion,
 deduplication, diagnostics, authentication, and telemetry contracts over HTTPS.
 
@@ -121,3 +126,10 @@ mandatory proprietary transport.
 
 **Consequence:** The HTTP and binary stream protocol remains the compatibility boundary.
 Each client has independent conformance tests and can be replaced by ordinary HTTPS code.
+
+Group replay scans retained IDs regardless of an individual member's opaque cursor,
+then filters group completion checkpoints. The member cursor still detects expired
+history; it cannot prove other members completed earlier events. New live deliveries
+wait behind the group's replay owner. This reduces replay overtaking but does not
+fence another broker or serialize external side effects. SDK handler rejection sends
+a NACK and reconnects without advancing past the failed completion.

@@ -925,7 +925,12 @@ func TestFailedAcceptanceDoesNotPoisonIdempotency(t *testing.T) {
 
 func TestIdempotentOnePeerRetryRetriesReplication(t *testing.T) {
 	var attempts atomic.Int32
-	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/internal/capabilities" {
+			w.Header().Set("Spruce-Peer-Version", "2")
+			w.WriteHeader(204)
+			return
+		}
 		if attempts.Add(1) == 1 {
 			w.WriteHeader(503)
 			return

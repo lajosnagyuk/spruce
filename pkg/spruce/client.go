@@ -235,7 +235,7 @@ func (c *Client) PublishRetry(ctx context.Context, topic string, payload []byte,
 			return result, nil
 		}
 		var apiErr *Error
-		if errors.As(err, &apiErr) && apiErr.StatusCode != 408 && apiErr.StatusCode != 429 && apiErr.StatusCode != 503 {
+		if errors.As(err, &apiErr) && apiErr.StatusCode != 408 && apiErr.StatusCode != 429 && apiErr.StatusCode < 500 {
 			return result, err
 		}
 		if attempt+1 == retry.MaxAttempts {
@@ -799,7 +799,9 @@ func (c *Client) subscribeOnce(ctx context.Context, o SubscribeOptions, handler 
 					}
 					return
 				}
-				markComplete(index, d.Cursor)
+				// A NACK is not processing completion. Reconnect from the last
+				// contiguous ACK so losing this broker cannot skip the retry.
+				cancel()
 				return
 			}
 			if e := acks.submit(streamCtx, d.DeliveryID); e != nil {

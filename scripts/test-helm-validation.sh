@@ -30,6 +30,8 @@ reject --set config.publishAdmissionBytes=0
 reject --set config.publishAdmissionWait=0s
 reject --set config.deliveryLagLimit=0s
 reject --set config.goMemoryLimit=0MiB
+reject --set-string config.streamMemoryBytes=262143
+reject --set-string config.streamMemoryBytes=67108864
 # Check the exact boundary and each budget one byte over it, independently of defaults.
 render --set resources.limits.memory=320Mi --set config.goMemoryLimit=176MiB --set-string config.memorySafetyMarginBytes=150994944
 reject --set resources.limits.memory=320Mi --set-string config.goMemoryLimit=184549377 --set-string config.memorySafetyMarginBytes=150994944

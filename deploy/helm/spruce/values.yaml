@@ -74,6 +74,7 @@ config:
   checkpointEntries: "65536"
   maxConcurrentRequests: "1024"
   maxStreams: "4096"
+  streamMemoryBytes: "16777216"
   maxInternalRequests: "256"
   publishAdmissionBytes: "33554432"
   publishAdmissionWait: 100ms

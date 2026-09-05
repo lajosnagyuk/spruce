@@ -119,6 +119,57 @@ class Conformance(unittest.TestCase):
         self.assertGreaterEqual(len(Handler.stream_paths),2)
         self.assertNotIn("since=", Handler.stream_paths[1])
 
+    def test_publish_retries_gateway_errors(self):
+        from spruce import RetryOptions
+        for status in (400,409,408,429,500,502,503,504):
+            with self.subTest(status=status):
+                original=self.client.publish; attempts=[]; result=object()
+                options=PublishOptions(producer_id="producer",idempotency_key="operation")
+                def flaky(topic,payload,received_options):
+                    attempts.append(received_options)
+                    if len(attempts)==1: raise SpruceError(status,"upstream unavailable")
+                    return result
+                self.client.publish=flaky
+                try:
+                    if status in (400,409):
+                        with self.assertRaises(SpruceError): self.client.publish_with_retry("t",b"event",options,RetryOptions(max_attempts=2,min_backoff=.001,max_backoff=.001))
+                        self.assertEqual(len(attempts),1)
+                    else:
+                        self.assertIs(self.client.publish_with_retry("t",b"event",options,RetryOptions(max_attempts=2,min_backoff=.001,max_backoff=.001)),result)
+                        self.assertEqual(attempts,[options,options])
+                finally: self.client.publish=original
+
+    def test_nack_drains_other_handlers_before_reconnecting(self):
+        release=threading.Event(); second_started=threading.Event()
+        Handler.stream_paths=[]; Handler.stream_count=2
+        def consume(delivery):
+            if delivery.delivery_id=="delivery-0":
+                second_started.wait(1)
+                raise RuntimeError("retry me")
+            second_started.set(); release.wait(2)
+        try:
+            with self.assertRaises(HandlerDrainTimeoutError):
+                self.client.subscribe(__import__('spruce').SubscribeOptions("stream",concurrency=2,drain_timeout=.05),consume)
+            self.assertEqual(len(Handler.stream_paths),1)
+        finally:
+            release.set(); Handler.stream_count=1
+
+    def test_nack_reconnects_before_failed_delivery(self):
+        stop=threading.Event(); Handler.stream_paths=[]; attempts=[]
+        timer=threading.Timer(3, stop.set); timer.start()
+        def consume(delivery):
+            attempts.append(delivery.message_id)
+            if len(attempts)==1: raise RuntimeError("retry me")
+            stop.set()
+        try:
+            self.client.subscribe(__import__('spruce').SubscribeOptions("stream", concurrency=1), consume, stop)
+        finally:
+            timer.cancel()
+        self.assertGreaterEqual(len(Handler.stream_paths),2)
+        query=urllib.parse.parse_qs(urllib.parse.urlparse(Handler.stream_paths[1]).query)
+        self.assertEqual(query.get("cursor"), ["initial-cursor"])
+        self.assertEqual(attempts[:2], ["message-0", "message-0"])
+
     def test_post_stream_ack_socket_timeout_reconnects(self):
         stop=threading.Event(); calls=[]; original=self.client._ack
         def flaky(action, ids):

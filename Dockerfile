@@ -7,11 +7,13 @@ COPY internal ./internal
 COPY pkg ./pkg
 RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/spruce ./cmd/spruce && \
     CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/spruce-integration ./cmd/spruce-integration && \
+    CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/spruce-lifecycle ./cmd/spruce-lifecycle && \
     CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/spruce-bench ./cmd/spruce-bench && \
     CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/spruce-binary-soak ./cmd/spruce-binary-soak
 
 FROM scratch AS tools
 COPY --from=build /out/spruce-integration /spruce-integration
+COPY --from=build /out/spruce-lifecycle /spruce-lifecycle
 COPY --from=build /out/spruce-bench /spruce-bench
 COPY --from=build /out/spruce-binary-soak /spruce-binary-soak
 USER 65532:65532
