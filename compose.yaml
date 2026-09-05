@@ -12,18 +12,21 @@ services:
       SPRUCE_ALLOW_INSECURE_TRANSPORT: "true"
     command: []
     mem_limit: 512m
+    stop_grace_period: 45s
     restart: unless-stopped
     networks: [spruce]
   broker2:
     build: .
     environment: *broker-env
     mem_limit: 512m
+    stop_grace_period: 45s
     restart: unless-stopped
     networks: [spruce]
   broker3:
     build: .
     environment: *broker-env
     mem_limit: 512m
+    stop_grace_period: 45s
     restart: unless-stopped
     networks: [spruce]
   proxy:
