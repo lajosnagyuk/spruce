@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -236,8 +237,8 @@ func TestPerformancePublishBatchAllocationCeiling(t *testing.T) {
 		t.Skip("allocation counts include race instrumentation")
 	}
 	body := benchmarkBatch(512, 256)
-	// Identical expiry-controlled benchmark measures 2101 allocations on the
-	// previous commit too; retain seven allocations of headroom.
+	// Expire history outside the timed section so calibration measures
+	// successful admission rather than a full retention cache.
 	var failedStatus int
 	result := testing.Benchmark(func(b *testing.B) {
 		cfg := DefaultConfig()
@@ -1703,8 +1704,8 @@ func TestReplicationGapOverflowRemainsTopicScopedUnsafe(t *testing.T) {
 	defer b.Close()
 	b.cache.reorderLimit = 0
 	m := &Message{ID: "overflow", Topic: "a", Origin: "origin.a", Sequence: 2, ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
-	if err := b.acceptReplicatedBatch([]*Message{m}); err != nil {
-		t.Fatal(err)
+	if err := b.acceptReplicatedBatch([]*Message{m}); !errors.Is(err, errRetentionCapacity) {
+		t.Fatalf("overflow acknowledged: %v", err)
 	}
 	b.cache.mu.Lock()
 	defer b.cache.mu.Unlock()

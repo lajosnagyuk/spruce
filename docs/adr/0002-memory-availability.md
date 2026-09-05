@@ -1,7 +1,6 @@
 # Memory availability and graceful degradation
 
-Status: accepted product contract, 2026-09-05. Implements the user's clarification
-that Spruce is an elastic, memory-only transport, not a durable event log.
+Status: accepted. Spruce is a memory-only transport, not a durable event log.
 
 ## Decision
 
@@ -25,7 +24,7 @@ acknowledgement. The single-message modes are:
   confirmation requirement. Retries reassess copies rather than reuse an old success receipt.
 
 A receipt counts confirmed acceptance during that request. It is not a lease on cache
-residency: TTL, eviction and subsequent failures still apply. With two confirmed copies,
+residency: TTL and subsequent failures still apply. With two confirmed copies,
 loss of those particular two brokers can lose the event even if other brokers survive.
 An event with three retained copies can survive loss of two of those brokers. While
 only one remains, new events cannot have redundant protection. A timeout has an unknown
@@ -44,12 +43,7 @@ always continue. Allow redelivery; never treat a NACK as completed work. Preserv
 per-producer/key order in ordinary operation and explicitly measure regressions through
 failover. Consumers need idempotent side effects; there is no exactly-once claim.
 
-Further work should reduce overlap during group handoff and make replica placement
-independent of total broker count. Current full replication still does not scale
-retained capacity with nodes. A partitioned implementation needs bounded membership
-handoff, explicit copy receipts, and recovery tests before replacing full replication.
-Strict partition ownership, if offered later, must state its unavailable-partition
-behaviour separately from this availability contract.
+Full replication does not scale retained capacity with broker count.
 
 ## Validation
 

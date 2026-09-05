@@ -97,8 +97,7 @@ cases (`--ssh-user` and optionally `--ssh-identity` select node access). It rest
 retains job results for an hour. It does not cordon or drain cluster hosts.
 
 Gateway retries of forwarded POSTs are restricted to single-message publishes with
-both operation-identity headers. See [current cluster evidence](ELASTIC-MEMORY-RESULTS.md)
-for tested degradation and outstanding group-overlap limitations.
+both operation-identity headers.
 
 ### Delivery distribution and completion
 
@@ -110,8 +109,6 @@ brokers during partitions. Full replication still stores every event on each bro
 
 Owner-local ACKs now complete even when peer checkpoint queues are full. Monitor action
 drops: subsequent owner loss can redeliver work whose checkpoint did not propagate.
-[Follow-up cluster results](RESILIENCE-DELIVERY-RESULTS.md) distinguish the tested repairs
-from unfinished per-key completion gating and retention admission.
 
 ### Retention and unfinished grouped work
 
@@ -142,4 +139,4 @@ signal. Status exposes corresponding fields in all three SDKs.
 
 These gates order distinct event identities at one broker. They do not fence an old
 application handler after timeout or an independently serving partition. Keep side
-effects idempotent and do not interpret one passing fault trial as exclusive ownership.
+effects idempotent; completion gates do not establish exclusive ownership across brokers.

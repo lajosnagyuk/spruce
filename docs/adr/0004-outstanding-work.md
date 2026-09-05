@@ -72,5 +72,3 @@ retry exhaustion holds a key until completion or expiry. Do not deploy expecting
 poison event to disappear merely because its attempt counter reaches the old limit.
 The Python status decoder now ignores additional fields, matching the other SDKs'
 forward-compatible behaviour. All SDK status models expose the new group metrics.
-
-See `docs/OUTSTANDING-WORK-RESULTS.md` for measured behaviour and remaining limitations.

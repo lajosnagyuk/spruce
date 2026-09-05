@@ -19,10 +19,11 @@ type groupWork struct {
 }
 type groupLane struct{ head, tail *groupWork }
 type groupWorkState struct {
-	scope  checkpointScope
-	lanes  map[string]*groupLane
-	work   map[string]*groupWork
-	charge int64
+	scope     checkpointScope
+	lanes     map[string]*groupLane
+	work      map[string]*groupWork
+	charge    int64
+	indexPeak int
 }
 
 // All group indexes share the existing stream-memory budget. Payloads remain
@@ -37,7 +38,7 @@ func (b *Broker) registerGroupLocked(topic, group string) bool {
 	if len(b.groupWork) >= b.cfg.MaxStreams {
 		return false
 	}
-	charge := int64(256 + len(topic) + len(group))
+	charge := int64(1024 + len(topic) + len(group))
 	if b.groupMemoryBytes+charge > b.cfg.StreamMemoryBytes-streamMemoryReservation || !b.reserveStreamMemory(charge) {
 		return false
 	}
@@ -96,6 +97,7 @@ func (b *Broker) prepareGroupWork(messages []*Message, onlyGroup ...string) erro
 			}
 			lane.tail = w
 			g.work[w.id] = w
+			g.indexPeak = max(g.indexPeak, len(g.work))
 			used += w.charge
 		}
 	}
@@ -174,6 +176,20 @@ func (b *Broker) removeGroupWorkLocked(g *groupWorkState, w *groupWork) {
 	}
 	b.streamMemoryBytes.Add(-w.charge)
 	b.groupMemoryBytes -= w.charge
+	// Go maps retain their high-water allocation after deletion. Compact on
+	// geometric shrink so repeated backlogs across groups cannot retain every
+	// group's historical peak after its work charges have been released.
+	if g.indexPeak > 8 && len(g.work) < g.indexPeak/4 {
+		work := make(map[string]*groupWork, len(g.work))
+		for id, entry := range g.work {
+			work[id] = entry
+		}
+		lanes := make(map[string]*groupLane, len(g.lanes))
+		for key, lane := range g.lanes {
+			lanes[key] = lane
+		}
+		g.work, g.lanes, g.indexPeak = work, lanes, len(work)
+	}
 }
 
 func (b *Broker) completeGroupWorkLocked(topic, group, id string) {

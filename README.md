@@ -37,9 +37,6 @@ The Compose cluster exposes an intentionally anonymous HTTP API at
 to choose another loopback port. The gateway reads the container DNS resolver at
 startup and refreshes broker addresses after restarts.
 
-See [the lifecycle reliability review](docs/RELIABILITY-REVIEW.md) for the current
-repair evidence, remaining failure cases and proposed stronger delivery contract.
-
 Stop it with:
 
 ```sh
@@ -263,8 +260,7 @@ Current gateways distribute topic/group streams across replicas, and first-party
 route completion using the same canonical affinity digest. This spreads independent
 delivery work while preserving full memory replication for resilience. It does not
 increase retained capacity or provide exclusive group ownership during partitions.
-See [the follow-up evidence](docs/RESILIENCE-DELIVERY-RESULTS.md) and
-[the accepted scaling direction](docs/adr/0003-resilience-and-delivery-capacity.md).
+See [the accepted scaling direction](docs/adr/0003-resilience-and-delivery-capacity.md).
 
 Grouped delivery now queues message IDs per key and waits for completion before sending
 that key's next event. NACK/timeout keeps the head outstanding until completion or its

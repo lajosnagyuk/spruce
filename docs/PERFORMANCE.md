@@ -284,11 +284,3 @@ Every message was accepted and delivered exactly once with no invalid result, ke
 cursor expiry, or restart. Container cgroup `memory.peak` was 13.4, 15.0, and 50.8 MiB
 across the three brokers; the topic owner recorded the highest value. This bounds the
 tested tiny-message shape but does not replace workload-specific capacity testing.
-
-## Lifecycle workload review (2026-09-05)
-
-The [reliability review](RELIABILITY-REVIEW.md) records a separate AMD/Podman baseline:
-low-rate resource use, actual per-event delivery latency, unpaced delivery and repeated
-broker kills. It includes failed ordering checks and the limitations of the measured
-failure envelope. These are different workloads from the historical batched ingress
-numbers above and should not be compared as an optimisation speedup.

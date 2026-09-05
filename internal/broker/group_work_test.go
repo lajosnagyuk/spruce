@@ -264,3 +264,107 @@ func TestSlowGroupedKeyDoesNotRejectUnrelatedPublish(t *testing.T) {
 		t.Fatal(d.Key)
 	}
 }
+
+func TestReplicaReorderOverflowRejectsConfirmation(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	b.cache.reorderLimit = 1
+	expiry := time.Now().Add(time.Minute).UnixMilli()
+	second := &Message{ID: "second", Topic: "t", Origin: "source", Sequence: 2, ExpiresAt: expiry}
+	third := &Message{ID: "third", Topic: "t", Origin: "source", Sequence: 3, ExpiresAt: expiry}
+	if err := b.acceptReplicatedBatch([]*Message{second}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.acceptReplicatedBatch([]*Message{third}); !errors.Is(err, errRetentionCapacity) {
+		t.Fatalf("unretained replica copy must not be confirmed: %v", err)
+	}
+	first := &Message{ID: "first", Topic: "t", Origin: "source", Sequence: 1, ExpiresAt: expiry}
+	if err := b.acceptReplicatedBatch([]*Message{first, third}); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range []*Message{first, second, third} {
+		if !b.cache.has(m.ID) {
+			t.Fatalf("retry did not recover %s", m.ID)
+		}
+	}
+}
+
+func TestReplicaBufferedRetryDoesNotReserveTwice(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	expiry := time.Now().Add(time.Minute).UnixMilli()
+	gap := &Message{ID: "gap", Topic: "t", Origin: "source", Sequence: 2, ExpiresAt: expiry}
+	if err := b.acceptReplicatedBatch([]*Message{gap}); err != nil {
+		t.Fatal(err)
+	}
+	filler := &Message{ID: "filler", Topic: "other", ExpiresAt: expiry, Payload: make([]byte, 1024)}
+	if _, err := b.accept(filler); err != nil {
+		t.Fatal(err)
+	}
+	b.cache.mu.Lock()
+	b.cache.maxBytes = b.cache.bytes + b.cache.reorderBytes
+	b.cache.mu.Unlock()
+	if err := b.acceptReplicatedBatch([]*Message{gap, gap}); err != nil {
+		t.Fatalf("already retained retry charged new capacity: %v", err)
+	}
+	if _, err := b.accept(&Message{ID: "extra", Topic: "other", ExpiresAt: expiry}); !errors.Is(err, errRetentionCapacity) {
+		t.Fatalf("local admission consumed reserved reorder capacity: %v", err)
+	}
+}
+
+func TestGroupIndexShrinksWithoutLosingQueuedWork(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	s := workSubscriber(b, "a")
+	expiry := time.Now().Add(time.Minute).UnixMilli()
+	for i := 0; i < 128; i++ {
+		acceptWork(t, b, fmt.Sprint(i), "key", expiry)
+	}
+	for i := 0; i < 127; i++ {
+		d := readWork(t, s)
+		if d.MessageID != fmt.Sprint(i) {
+			t.Fatalf("queue changed during compaction: %+v", d)
+		}
+		b.removeAcks([]string{d.DeliveryID})
+	}
+	b.mu.RLock()
+	g := b.groupWork[checkpointScope{topic: "t", group: "g"}]
+	peak := g.indexPeak
+	b.mu.RUnlock()
+	if peak > 8 {
+		t.Fatalf("emptying queue retained its peak map capacity: %d", peak)
+	}
+	if d := readWork(t, s); d.MessageID != "127" {
+		t.Fatalf("last queued work lost: %+v", d)
+	}
+}
+
+func TestRepeatedBatchIdentityDoesNotConsumeSequence(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	expiry := time.Now().Add(time.Minute).UnixMilli()
+	first := &Message{ID: "first", Topic: "t", ExpiresAt: expiry}
+	if err := b.acceptBatch([]*Message{first}); err != nil {
+		t.Fatal(err)
+	}
+	retry := &Message{ID: "first", Topic: "t", ExpiresAt: expiry}
+	next := &Message{ID: "next", Topic: "t", ExpiresAt: expiry}
+	if err := b.acceptBatch([]*Message{retry, next}); err != nil {
+		t.Fatal(err)
+	}
+	if retry.Sequence != first.Sequence || next.Sequence != first.Sequence+1 {
+		t.Fatalf("duplicate created a sequence hole: first=%d retry=%d next=%d", first.Sequence, retry.Sequence, next.Sequence)
+	}
+}
+
+func TestReplicaSequenceFrontierDoesNotConfirmMissingCopy(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	b.cache.mu.Lock()
+	b.cache.receivedThrough["source"] = 2
+	b.cache.mu.Unlock()
+	m := &Message{ID: "missing", Topic: "t", Origin: "source", Sequence: 1, ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
+	if err := b.acceptReplicatedBatch([]*Message{m}); !errors.Is(err, errReplicaSequenceMissing) {
+		t.Fatalf("sequence frontier falsely confirmed a retained copy: %v", err)
+	}
+}

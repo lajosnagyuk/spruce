@@ -653,8 +653,6 @@ type subscriber struct {
 
 type deliveryCandidate struct {
 	subscriber *subscriber
-	group      string
-	score      uint64
 }
 
 var deliveryCandidates = sync.Pool{New: func() any { return make([]deliveryCandidate, 0, 32) }}
@@ -1312,11 +1310,14 @@ func (b *Broker) publishBatch(w http.ResponseWriter, r *http.Request) {
 		batchReaders.Put(reader)
 	}()
 	payloads := make([][]byte, 0, 256)
-	keys := make([]string, 0, 256)
+	var keys []string
 	version := r.Header.Get("Spruce-Batch-Version")
 	if version != "" && version != "1" && version != "2" {
 		problem(w, 400, "invalid_batch_version")
 		return
+	}
+	if version == "2" {
+		keys = make([]string, 0, 256)
 	}
 	var total int64
 	for len(payloads) < maxBatchMessages {
@@ -1368,7 +1369,9 @@ func (b *Broker) publishBatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		payloads = append(payloads, payload)
-		keys = append(keys, key)
+		if version == "2" {
+			keys = append(keys, key)
+		}
 	}
 	if len(payloads) == maxBatchMessages {
 		if _, err := reader.Peek(1); err == nil {
@@ -1753,7 +1756,7 @@ func (b *Broker) acceptLocked(m *Message) (bool, error) {
 		b.metrics.Duplicate.Add(1)
 		return false, nil
 	}
-	if b.cache.bytes+messageSize(m) > b.cache.maxBytes {
+	if b.cache.bytes+b.cache.reorderBytes+messageSize(m) > b.cache.maxBytes {
 		return false, errRetentionCapacity
 	}
 	if m.Origin == "" && b.cache.topicSequences[m.Topic] == nil && len(b.cache.topicSequences) >= b.cache.frontierLimit {
@@ -1815,13 +1818,17 @@ func (b *Broker) acceptBatch(messages []*Message) error {
 			added += messageSize(m)
 		}
 	}
-	if b.cache.bytes+added > b.cache.maxBytes {
+	if b.cache.bytes+b.cache.reorderBytes+added > b.cache.maxBytes {
 		return errRetentionCapacity
 	}
 	if err := b.prepareGroupWork(messages); err != nil {
 		return err
 	}
 	for _, m := range messages {
+		if existing := b.cache.items[m.ID]; existing != nil {
+			m.Origin, m.Sequence = existing.Origin, existing.Sequence
+			continue
+		}
 		if m.Origin == "" {
 			state := b.cache.topicSequences[m.Topic]
 			if state == nil {
@@ -1851,6 +1858,13 @@ func (b *Broker) acceptBatch(messages []*Message) error {
 	return nil
 }
 
+var errReplicaSequenceMissing = errors.New("replica sequence no longer retained")
+
+type sequenceKey struct {
+	origin   string
+	sequence uint64
+}
+
 func (b *Broker) acceptReplicatedBatch(messages []*Message) error {
 	b.cache.mu.Lock()
 	defer b.cache.mu.Unlock()
@@ -1862,8 +1876,14 @@ func (b *Broker) acceptReplicatedBatch(messages []*Message) error {
 		}
 	}
 	var added int64
+	seen := make(map[sequenceKey]struct{}, len(messages))
 	for _, m := range messages {
-		if b.cache.items[m.ID] == nil {
+		key := sequenceKey{m.Origin, m.Sequence}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		if b.cache.items[m.ID] == nil && b.cache.reorder[m.Origin][m.Sequence] == nil && m.Sequence > b.cache.receivedThrough[m.Origin] {
 			added += messageSize(m)
 		}
 	}
@@ -1882,6 +1902,8 @@ func (b *Broker) acceptReplicatedBatch(messages []*Message) error {
 		if m.Sequence <= through {
 			if _, exists := b.cache.items[m.ID]; exists {
 				b.metrics.Duplicate.Add(1)
+			} else if m.ExpiresAt > now {
+				return errReplicaSequenceMissing
 			}
 			next := b.cache.reorder[m.Origin][through+1]
 			if next == nil {
@@ -1905,7 +1927,7 @@ func (b *Broker) acceptReplicatedBatch(messages []*Message) error {
 			if len(gaps) >= b.cache.reorderLimit || b.cache.reorderBytes+messageSize(m) > b.cache.maxBytes/4 {
 				b.cache.markUnsafeLocked(m.Topic, "overflow:"+m.Origin, m.ExpiresAt)
 				b.metrics.ReplicationDropped.Add(1)
-				continue
+				return errRetentionCapacity
 			}
 			gaps[m.Sequence] = m
 			b.cache.reorderBytes += messageSize(m)
@@ -2789,7 +2811,9 @@ func (b *Broker) replicate(w http.ResponseWriter, r *http.Request) {
 		acceptErr = b.acceptBatch(live)
 	}
 	if acceptErr != nil {
-		if errors.Is(acceptErr, errRetentionCapacity) {
+		if errors.Is(acceptErr, errReplicaSequenceMissing) {
+			problem(w, http.StatusConflict, "replica_sequence_missing")
+		} else if errors.Is(acceptErr, errRetentionCapacity) {
 			w.Header().Set("Retry-After", "1")
 			problem(w, 429, "retention_capacity")
 		} else {
@@ -2850,28 +2874,8 @@ func (b *Broker) deliver(m *Message, onlyGroup string, attempt int) {
 		}
 	}
 	b.mu.Unlock()
-	if len(candidates) > 1 {
-		sort.Slice(candidates, func(i, j int) bool {
-			if candidates[i].group != candidates[j].group {
-				return candidates[i].group < candidates[j].group
-			}
-			return candidates[i].score > candidates[j].score
-		})
-	}
-	completedGroup := ""
-	hasCompletedGroup := false
 	for _, candidate := range candidates {
-		if candidate.group == "" {
-			b.sendDelivery(candidate.subscriber, m, attempt)
-			continue
-		}
-		if hasCompletedGroup && candidate.group == completedGroup {
-			continue
-		}
-		if b.sendDelivery(candidate.subscriber, m, attempt) {
-			completedGroup = candidate.group
-			hasCompletedGroup = true
-		}
+		b.sendDelivery(candidate.subscriber, m, attempt)
 	}
 	for i := range candidates {
 		candidates[i] = deliveryCandidate{}
@@ -3139,20 +3143,22 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 		if !b.registerGroupLocked(topic, group) {
 			b.mu.Unlock()
 			b.cache.mu.Unlock()
+			w.Header().Set("Retry-After", "1")
 			problem(w, 429, "group_memory_capacity")
 			return
 		}
 		b.mu.Unlock()
 		if err := b.prepareGroupWork(b.cache.topics[topic]); err != nil {
 			b.cache.mu.Unlock()
+			w.Header().Set("Retry-After", "1")
 			problem(w, 429, "group_memory_capacity")
 			return
 		}
 		b.mu.Lock()
 	}
-	groupReplayOwner := group == ""
+	broadcastReplay := group == ""
 	var replay []string
-	if groupReplayOwner {
+	if broadcastReplay {
 		indexBytes := int64(len(b.cache.topics[topic])) * 16
 		for _, m := range b.cache.topics[topic] {
 			if m != nil {
@@ -3167,36 +3173,19 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		reservedMemory += indexBytes
-		replayCursor := cursor
-		if group != "" && !legacy {
-			// A member's cursor says nothing about work assigned to another
-			// member. Recover the group's retained backlog using checkpoints.
-			replayCursor = nil
-		}
-		replay = b.cache.replayIDsLocked(topic, replayCursor, legacy, legacySince)
+		replay = b.cache.replayIDsLocked(topic, cursor, legacy, legacySince)
 	}
 	b.fenceAffinityMemberLocked(s)
-	if !groupReplayOwner {
+	if !broadcastReplay {
 		s.replaying = false
 	}
 	b.addSubscriberLocked(s)
 	b.wakeGroups()
-	if group != "" && groupReplayOwner {
-		kept := replay[:0]
-		now := time.Now().UnixMilli()
-		for _, id := range replay {
-			if !b.checkpointActiveLocked(topic, group, id, now) {
-				kept = append(kept, id)
-			}
-		}
-		replay = kept
-	}
 	b.mu.Unlock()
 	b.cache.mu.Unlock()
 	w.Header().Set("Spruce-Cursor", encodeReplayCursor(cursor))
 	defer func() {
 		b.mu.Lock()
-		takeover := s.replaying && s.group != ""
 		b.removeSubscriberLocked(s)
 		for _, p := range b.pending {
 			if p.subscriberID == s.id {
@@ -3206,15 +3195,6 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		b.mu.Unlock()
-		if takeover {
-			// Reconnect members so one takes over bounded replay. Do not retain
-			// another full payload snapshot in a disconnected handler.
-			b.mu.RLock()
-			for _, member := range b.topicGroups[s.topic][s.group] {
-				member.cancel()
-			}
-			b.mu.RUnlock()
-		}
 	}()
 	w.Header().Set("Content-Type", "application/vnd.spruce.stream")
 	w.Header().Set("Cache-Control", "no-store")
