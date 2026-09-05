@@ -116,6 +116,7 @@ spec:
             - {name: SPRUCE_CHECKPOINT_ENTRIES, value: {{ .Values.config.checkpointEntries | quote }}}
             - {name: SPRUCE_MAX_CONCURRENT_REQUESTS, value: {{ .Values.config.maxConcurrentRequests | quote }}}
             - {name: SPRUCE_MAX_STREAMS, value: {{ .Values.config.maxStreams | quote }}}
+            - {name: SPRUCE_STREAM_MEMORY_BYTES, value: {{ .Values.config.streamMemoryBytes | quote }}}
             - {name: SPRUCE_MAX_INTERNAL_REQUESTS, value: {{ .Values.config.maxInternalRequests | quote }}}
             - {name: SPRUCE_PUBLISH_ADMISSION_BYTES, value: {{ .Values.config.publishAdmissionBytes | quote }}}
             - {name: SPRUCE_DELIVERY_LAG_LIMIT, value: {{ .Values.config.deliveryLagLimit | quote }}}

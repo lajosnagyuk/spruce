@@ -71,9 +71,10 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- $memoryMargin := int64 .Values.config.memorySafetyMarginBytes -}}
 {{- if gt (add $goMemoryLimit $memoryMargin) $memoryLimit -}}
 {{- fail "config.goMemoryLimit plus config.memorySafetyMarginBytes must not exceed resources.limits.memory" -}}{{- end -}}
-{{- $boundedMemory := add (int64 .Values.config.cacheBytes) (int64 .Values.config.replicationQueueBytes) (int64 .Values.config.actionQueueBytes) (int64 .Values.config.maxInflightBytes) (int64 .Values.config.publishAdmissionBytes) $memoryMargin -}}
+{{- if lt (int64 .Values.config.streamMemoryBytes) 262144 -}}{{- fail "config.streamMemoryBytes must fit at least one 256 KiB stream reservation" -}}{{- end -}}
+{{- $boundedMemory := add (int64 .Values.config.cacheBytes) (int64 .Values.config.replicationQueueBytes) (int64 .Values.config.actionQueueBytes) (int64 .Values.config.maxInflightBytes) (int64 .Values.config.publishAdmissionBytes) (int64 .Values.config.streamMemoryBytes) $memoryMargin -}}
 {{- if gt $boundedMemory $memoryLimit -}}
-{{- fail "cache, replication queue, action queue, inflight, publish admission, and memory safety margin budgets must fit resources.limits.memory" -}}{{- end -}}
+{{- fail "cache, replication queue, action queue, inflight, publish admission, stream memory, and memory safety margin budgets must fit resources.limits.memory" -}}{{- end -}}
 {{- if and .Values.podDisruptionBudget.enabled (ge (int .Values.podDisruptionBudget.maxUnavailable) (int .Values.replicaCount)) -}}
 {{- fail "podDisruptionBudget.maxUnavailable must be less than replicaCount" -}}{{- end -}}
 {{- if and .Values.gateway.podDisruptionBudget.enabled (ge (int .Values.gateway.podDisruptionBudget.maxUnavailable) (int .Values.gateway.replicaCount)) -}}
