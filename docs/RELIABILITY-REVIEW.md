@@ -1,7 +1,8 @@
 # Lifecycle event delivery review
 
-Status: initial repair work and local validation; the architecture proposal below is
-not implemented. Base commit: `057675b498cdeea3286be975828604955362fd84`.
+Status: delivery repairs and an implemented opt-in memory-availability mode. See
+[Andromeda results](ELASTIC-MEMORY-RESULTS.md) for the subsequent deployment tests.
+Base commit: `057675b498cdeea3286be975828604955362fd84`.
 
 ## Workload and acceptance contract
 
@@ -21,7 +22,7 @@ The desired contract should distinguish these boundaries:
 | Same entity changes twice | Consumers apply a meaningful sequence | Key affinity and contiguous client completion; no fenced cross-broker processing order |
 | Consumer is offline | Backlog remains recoverable up to explicit policy | Cache eviction, TTL, checkpoint bounds and retry limits can lose progress or events |
 | More brokers are added | Useful aggregate capacity increases | Every broker retains every message; retained capacity does not scale with node count |
-| All brokers restart | Previously accepted events remain available | Memory-only history is lost |
+| All brokers restart | Resume service; old events may be lost | Memory-only history is lost |
 
 An ACK is evidence that a handler reported success, not proof that an external database
 transaction happened exactly once. Consumer-side idempotency remains necessary.
@@ -163,57 +164,25 @@ iteration versus 307–334 on main. Allocation counts stayed at 2,083 and 1,572 
 iteration respectively. The batch repair has a small measured CPU cost; this is not a
 speedup claim or a statistically established regression bound. Allocation gates pass.
 
-## Proposed architecture for the stronger contract
+## Accepted architecture direction
 
-For this workload I recommend relaxing the prohibition on all leaders, retaining no
-single global message-path leader, and using small replicated partitions with fenced
-ownership. I also recommend an optional persisted lifecycle mode if accepted events
-must survive complete restart. Both are changes to the product definition, not hidden
-implementation details. This proposal needs the storage requirement settled before
-implementation.
+The user has settled the product definition: memory-only transport, continued service
+from surviving capacity, and no requirement to survive complete cluster loss.
+[ADR 0002](adr/0002-memory-availability.md) replaces the earlier persistence proposal.
+The new `available` mode exposes the confirmed copy count rather than silently imposing
+a majority requirement or pretending one remaining broker is redundant.
 
-1. Map each topic/key to a stable partition. A single committed sequence within that
-   partition defines broker order. Concurrent independent publishers have no intrinsic
-   wall-clock order; the assigned sequence is the order consumers can rely on. An
-   entity version in a payload can express a stronger application ordering requirement.
-2. Give each partition one elected, term-fenced writer with a fixed replica count
-   (initially three). A majority commits entries. During a split, a side unable to
-   establish that authority rejects or delays writes rather than accepting competing
-   histories. Calling this process an owner does not remove its leader semantics.
-3. Spread partitions across nodes while keeping replication factor fixed. Adding nodes
-   can then add aggregate storage and throughput across partitions. A single hot key
-   remains serial; adding nodes cannot parallelise that key's ordered state transitions.
-   Membership changes require a protocol that cannot create two committing majorities.
-4. In persisted mode, acknowledge only after the agreed replicas have persisted the
-   committed entry. Use bounded segmented logs and bounded memory buffers. Rebalance
-   and restart recover from committed history. In memory mode, clearly retain the
-   total-restart loss limitation.
-5. Commit consumer-group progress with the same recovery discipline. Fence obsolete
-   assignments and allow at most one outstanding event per key where processing order
-   is requested. A lease cannot stop an old process from completing an external side
-   effect; the consumer still needs idempotency or a version/fencing check at that
-   side-effect boundary.
-6. Backpressure or reject before acknowledging when the retention budget is exhausted.
-   For lifecycle mode, do not evict unprocessed accepted events merely to keep an
-   ingress benchmark fast. Define subscription start offsets, group deletion, offline
-   group retention and poison-message handling explicitly. Park a failed key or use an
-   explicit dead-letter policy rather than silently discard it after retries.
-7. Preserve operation IDs through retries. Define their retention window and reject
-   conflicting content consistently. Publish timeout means an unknown outcome and a
-   retry with the same operation ID, not proof that nothing was accepted.
-
-This intentionally starts with a narrow contract. A few thousand events per hour does
-not require a complex elastic control plane. Measure the cost of three small replicated
-processes and disk commits before adding optimisation machinery. The transport cannot
-make an application's database update and a separate publish atomic by itself; that
-boundary needs an outbox or equivalent in the shared integration layer when required.
+The next scaling change must separate replication factor from node count, with bounded
+replica handoff and explicit placement. Current full replication still does not provide
+that retained-capacity scaling. Group handoff must also avoid unnecessary delivery
+overlap without claiming that an isolated minority can prove exclusive ownership
+against another live partition. Ordered side effects still require consumer cooperation.
 
 ## Remaining validation before replacement
 
-- Obtain the exact `spruce-dev` Kubernetes target. The available context points to the
-  existing application cluster, with `quix-spruce` namespaces; the Proxmox inventory
-  contains five `spruce-k3s-*` VMs. No separately named dev cluster was identified.
-  Do not run the current hardening script's node drains against those app hosts.
+- `spruce-dev` is now an isolated namespace on Andromeda, with its own release, Secrets,
+  quotas and network policies. Namespace-local disruption is authorised. Host drains
+  still affect other applications and are not part of these pod-level tests.
 - Repeat container faults across every broker and at multiple offsets, including
   producer timeout/retry, handler NACK, slow/offline consumer and gateway restart.
 - Test network partitions, simultaneous loss of the agreed number of replicas,

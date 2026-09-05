@@ -453,3 +453,22 @@ func TestPublishRetryHandlesGatewayErrorsWithSameOperation(t *testing.T) {
 		})
 	}
 }
+
+func TestDefaultPublishRetryOutlastsTransientDrain(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) <= 3 {
+			http.Error(w, "broker_draining", 503)
+			return
+		}
+		w.WriteHeader(202)
+		_, _ = w.Write([]byte(`{"id":"same-operation","confirmed_copies":1,"degraded":true}`))
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	result, err := New(server.URL).PublishRetry(ctx, "t", []byte("event"), PublishOptions{ProducerID: "p", IdempotencyKey: "operation", Ack: "available", Compression: "off"}, RetryOptions{})
+	if err != nil || attempts.Load() != 4 || result.ConfirmedCopies != 1 || !result.Degraded {
+		t.Fatalf("drain recovery: attempts=%d result=%+v err=%v", attempts.Load(), result, err)
+	}
+}

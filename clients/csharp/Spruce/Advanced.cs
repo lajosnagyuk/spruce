@@ -6,7 +6,7 @@ using System.Threading.Channels;
 namespace Spruce;
 
 public sealed record ClientEvent(string Operation, TimeSpan Duration, int? StatusCode, Exception? Error);
-public sealed record RetryOptions(int MaxAttempts = 3, TimeSpan? MinBackoff = null, TimeSpan? MaxBackoff = null);
+public sealed record RetryOptions(int MaxAttempts = 8, TimeSpan? MinBackoff = null, TimeSpan? MaxBackoff = null);
 public sealed record SubscribeOptions(
     string Topic,
     string? Group = null,

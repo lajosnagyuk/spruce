@@ -44,8 +44,10 @@ type PublishOptions struct {
 	TTL                                                            time.Duration
 }
 type PublishResult struct {
-	ID         string `json:"id"`
-	Replicated bool   `json:"replicated"`
+	ID              string `json:"id"`
+	Replicated      bool   `json:"replicated"`
+	ConfirmedCopies int    `json:"confirmed_copies,omitempty"`
+	Degraded        bool   `json:"degraded,omitempty"`
 }
 
 type BatchResult struct {
@@ -218,7 +220,7 @@ func (c *Client) PublishRetry(ctx context.Context, topic string, payload []byte,
 		return PublishResult{}, errors.New("retry requires producer ID and idempotency key")
 	}
 	if retry.MaxAttempts <= 0 {
-		retry.MaxAttempts = 3
+		retry.MaxAttempts = 8
 	}
 	if retry.MinBackoff <= 0 {
 		retry.MinBackoff = 50 * time.Millisecond

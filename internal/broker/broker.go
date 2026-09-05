@@ -730,16 +730,18 @@ func (h *pendingHeap) Pop() any {
 }
 
 type peer struct {
-	url         string
-	ch          chan []*Message
-	queuedBytes atomic.Int64
-	actionBytes atomic.Int64
-	acks        chan actionBatch
-	nacks       chan actionBatch
-	v2          atomic.Bool
-	legacy      atomic.Bool
-	probeMu     sync.Mutex
-	lastV2Probe atomic.Int64
+	url              string
+	ch               chan []*Message
+	queuedBytes      atomic.Int64
+	actionBytes      atomic.Int64
+	acks             chan actionBatch
+	nacks            chan actionBatch
+	v2               atomic.Bool
+	legacy           atomic.Bool
+	probeMu          sync.Mutex
+	lastV2Probe      atomic.Int64
+	unavailableUntil atomic.Int64
+	copySlots        chan struct{}
 }
 
 func writePeerBatchV1(w io.Writer, messages []*Message) error {
@@ -919,6 +921,7 @@ type Broker struct {
 	internalSlots         chan struct{}
 	digestSlot            chan struct{}
 	ready                 atomic.Bool
+	draining              atomic.Bool
 }
 
 type publishAdmissionWaiter struct {
@@ -1032,7 +1035,7 @@ func New(cfg Config) *Broker {
 	for _, u := range cfg.Peers {
 		u = strings.TrimRight(strings.TrimSpace(u), "/")
 		if u != "" {
-			p := &peer{url: u, ch: make(chan []*Message, cfg.QueueDepth), acks: make(chan actionBatch, 1024), nacks: make(chan actionBatch, 1024)}
+			p := &peer{url: u, ch: make(chan []*Message, cfg.QueueDepth), acks: make(chan actionBatch, 1024), nacks: make(chan actionBatch, 1024), copySlots: make(chan struct{}, 32)}
 			b.peers = append(b.peers, p)
 		}
 	}
@@ -1051,8 +1054,18 @@ func New(cfg Config) *Broker {
 
 func (b *Broker) Handler() http.Handler { return http.HandlerFunc(b.serveHTTP) }
 func (b *Broker) Close()                { b.closeOnce.Do(func() { close(b.stop) }) }
-func (b *Broker) BeginDrain()           { b.ready.Store(false) }
-func (b *Broker) Ready()                { b.ready.Store(true) }
+func (b *Broker) BeginDrain() {
+	b.ready.Store(false)
+	b.draining.Store(true)
+	b.mu.RLock()
+	for _, s := range b.subs {
+		if s.cancel != nil {
+			s.cancel()
+		}
+	}
+	b.mu.RUnlock()
+}
+func (b *Broker) Ready() { b.ready.Store(true) }
 
 func (b *Broker) acquirePublishAdmission(ctx context.Context, bytes int64) bool {
 	if bytes <= 0 || bytes > b.cfg.PublishAdmissionBytes {
@@ -1132,6 +1145,12 @@ func (b *Broker) releasePublishAdmission(bytes int64) {
 }
 
 func (b *Broker) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	if b.draining.Load() && (r.URL.Path == "/v1/subscriptions/stream" || strings.HasPrefix(r.URL.Path, "/v1/topics/")) {
+		w.Header().Set("Retry-After", "0")
+		problem(w, http.StatusServiceUnavailable, "broker_draining")
+		return
+	}
+
 	if strings.HasPrefix(r.URL.Path, "/health/") {
 		b.mux.ServeHTTP(w, r)
 		return
@@ -1563,7 +1582,7 @@ func (b *Broker) publish(w http.ResponseWriter, r *http.Request) {
 	if ack == "" {
 		ack = "local"
 	}
-	if ack != "local" && ack != "one-peer" {
+	if ack != "local" && ack != "one-peer" && ack != "available" {
 		problem(w, 400, "invalid_ack_mode")
 		return
 	}
@@ -1604,8 +1623,17 @@ func (b *Broker) publish(w http.ResponseWriter, r *http.Request) {
 		}
 		if !owner {
 			id = idempotency.id
+			if ack == "available" {
+				m := b.cache.get(id)
+				if m == nil {
+					problem(w, 409, "idempotency_history_expired")
+					return
+				}
+				b.publishAvailable(w, r, m, true, nil, "")
+				return
+			}
 			replicated := b.idempotencyReplicated(idempotency)
-			if ack == "one-peer" && !replicated {
+			if ack == "one-peer" {
 				m := b.cache.get(id)
 				if m == nil || !b.replicateOne(r.Context(), m) {
 					problem(w, 503, "peer_ack_unavailable")
@@ -1627,10 +1655,10 @@ func (b *Broker) publish(w http.ResponseWriter, r *http.Request) {
 	}
 	replicationBytes := messageSize(m)
 	var reservedPeer *peer
-	if ack != "one-peer" {
+	if ack == "local" {
 		reservedPeer = b.waitReplicationAdmission(r.Context(), replicationBytes)
 	}
-	if ack != "one-peer" && len(b.peers) > 0 && reservedPeer == nil {
+	if ack == "local" && len(b.peers) > 0 && reservedPeer == nil {
 		b.finishIdempotency(idempotencyCacheKey, idempotency, false, false)
 		b.metrics.Rejected.Add(1)
 		b.metrics.OverloadRejected.Add(1)
@@ -1664,6 +1692,10 @@ func (b *Broker) publish(w http.ResponseWriter, r *http.Request) {
 	if inserted {
 		b.metrics.Published.Add(1)
 		b.metrics.PublishBytes.Add(uint64(len(payload)))
+	}
+	if ack == "available" {
+		b.publishAvailable(w, r, m, !inserted, idempotency, idempotencyCacheKey)
+		return
 	}
 	replicated := false
 	if ack == "one-peer" && len(b.peers) > 0 {
@@ -1853,14 +1885,17 @@ func (b *Broker) enqueuePeerBatch(messages []*Message, reservedPeer *peer) {
 	b.enqueuePeerBatchExcept(messages, reservedPeer, nil)
 }
 
-func (b *Broker) enqueuePeerBatchExcept(messages []*Message, reservedPeer, confirmedPeer *peer) {
+func (b *Broker) enqueuePeerBatchExcept(messages []*Message, reservedPeer *peer, confirmedPeers ...*peer) {
 	var bytes int64
 	for _, m := range messages {
 		bytes += messageSize(m)
 	}
+peerLoop:
 	for _, p := range b.peers {
-		if p == confirmedPeer {
-			continue
+		for _, confirmed := range confirmedPeers {
+			if p == confirmed {
+				continue peerLoop
+			}
 		}
 		if p == reservedPeer {
 			select {
@@ -2188,6 +2223,7 @@ func (b *Broker) sendPeerBody(ctx context.Context, p *peer, body []byte, count i
 	resp, err := b.client.Do(req)
 	if err != nil {
 		if !errors.Is(err, context.Canceled) {
+			p.unavailableUntil.Store(time.Now().Add(time.Second).UnixNano())
 			b.metrics.ReplicationErrors.Add(1)
 		}
 		return false
@@ -2195,9 +2231,11 @@ func (b *Broker) sendPeerBody(ctx context.Context, p *peer, body []byte, count i
 	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
+		p.unavailableUntil.Store(time.Now().Add(time.Second).UnixNano())
 		b.metrics.ReplicationErrors.Add(1)
 		return false
 	}
+	p.unavailableUntil.Store(0)
 	b.metrics.Replicated.Add(uint64(count))
 	return true
 }
@@ -2303,7 +2341,14 @@ func (b *Broker) replicateOne(ctx context.Context, m *Message) bool {
 	defer cancel()
 	result := make(chan *peer, len(b.peers))
 	for _, p := range b.peers {
+		select {
+		case p.copySlots <- struct{}{}:
+		default:
+			result <- nil
+			continue
+		}
 		go func(p *peer) {
+			defer func() { <-p.copySlots }()
 			if b.sendPeer(ctx, p, m) {
 				result <- p
 			} else {
@@ -3079,6 +3124,12 @@ func (b *Broker) stream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	b.mu.Lock()
+	if b.draining.Load() {
+		b.mu.Unlock()
+		b.cache.mu.Unlock()
+		problem(w, http.StatusServiceUnavailable, "broker_draining")
+		return
+	}
 	groupReplayOwner := group == "" || len(b.topicGroups[topic][group]) == 0
 	// An existing connection with the same affinity identity will be fenced
 	// below. Its replacement must take over replay when it is the sole member.

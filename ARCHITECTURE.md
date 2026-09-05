@@ -133,3 +133,14 @@ history; it cannot prove other members completed earlier events. New live delive
 wait behind the group's replay owner. This reduces replay overtaking but does not
 fence another broker or serialize external side effects. SDK handler rejection sends
 a NACK and reconnects without advancing past the failed completion.
+
+Single-message `available` acknowledgement tries peer acceptance within a 100 ms
+confirmation window and reports a lower bound of confirmed copies. A lone broker can
+accept with one copy; unfinished replication remains byte-bounded. Per-peer synchronous
+confirmation has 32 slots, independent of the request concurrency ceiling. Strict
+`one-peer` retries reconfirm instead of reusing historical replicated=true.
+
+Drain rejects new publishes/streams and closes current streams after withdrawing
+readiness, while retaining ACK and peer-recovery access during the grace period.
+See [ADR 0002](docs/adr/0002-memory-availability.md) for the memory-only availability
+contract and the limit on ordering across live network partitions.

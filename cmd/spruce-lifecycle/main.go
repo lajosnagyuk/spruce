@@ -28,27 +28,28 @@ type event struct {
 }
 
 type report struct {
-	Run                string     `json:"run"`
-	Producers          int        `json:"producers"`
-	Topics             int        `json:"topics"`
-	Groups             int        `json:"groups"`
-	Members            int        `json:"members_per_group"`
-	Keys               int        `json:"keys"`
-	Ack                string     `json:"ack"`
-	Compression        string     `json:"compression"`
-	PaddingBytes       int        `json:"payload_padding_bytes"`
-	Accepted           int        `json:"accepted"`
-	PublishErrors      int        `json:"publish_errors"`
-	Missing            int        `json:"missing_group_deliveries"`
-	Duplicates         int        `json:"duplicate_group_deliveries"`
-	Unconfirmed        int        `json:"deliveries_without_publish_confirmation"`
-	Invalid            int        `json:"invalid"`
-	OrderRegressions   int        `json:"per_producer_key_order_regressions"`
-	SubscriptionErrors int64      `json:"terminal_subscription_errors"`
-	PublishSeconds     float64    `json:"publish_seconds"`
-	AcceptedPerSecond  float64    `json:"accepted_per_second"`
-	PublishMS          [3]float64 `json:"publish_p50_p95_p99_ms"`
-	DeliveryMS         [3]float64 `json:"first_delivery_p50_p95_p99_ms"`
+	Run                 string      `json:"run"`
+	Producers           int         `json:"producers"`
+	Topics              int         `json:"topics"`
+	Groups              int         `json:"groups"`
+	Members             int         `json:"members_per_group"`
+	Keys                int         `json:"keys"`
+	Ack                 string      `json:"ack"`
+	Compression         string      `json:"compression"`
+	PaddingBytes        int         `json:"payload_padding_bytes"`
+	Accepted            int         `json:"accepted"`
+	ConfirmedCopyCounts map[int]int `json:"confirmed_copy_counts,omitempty"`
+	PublishErrors       int         `json:"publish_errors"`
+	Missing             int         `json:"missing_group_deliveries"`
+	Duplicates          int         `json:"duplicate_group_deliveries"`
+	Unconfirmed         int         `json:"deliveries_without_publish_confirmation"`
+	Invalid             int         `json:"invalid"`
+	OrderRegressions    int         `json:"per_producer_key_order_regressions"`
+	SubscriptionErrors  int64       `json:"terminal_subscription_errors"`
+	PublishSeconds      float64     `json:"publish_seconds"`
+	AcceptedPerSecond   float64     `json:"accepted_per_second"`
+	PublishMS           [3]float64  `json:"publish_p50_p95_p99_ms"`
+	DeliveryMS          [3]float64  `json:"first_delivery_p50_p95_p99_ms"`
 }
 
 func percentiles(values []time.Duration) [3]float64 {
@@ -98,6 +99,7 @@ func main() {
 	var mu sync.Mutex
 	var deliveryLatencies, publishLatencies []time.Duration
 	var invalid, duplicates, orderRegressions, publishErrors int
+	copyCounts := make(map[int]int)
 	last := make(map[[3]int]int)
 	var terminal atomic.Int64
 	ready := make(chan struct{}, *topics**groups**members)
@@ -199,7 +201,7 @@ func main() {
 				sentAt[index] = e.Sent
 				mu.Unlock()
 				body, _ := json.Marshal(e)
-				_, err := c.PublishRetry(ctx, fmt.Sprintf("%s-%d", run, topic), body, spruce.PublishOptions{Key: fmt.Sprint(key), ProducerID: fmt.Sprintf("%s-%d", run, producer), IdempotencyKey: fmt.Sprint(sequence), Ack: *ack, Compression: *compression, TTL: 10 * time.Minute}, spruce.RetryOptions{})
+				result, err := c.PublishRetry(ctx, fmt.Sprintf("%s-%d", run, topic), body, spruce.PublishOptions{Key: fmt.Sprint(key), ProducerID: fmt.Sprintf("%s-%d", run, producer), IdempotencyKey: fmt.Sprint(sequence), Ack: *ack, Compression: *compression, TTL: 10 * time.Minute}, spruce.RetryOptions{})
 				elapsed := time.Since(time.Unix(0, e.Sent))
 				mu.Lock()
 				if err != nil {
@@ -207,6 +209,9 @@ func main() {
 					fmt.Fprintln(os.Stderr, "publish:", err)
 				} else {
 					accepted[index] = true
+					if result.ConfirmedCopies > 0 {
+						copyCounts[result.ConfirmedCopies]++
+					}
 					publishLatencies = append(publishLatencies, elapsed)
 				}
 				mu.Unlock()
@@ -245,7 +250,7 @@ func main() {
 	}
 	cancel()
 	subscribers.Wait()
-	r := report{Run: run, Producers: *producers, Topics: *topics, Groups: *groups, Members: *members, Keys: *keys, Ack: *ack, Compression: *compression, PaddingBytes: *size, PublishErrors: publishErrors, Invalid: invalid, Duplicates: duplicates, OrderRegressions: orderRegressions, SubscriptionErrors: terminal.Load(), PublishSeconds: publishSeconds, PublishMS: percentiles(publishLatencies), DeliveryMS: percentiles(deliveryLatencies)}
+	r := report{ConfirmedCopyCounts: copyCounts, Run: run, Producers: *producers, Topics: *topics, Groups: *groups, Members: *members, Keys: *keys, Ack: *ack, Compression: *compression, PaddingBytes: *size, PublishErrors: publishErrors, Invalid: invalid, Duplicates: duplicates, OrderRegressions: orderRegressions, SubscriptionErrors: terminal.Load(), PublishSeconds: publishSeconds, PublishMS: percentiles(publishLatencies), DeliveryMS: percentiles(deliveryLatencies)}
 	for i, ok := range accepted {
 		if ok {
 			r.Accepted++

@@ -10,7 +10,7 @@ using System.Threading.Channels;
 namespace Spruce;
 
 public sealed record PublishOptions(string? Key = null, TimeSpan? Ttl = null, string? ContentType = null, string? Ack = null, string? IdempotencyKey = null, string? ProducerId = null, string? Compression = null);
-public sealed record PublishResult([property: JsonPropertyName("id")] string Id, [property: JsonPropertyName("replicated")] bool Replicated);
+public sealed record PublishResult([property: JsonPropertyName("id")] string Id, [property: JsonPropertyName("replicated")] bool Replicated, [property: JsonPropertyName("confirmed_copies")] int ConfirmedCopies = 0, [property: JsonPropertyName("degraded")] bool Degraded = false);
 public sealed record BatchResult([property: JsonPropertyName("ids")] string[] Ids);
 public sealed record BatchEntry(ReadOnlyMemory<byte> Payload, string? Key = null);
 public sealed record Delivery(

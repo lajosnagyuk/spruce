@@ -78,3 +78,24 @@ KUBE_CONTEXT=<context> SPRUCE_NAMESPACE=<namespace> SPRUCE_RELEASE=<release> \
 After an incident, confirm all replicas are ready, replication error/drop counters are
 stable, queues return to zero, authenticated publish/consume succeeds, and retired
 credentials fail. There is no backup or restore operation because Spruce persists no data.
+
+## Availability during partial cluster loss
+
+Use single-message `available` acknowledgement when continued service from a lone
+survivor is preferred. Observe `confirmed_copies` and `degraded` on the publish result.
+`one-peer` still requires a fresh peer confirmation, including on retries. Eight default
+publish attempts allow transient drain/routing recovery; configure a caller deadline
+and retry policy to match the application's acceptable wait.
+
+Draining now closes active streams and rejects new publication/subscription admission;
+ACKs and peer recovery remain enabled during the grace period. The Helm gateway's
+rendered configuration checksum triggers rollout for DNS and routing changes.
+
+For isolated test namespaces labelled `spruce.io/test-environment=true`,
+`scripts/k3s-lifecycle.py` runs baseline, scale-to-one/recover, and one/two-container SIGKILL
+cases (`--ssh-user` and optionally `--ssh-identity` select node access). It restores the StatefulSet replica count after scale tests and
+retains job results for an hour. It does not cordon or drain cluster hosts.
+
+Gateway retries of forwarded POSTs are restricted to single-message publishes with
+both operation-identity headers. See [current cluster evidence](ELASTIC-MEMORY-RESULTS.md)
+for tested degradation and outstanding group-overlap limitations.

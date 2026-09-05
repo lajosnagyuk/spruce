@@ -248,3 +248,13 @@ The manually triggered **Bounded memory soak** workflow checks the tested memory
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+### Degraded memory-only operation
+
+Single-message producers may select `Ack: "available"` (HTTP `Spruce-Ack: available`)
+to keep serving when only one broker remains. The response includes `confirmed_copies`
+and `degraded`. Healthy peers are attempted within a 100 ms confirmation window;
+unfinished copies use bounded background replication. `one-peer` retains its strict
+peer requirement. These receipts do not prevent TTL expiry, eviction or later loss of
+all copies. Complete-cluster restart survival is outside the product contract.
+See [ADR 0002](docs/adr/0002-memory-availability.md).

@@ -122,6 +122,8 @@ class PublishOptions:
 class PublishResult:
     id: str
     replicated: bool = False
+    confirmed_copies: int = 0
+    degraded: bool = False
 
 @dataclass(frozen=True)
 class BatchEntry:
@@ -156,7 +158,7 @@ class SubscribeOptions:
 
 @dataclass(frozen=True)
 class RetryOptions:
-    max_attempts: int = 3
+    max_attempts: int = 8
     min_backoff: float = 0.05
     max_backoff: float = 2.0
 
@@ -253,7 +255,7 @@ class Client:
         encoded = _compress_payload(bytes(payload), options.compression)
         with self._request("POST", path, encoded, self._option_headers(options), operation="publish") as response:
             value = json.load(response)
-        return PublishResult(value["id"], bool(value.get("replicated", False)))
+        return PublishResult(value["id"], bool(value.get("replicated", False)), int(value.get("confirmed_copies", 0)), bool(value.get("degraded", False)))
 
     def publish_with_retry(self, topic: str, payload: bytes, options: PublishOptions, retry: RetryOptions = RetryOptions()) -> PublishResult:
         if not options.producer_id or not options.idempotency_key: raise ValueError("retry requires producer ID and idempotency key")
