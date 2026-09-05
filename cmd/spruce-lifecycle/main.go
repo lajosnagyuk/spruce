@@ -28,32 +28,34 @@ type event struct {
 }
 
 type report struct {
-	DistinctKeyOverlaps int         `json:"concurrent_distinct_key_events"`
-	KeyOverlaps         int         `json:"concurrent_key_handlers"`
-	InjectedNacks       int         `json:"injected_nacks"`
-	HandlerDelayMS      int64       `json:"handler_delay_ms"`
-	Run                 string      `json:"run"`
-	Producers           int         `json:"producers"`
-	Topics              int         `json:"topics"`
-	Groups              int         `json:"groups"`
-	Members             int         `json:"members_per_group"`
-	Keys                int         `json:"keys"`
-	Ack                 string      `json:"ack"`
-	Compression         string      `json:"compression"`
-	PaddingBytes        int         `json:"payload_padding_bytes"`
-	Accepted            int         `json:"accepted"`
-	ConfirmedCopyCounts map[int]int `json:"confirmed_copy_counts,omitempty"`
-	PublishErrors       int         `json:"publish_errors"`
-	Missing             int         `json:"missing_group_deliveries"`
-	Duplicates          int         `json:"duplicate_group_deliveries"`
-	Unconfirmed         int         `json:"deliveries_without_publish_confirmation"`
-	Invalid             int         `json:"invalid"`
-	OrderRegressions    int         `json:"per_producer_key_order_regressions"`
-	SubscriptionErrors  int64       `json:"terminal_subscription_errors"`
-	PublishSeconds      float64     `json:"publish_seconds"`
-	AcceptedPerSecond   float64     `json:"accepted_per_second"`
-	PublishMS           [3]float64  `json:"publish_p50_p95_p99_ms"`
-	DeliveryMS          [3]float64  `json:"first_delivery_p50_p95_p99_ms"`
+	DeliverySeconds          float64     `json:"delivery_seconds"`
+	GroupDeliveriesPerSecond float64     `json:"group_deliveries_per_second"`
+	DistinctKeyOverlaps      int         `json:"concurrent_distinct_key_events"`
+	KeyOverlaps              int         `json:"concurrent_key_handlers"`
+	InjectedNacks            int         `json:"injected_nacks"`
+	HandlerDelayMS           int64       `json:"handler_delay_ms"`
+	Run                      string      `json:"run"`
+	Producers                int         `json:"producers"`
+	Topics                   int         `json:"topics"`
+	Groups                   int         `json:"groups"`
+	Members                  int         `json:"members_per_group"`
+	Keys                     int         `json:"keys"`
+	Ack                      string      `json:"ack"`
+	Compression              string      `json:"compression"`
+	PaddingBytes             int         `json:"payload_padding_bytes"`
+	Accepted                 int         `json:"accepted"`
+	ConfirmedCopyCounts      map[int]int `json:"confirmed_copy_counts,omitempty"`
+	PublishErrors            int         `json:"publish_errors"`
+	Missing                  int         `json:"missing_group_deliveries"`
+	Duplicates               int         `json:"duplicate_group_deliveries"`
+	Unconfirmed              int         `json:"deliveries_without_publish_confirmation"`
+	Invalid                  int         `json:"invalid"`
+	OrderRegressions         int         `json:"per_producer_key_order_regressions"`
+	SubscriptionErrors       int64       `json:"terminal_subscription_errors"`
+	PublishSeconds           float64     `json:"publish_seconds"`
+	AcceptedPerSecond        float64     `json:"accepted_per_second"`
+	PublishMS                [3]float64  `json:"publish_p50_p95_p99_ms"`
+	DeliveryMS               [3]float64  `json:"first_delivery_p50_p95_p99_ms"`
 }
 
 func percentiles(values []time.Duration) [3]float64 {
@@ -81,6 +83,7 @@ func main() {
 	compression := flag.String("compression", "off", "off, gzip, or zstd; synthetic padding is deliberately compressible")
 	rate := flag.Float64("rate", 0, "aggregate offered messages/s; zero is unpaced")
 	timeout := flag.Duration("timeout", 60*time.Second, "whole scenario deadline")
+	ttl := flag.Duration("ttl", 10*time.Minute, "message retention window")
 	settle := flag.Duration("settle", 2*time.Second, "observe late duplicates after all accepted deliveries")
 	insecure := flag.Bool("allow-insecure-credentials", false, "allow synthetic development credentials over HTTP")
 	allowDuplicates := flag.Bool("allow-duplicates", false, "allow measured at-least-once redeliveries")
@@ -89,7 +92,7 @@ func main() {
 	handlerConcurrency := flag.Int("handler-concurrency", 1, "handler workers per stream")
 	nackFirst := flag.Bool("nack-first", false, "reject each producer first event once per group")
 	flag.Parse()
-	if *handlerDelay < 0 || *handlerDelay > time.Second || *handlerConcurrency < 1 || *handlerConcurrency > 32 || *producers < 1 || *producers > 1024 || *topics < 1 || *topics > 256 || *groups < 1 || *groups > 256 || *members < 1 || *members > 256 || *keys < 1 || *keys > 1000000 || *count < 1 || *count > 1000000 || *size < 0 || *size > 900<<10 || *rate < 0 || *timeout <= 0 || *settle < 0 || int64(*producers)*int64(*count) > 1000000 || int64(*topics)*int64(*groups)*int64(*members) > 1024 || int64(*producers)*int64(*count)*int64(*groups) > 4000000 {
+	if *ttl <= 0 || *ttl > 24*time.Hour || *handlerDelay < 0 || *handlerDelay > time.Second || *handlerConcurrency < 1 || *handlerConcurrency > 32 || *producers < 1 || *producers > 1024 || *topics < 1 || *topics > 256 || *groups < 1 || *groups > 256 || *members < 1 || *members > 256 || *keys < 1 || *keys > 1000000 || *count < 1 || *count > 1000000 || *size < 0 || *size > 900<<10 || *rate < 0 || *timeout <= 0 || *settle < 0 || int64(*producers)*int64(*count) > 1000000 || int64(*topics)*int64(*groups)*int64(*members) > 1024 || int64(*producers)*int64(*count)*int64(*groups) > 4000000 {
 		fmt.Fprintln(os.Stderr, "invalid or excessive scenario bounds")
 		os.Exit(2)
 	}
@@ -252,7 +255,7 @@ func main() {
 				sentAt[index] = e.Sent
 				mu.Unlock()
 				body, _ := json.Marshal(e)
-				result, err := c.PublishRetry(ctx, fmt.Sprintf("%s-%d", run, topic), body, spruce.PublishOptions{Key: fmt.Sprint(key), ProducerID: fmt.Sprintf("%s-%d", run, producer), IdempotencyKey: fmt.Sprint(sequence), Ack: *ack, Compression: *compression, TTL: 10 * time.Minute}, spruce.RetryOptions{})
+				result, err := c.PublishRetry(ctx, fmt.Sprintf("%s-%d", run, topic), body, spruce.PublishOptions{Key: fmt.Sprint(key), ProducerID: fmt.Sprintf("%s-%d", run, producer), IdempotencyKey: fmt.Sprint(sequence), Ack: *ack, Compression: *compression, TTL: *ttl}, spruce.RetryOptions{})
 				elapsed := time.Since(time.Unix(0, e.Sent))
 				mu.Lock()
 				if err != nil {
@@ -293,6 +296,7 @@ func main() {
 		}
 	}
 	ticker.Stop()
+	deliverySeconds := time.Since(started).Seconds()
 	timer := time.NewTimer(*settle)
 	select {
 	case <-timer.C:
@@ -301,7 +305,7 @@ func main() {
 	}
 	cancel()
 	subscribers.Wait()
-	r := report{DistinctKeyOverlaps: distinctKeyOverlaps, KeyOverlaps: keyOverlaps, InjectedNacks: injectedNacks, HandlerDelayMS: handlerDelay.Milliseconds(), ConfirmedCopyCounts: copyCounts, Run: run, Producers: *producers, Topics: *topics, Groups: *groups, Members: *members, Keys: *keys, Ack: *ack, Compression: *compression, PaddingBytes: *size, PublishErrors: publishErrors, Invalid: invalid, Duplicates: duplicates, OrderRegressions: orderRegressions, SubscriptionErrors: terminal.Load(), PublishSeconds: publishSeconds, PublishMS: percentiles(publishLatencies), DeliveryMS: percentiles(deliveryLatencies)}
+	r := report{DeliverySeconds: deliverySeconds, DistinctKeyOverlaps: distinctKeyOverlaps, KeyOverlaps: keyOverlaps, InjectedNacks: injectedNacks, HandlerDelayMS: handlerDelay.Milliseconds(), ConfirmedCopyCounts: copyCounts, Run: run, Producers: *producers, Topics: *topics, Groups: *groups, Members: *members, Keys: *keys, Ack: *ack, Compression: *compression, PaddingBytes: *size, PublishErrors: publishErrors, Invalid: invalid, Duplicates: duplicates, OrderRegressions: orderRegressions, SubscriptionErrors: terminal.Load(), PublishSeconds: publishSeconds, PublishMS: percentiles(publishLatencies), DeliveryMS: percentiles(deliveryLatencies)}
 	for i, ok := range accepted {
 		if ok {
 			r.Accepted++
@@ -316,6 +320,7 @@ func main() {
 		}
 	}
 	r.AcceptedPerSecond = float64(r.Accepted) / publishSeconds
+	r.GroupDeliveriesPerSecond = float64(r.Accepted**groups-r.Missing) / deliverySeconds
 	_ = json.NewEncoder(os.Stdout).Encode(r)
 	if r.Accepted != total || r.PublishErrors+r.Missing+r.Invalid+r.DistinctKeyOverlaps > 0 || r.SubscriptionErrors > 0 || (!*allowDuplicates && r.Duplicates > 0) || (!*allowReorder && r.OrderRegressions > 0) {
 		os.Exit(1)

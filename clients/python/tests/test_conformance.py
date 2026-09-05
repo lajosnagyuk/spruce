@@ -13,6 +13,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/status": self.reply(200, {"messages": 1, "cache_accounted_bytes": 2, "cache_limit_bytes": 3, "peers": 1, "consumers": 0, "pending_deliveries": 0, "group_outstanding_messages": 7, "future_status_field": 99})
         elif self.path.startswith("/v1/subscriptions/stream"):
             Handler.stream_paths.append(self.path)
+            if "topic=silent" in self.path:
+                self.send_response(200); self.end_headers(); self.wfile.flush(); time.sleep(.4); return
             body=b""
             for index in range(Handler.stream_count):
                 metadata=json.dumps({"delivery_id":f"delivery-{index}","message_id":f"message-{index}","topic":"stream","created_at":index+1,"attempt":1,"cursor":f"cursor-{index}"}).encode(); payload=b"opaque"
@@ -42,6 +44,20 @@ class Conformance(unittest.TestCase):
     def setUpClass(cls):
         cls.server=ThreadingHTTPServer(("127.0.0.1",0),Handler); threading.Thread(target=cls.server.serve_forever,daemon=True).start()
         cls.client=Client(f"http://127.0.0.1:{cls.server.server_port}")
+
+    def test_silent_stream_reconnects(self):
+        from spruce import SubscribeOptions
+        stop = threading.Event()
+        connected = []
+        def observe(event):
+            if event.operation == "subscription_connected":
+                connected.append(1)
+                if len(connected) >= 2: stop.set()
+        client = Client(f"http://127.0.0.1:{self.server.server_port}", stream_read_timeout=.05, on_event=observe)
+        timer = threading.Timer(2, stop.set); timer.start()
+        try: client.subscribe(SubscribeOptions("silent"), lambda _: self.fail("unexpected delivery"), stop)
+        finally: timer.cancel()
+        self.assertGreaterEqual(len(connected), 2)
 
     def test_completion_affinity_utf8_vector(self):
         from spruce import _completion_affinity

@@ -190,7 +190,9 @@ class _NoDowngrade(urllib.request.HTTPRedirectHandler):
 
 
 class Client:
-    def __init__(self, base_url: str, *, token: str = "", username: str = "", password: str = "", allow_insecure_credentials: bool = False, timeout: float = 30.0, ssl_context: ssl.SSLContext | None = None, on_event: Callable[[ClientEvent], None] | None = None) -> None:
+    def __init__(self, base_url: str, *, token: str = "", username: str = "", password: str = "", allow_insecure_credentials: bool = False, timeout: float = 30.0, ssl_context: ssl.SSLContext | None = None, on_event: Callable[[ClientEvent], None] | None = None, stream_read_timeout: float = 45.0) -> None:
+        if not 0 < stream_read_timeout < float("inf"): raise ValueError("stream_read_timeout must be positive and finite")
+        self.stream_read_timeout = stream_read_timeout
         self.base_url = base_url.rstrip("/")
         self.token, self.username, self.password = token, username, password
         self.allow_insecure_credentials, self.timeout, self.on_event = allow_insecure_credentials, timeout, on_event
@@ -369,7 +371,7 @@ class Client:
                     next_progress += 1
             try:
                 connected_at, connected_cursor = time.monotonic(), cursor
-                response = self._request("GET", "/v1/subscriptions/stream?" + urllib.parse.urlencode(query), headers={"Spruce-Delivery-Affinity": _completion_affinity(options.topic, options.group)}, timeout=None, operation="subscribe")
+                response = self._request("GET", "/v1/subscriptions/stream?" + urllib.parse.urlencode(query), headers={"Spruce-Delivery-Affinity": _completion_affinity(options.topic, options.group)}, timeout=self.stream_read_timeout, operation="subscribe")
                 if not cursor: cursor = response.headers.get("Spruce-Cursor", "")
                 self._emit("subscription_connected", connected_at, 200, None)
                 connection_done = threading.Event()

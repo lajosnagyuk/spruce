@@ -140,3 +140,44 @@ signal. Status exposes corresponding fields in all three SDKs.
 These gates order distinct event identities at one broker. They do not fence an old
 application handler after timeout or an independently serving partition. Keep side
 effects idempotent; completion gates do not establish exclusive ownership across brokers.
+
+### Partition recovery and idle streams
+
+Dropped replication work schedules a retained-cache repair on the existing peer worker.
+Repair sends bounded pages through the authenticated internal API, reserves the existing
+replication queue budget, and retries while the peer remains incomplete. Healthy peers
+are not periodically sent full snapshots. Monitor `spruce_repair_pending_peers`,
+`spruce_repair_pages_total`, `spruce_repair_messages_total` and
+`spruce_repair_errors_total`; sustained pending repair means redundancy is reduced.
+Repairs preserve original expiry and cannot recover events after every copy expires.
+Repair reconciles payloads, not lost consumer completion checkpoints; a healed replica
+can therefore redeliver previously completed work.
+The repair API requires updated peers; older brokers continue ordinary replication but
+cannot accept background repair pages.
+
+Recovery may import events after a gap in a replica's history. It marks that topic's
+cursor history unsafe rather than pretending the gap never existed. Partition recovery
+can duplicate or reorder delivery already performed by independently available brokers.
+Consumers must make side effects idempotent; a cursor-expired error requires an explicit
+application recovery decision.
+
+Brokers send stream heartbeats every 15 seconds. Gateways close a stream after 30 seconds
+without upstream data. SDKs also bound a stalled frame read with a default 45-second
+`StreamReadTimeout` (Go/C#) or `stream_read_timeout` (Python client constructor). Keep
+these intervals above the heartbeat interval. Handler execution does not consume the
+SDK read deadline. These bounds detect silent broken connections; TCP connection state
+alone does not establish that a consumer can still receive events.
+
+The disposable-container test driver exercises delivery and cache convergence using
+baseline, network partition/heal, and two-broker SIGKILL scenarios:
+
+```sh
+python3 scripts/test-container-resilience.py --image spruce:dev --case partition
+python3 scripts/test-container-resilience.py --image spruce:dev --case kill-two
+python3 scripts/test-container-resilience.py --image spruce:dev --brokers 5 --case baseline
+```
+
+Build `bin/spruce-lifecycle` first. `--resources` samples Linux cgroup CPU and memory;
+`--retention-seconds` permits expiry-cycle soaks. The driver fails missing or corrupt
+accepted deliveries and checks retained-cache digests after recovery. Partition cases
+report reordering separately from loss because cross-partition order is not guaranteed.

@@ -36,6 +36,7 @@ public sealed partial class SpruceClient : IDisposable
     private readonly bool _ownsHttp;
     private readonly TimeSpan _requestTimeout;
     public Action<ClientEvent>? OnEvent { get; init; }
+    public TimeSpan StreamReadTimeout { get; init; } = TimeSpan.FromSeconds(45);
 
     public SpruceClient(string baseUrl, HttpClient? http = null, string? token = null, string? username = null, string? password = null, bool allowInsecureCredentials = false, TimeSpan? requestTimeout = null)
     {
@@ -124,6 +125,7 @@ public sealed partial class SpruceClient : IDisposable
     private async Task SubscribeCoreAsync(string topic, string? group, string memberId, Func<Delivery, CancellationToken, Task> handler, CancellationToken cancellationToken, int concurrency, int maxPayloadBytes, long since, TimeSpan? drainTimeout, bool preserveKeyOrder, string? cursor)
     {
         if (string.IsNullOrWhiteSpace(topic)) throw new ArgumentException("Topic is required", nameof(topic));
+        if (StreamReadTimeout <= TimeSpan.Zero || StreamReadTimeout > TimeSpan.FromDays(1)) throw new ArgumentOutOfRangeException(nameof(StreamReadTimeout));
         if (concurrency <= 0) concurrency = 16;
         if (concurrency < 1 || concurrency > 1024) throw new ArgumentOutOfRangeException(nameof(concurrency));
         if (maxPayloadBytes < 1 || maxPayloadBytes > 64 * 1024 * 1024) throw new ArgumentOutOfRangeException(nameof(maxPayloadBytes));
@@ -213,6 +215,7 @@ public sealed partial class SpruceClient : IDisposable
                 {
                     while (!connection.IsCancellationRequested)
                     {
+                        connection.CancelAfter(StreamReadTimeout);
                         await stream.ReadExactlyAsync(sizes, connection.Token);
                         var metadataLength = BinaryPrimitives.ReadUInt32BigEndian(sizes.AsSpan(0, 4));
                         var payloadLength = BinaryPrimitives.ReadUInt32BigEndian(sizes.AsSpan(4, 4));
@@ -220,6 +223,7 @@ public sealed partial class SpruceClient : IDisposable
                         var metadata = new byte[metadataLength]; await stream.ReadExactlyAsync(metadata, connection.Token);
                         var delivery = JsonSerializer.Deserialize<Delivery>(metadata)!;
                         var payload = new byte[payloadLength]; await stream.ReadExactlyAsync(payload, connection.Token);
+                        connection.CancelAfter(Timeout.InfiniteTimeSpan);
                         if (string.IsNullOrEmpty(delivery.DeliveryId)) continue;
                         delivery = delivery with { Payload = DecodePayload(payload, maxPayloadBytes) };
 						await progressWindow.WaitAsync(connection.Token);

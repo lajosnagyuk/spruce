@@ -4,6 +4,7 @@ using System.Text;
 using Spruce;
 
 var failures = new List<string>();
+await Run("silent stream reconnect", SilentStreamReconnect, failures);
 await Run("invalid batch", RejectsInvalidBatch, failures);
 await Run("batch v2 per-entry keys", BatchV2PerEntryKeys, failures);
 await Run("adaptive gzip wire", AdaptiveGzipWire, failures);
@@ -359,6 +360,21 @@ static async Task BoundedOrderedCompletionWindow()
     try { await subscription; } catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
 }
 
+static async Task SilentStreamReconnect()
+{
+    using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+    var connected = 0;
+    using var client = new SpruceClient("https://spruce.invalid", new HttpClient(new StubHandler(_ =>
+        new(HttpStatusCode.OK) { Content = new StreamContent(new SilentStream()) })))
+    {
+        StreamReadTimeout = TimeSpan.FromMilliseconds(50),
+        OnEvent = e => { if (e.Operation == "subscription_connected" && Interlocked.Increment(ref connected) == 2) cancellation.Cancel(); }
+    };
+    try { await client.SubscribeAsync("t", "g", (_, _) => throw new Exception("unexpected delivery"), cancellation.Token); }
+    catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+    Assert(connected >= 2, "silent stream never reconnected");
+}
+
 static Stream Frames(params (string Delivery, string Message, string Key, byte Payload)[] deliveries)
 {
     var output = new MemoryStream();
@@ -406,4 +422,20 @@ sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> respond) 
 {
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
         Task.FromResult(respond(request));
+}
+
+sealed class SilentStream : Stream
+{
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+    public override void Flush() => throw new NotSupportedException();
+    public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    { await Task.Delay(Timeout.Infinite, cancellationToken); return 0; }
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
 }

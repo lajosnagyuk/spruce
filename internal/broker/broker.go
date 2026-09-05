@@ -619,6 +619,9 @@ func (c *cache) page(after string, maxBytes int64) ([]*Message, string, bool) {
 		if m := c.order[i]; m != nil {
 			sz := messageSize(m)
 			if bytes+sz > maxBytes {
+				if len(out) == 0 {
+					return nil, "", false
+				}
 				break
 			}
 			out, bytes, next = append(out, m), bytes+sz, m.ID
@@ -743,6 +746,10 @@ type peer struct {
 	probeMu          sync.Mutex
 	lastV2Probe      atomic.Int64
 	unavailableUntil atomic.Int64
+	repairVersion    atomic.Uint64
+	repairCompleted  atomic.Uint64
+	repairCursor     string
+	repairStarted    uint64
 	copySlots        chan struct{}
 }
 
@@ -879,6 +886,7 @@ type idempotencyOrderEntry struct{ key, id string }
 
 type Metrics struct {
 	GroupExpired                                                                                      atomic.Uint64
+	RepairPages, RepairMessages, RepairErrors                                                         atomic.Uint64
 	Published, PublishBytes, Rejected, OverloadRejected, CursorExpired, Replicated, ReplicationErrors atomic.Uint64
 	ReplicationDropped, ReplicationPressureRejected, DeliveryPressureRejected                         atomic.Uint64
 	AckActionDropped, NackActionDropped                                                               atomic.Uint64
@@ -1222,6 +1230,7 @@ func (b *Broker) routes() {
 	b.mux.HandleFunc("POST /v1/deliveries/ack", b.ack)
 	b.mux.HandleFunc("POST /v1/deliveries/nack", b.nack)
 	b.mux.HandleFunc("POST /internal/replicate", b.replicate)
+	b.mux.HandleFunc("POST /internal/repair", b.replicate)
 	b.mux.HandleFunc("GET /internal/snapshot", b.snapshot)
 	b.mux.HandleFunc("GET /internal/checkpoints", b.checkpointSnapshot)
 	b.mux.HandleFunc("GET /internal/replay-frontiers", b.replayFrontierSnapshot)
@@ -1794,6 +1803,10 @@ func (b *Broker) acceptLocked(m *Message) (bool, error) {
 func (b *Broker) acceptBatch(messages []*Message) error {
 	b.cache.mu.Lock()
 	defer b.cache.mu.Unlock()
+	return b.acceptBatchLocked(messages, false)
+}
+
+func (b *Broker) acceptBatchLocked(messages []*Message, repair bool) error {
 	b.cache.expireLocked(time.Now().UnixMilli())
 	// Admission must precede sequence assignment: rejected batches must not
 	// leave holes that replicas can never fill.
@@ -1815,7 +1828,10 @@ func (b *Broker) acceptBatch(messages []*Message) error {
 	var added int64
 	for _, m := range messages {
 		if b.cache.items[m.ID] == nil {
-			added += messageSize(m)
+			buffered := b.cache.reorder[m.Origin][m.Sequence]
+			if !repair || buffered == nil || buffered.ID != m.ID {
+				added += messageSize(m)
+			}
 		}
 	}
 	if b.cache.bytes+b.cache.reorderBytes+added > b.cache.maxBytes {
@@ -1825,6 +1841,19 @@ func (b *Broker) acceptBatch(messages []*Message) error {
 		return err
 	}
 	for _, m := range messages {
+		if repair {
+			if buffered := b.cache.reorder[m.Origin][m.Sequence]; buffered != nil && buffered.ID == m.ID {
+				delete(b.cache.reorder[m.Origin], m.Sequence)
+				b.cache.reorderBytes -= messageSize(buffered)
+				if len(b.cache.reorder[m.Origin]) == 0 {
+					delete(b.cache.reorder, m.Origin)
+					b.cache.clearUnsafeLocked(m.Topic, "gap:"+m.Origin)
+				}
+			}
+			if m.Sequence > b.cache.receivedThrough[m.Origin]+1 {
+				b.cache.markUnsafeLocked(m.Topic, "repair:"+m.Origin, m.ExpiresAt)
+			}
+		}
 		if existing := b.cache.items[m.ID]; existing != nil {
 			m.Origin, m.Sequence = existing.Origin, existing.Sequence
 			continue
@@ -2003,6 +2032,7 @@ peerLoop:
 			queued := p.queuedBytes.Load()
 			if queued+bytes > b.cfg.ReplicationQueueBytes {
 				b.metrics.ReplicationDropped.Add(uint64(len(messages)))
+				p.repairVersion.Add(1)
 				break
 			}
 			if !p.queuedBytes.CompareAndSwap(queued, queued+bytes) {
@@ -2013,6 +2043,7 @@ peerLoop:
 			default:
 				p.queuedBytes.Add(-bytes)
 				b.metrics.ReplicationDropped.Add(uint64(len(messages)))
+				p.repairVersion.Add(1)
 			}
 			break
 		}
@@ -2335,11 +2366,19 @@ func (b *Broker) sendPeerBody(ctx context.Context, p *peer, body []byte, count i
 }
 
 func (b *Broker) peerLoop(p *peer) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 	var encoded bytes.Buffer
 	for {
 		select {
 		case <-b.stop:
 			return
+		case <-ticker.C:
+			for range 4 {
+				if !b.repairPeerStep(p) {
+					break
+				}
+			}
 		case batch := <-p.ch:
 			b.probePeerV2(context.Background(), p)
 			encoded.Reset()
@@ -2379,6 +2418,7 @@ func (b *Broker) peerLoop(p *peer) {
 			}
 			if !replicated {
 				b.metrics.ReplicationDropped.Add(uint64(len(batch)))
+				p.repairVersion.Add(1)
 			}
 			p.queuedBytes.Add(-batchBytes(batch))
 			b.signalReplicationFreed()
@@ -2793,7 +2833,7 @@ func (b *Broker) replicate(w http.ResponseWriter, r *http.Request) {
 		b.cache.mu.Unlock()
 	}
 	for _, m := range messages {
-		if !validTopic(m.Topic) || m.ExpiresAt > time.Now().Add(b.cfg.MaxTTL).UnixMilli() || messageSize(m) > b.cfg.CacheBytes {
+		if !validTopic(m.Topic) || m.ExpiresAt > time.Now().Add(b.cfg.MaxTTL).UnixMilli() || messageSize(m) > b.cfg.CacheBytes || (v2 && (m.Origin == "" || m.Sequence == 0)) {
 			problem(w, 400, "invalid_message")
 			return
 		}
@@ -2805,7 +2845,15 @@ func (b *Broker) replicate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var acceptErr error
-	if v2 {
+	if r.URL.Path == "/internal/repair" {
+		if !v2 {
+			problem(w, 400, "repair_requires_v2")
+			return
+		}
+		b.cache.mu.Lock()
+		acceptErr = b.acceptBatchLocked(live, true)
+		b.cache.mu.Unlock()
+	} else if v2 {
 		acceptErr = b.acceptReplicatedBatch(live)
 	} else {
 		acceptErr = b.acceptBatch(live)
@@ -3803,6 +3851,10 @@ func (b *Broker) status(w http.ResponseWriter, _ *http.Request) {
 		actionQueueBytes += p.actionBytes.Load()
 	}
 	v["replication_queue_bytes"] = replicationQueueBytes
+	v["repair_pending_peers"] = b.repairPendingPeers()
+	v["repair_pages"] = b.metrics.RepairPages.Load()
+	v["repair_messages"] = b.metrics.RepairMessages.Load()
+	v["repair_errors"] = b.metrics.RepairErrors.Load()
 	v["replication_queue_max_peer_bytes"] = replicationQueueMaxPeerBytes
 	v["replication_queue_capacity_bytes"] = b.cfg.ReplicationQueueBytes * int64(len(b.peers))
 	v["replication_queue_high_water_bytes"] = b.replicationHighWaterBytes()
@@ -3912,6 +3964,7 @@ func (b *Broker) prometheus(w http.ResponseWriter, _ *http.Request) {
 	_, _ = fmt.Fprintf(w, "# TYPE spruce_group_outstanding_messages gauge\nspruce_group_outstanding_messages %d\n# TYPE spruce_group_active_keys gauge\nspruce_group_active_keys %d\n# TYPE spruce_registered_groups gauge\nspruce_registered_groups %d\n", groupEntries, groupKeys, registeredGroups)
 	_, _ = fmt.Fprintf(w, "# TYPE spruce_group_memory_bytes gauge\nspruce_group_memory_bytes %d\n", groupMemoryBytes)
 	_, _ = fmt.Fprintf(w, "# TYPE spruce_group_expired_messages_total counter\nspruce_group_expired_messages_total %d\n", b.metrics.GroupExpired.Load())
+	_, _ = fmt.Fprintf(w, "# TYPE spruce_repair_pending_peers gauge\nspruce_repair_pending_peers %d\n# TYPE spruce_repair_pages_total counter\nspruce_repair_pages_total %d\n# TYPE spruce_repair_messages_total counter\nspruce_repair_messages_total %d\n# TYPE spruce_repair_errors_total counter\nspruce_repair_errors_total %d\n", b.repairPendingPeers(), b.metrics.RepairPages.Load(), b.metrics.RepairMessages.Load(), b.metrics.RepairErrors.Load())
 	b.writeHistogram(w, "spruce_publish_request_duration_microseconds", &b.metrics.PublishLatency)
 	_, _ = fmt.Fprintf(w, "# TYPE spruce_stream_memory_bytes gauge\nspruce_stream_memory_bytes %d\n# TYPE spruce_stream_memory_capacity_bytes gauge\nspruce_stream_memory_capacity_bytes %d\n", b.streamMemoryBytes.Load(), b.cfg.StreamMemoryBytes)
 	b.writeHistogram(w, "spruce_replication_request_duration_microseconds", &b.metrics.ReplicationLatency)
