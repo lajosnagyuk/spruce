@@ -33,14 +33,17 @@ type batchCommand struct {
 }
 
 type ProducerBatcher struct {
-	client *Client
-	opts   BatcherOptions
-	queue  chan batchCommand
-	stop   chan struct{}
-	done   chan struct{}
-	once   sync.Once
-	ctx    context.Context
-	cancel context.CancelFunc
+	client    *Client
+	opts      BatcherOptions
+	queue     chan batchCommand
+	slots     chan struct{}
+	enqueueMu sync.Mutex
+	stop      chan struct{}
+	done      chan struct{}
+	once      sync.Once
+	closeErr  error
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 func NewProducerBatcher(client *Client, options BatcherOptions) *ProducerBatcher {
@@ -62,8 +65,9 @@ func NewProducerBatcher(client *Client, options BatcherOptions) *ProducerBatcher
 	if options.QueueDepth <= 0 {
 		options.QueueDepth = 4096
 	}
+	options.QueueDepth = min(options.QueueDepth, 65536)
 	workerCtx, cancel := context.WithCancel(context.Background())
-	b := &ProducerBatcher{client: client, opts: options, queue: make(chan batchCommand, options.QueueDepth), stop: make(chan struct{}), done: make(chan struct{}), ctx: workerCtx, cancel: cancel}
+	b := &ProducerBatcher{client: client, opts: options, queue: make(chan batchCommand, options.QueueDepth), slots: make(chan struct{}, options.QueueDepth), stop: make(chan struct{}), done: make(chan struct{}), ctx: workerCtx, cancel: cancel}
 	go b.run()
 	return b
 }
@@ -78,13 +82,12 @@ func (b *ProducerBatcher) Publish(ctx context.Context, topic string, payload []b
 	if options.IdempotencyKey != "" || (options.Ack != "" && options.Ack != "local") {
 		return PublishResult{}, errors.New("option is incompatible with batch publishing")
 	}
+	if err := b.reserve(ctx); err != nil {
+		return PublishResult{}, err
+	}
 	item := &batchPublish{ctx: ctx, topic: topic, payload: append([]byte(nil), payload...), options: options, done: make(chan batchPublishResult, 1)}
-	select {
-	case b.queue <- batchCommand{publish: item}:
-	case <-b.stop:
-		return PublishResult{}, ErrBatcherClosed
-	case <-ctx.Done():
-		return PublishResult{}, ctx.Err()
+	if err := b.enqueueReserved(batchCommand{publish: item}); err != nil {
+		return PublishResult{}, err
 	}
 	select {
 	case result := <-item.done:
@@ -95,13 +98,12 @@ func (b *ProducerBatcher) Publish(ctx context.Context, topic string, payload []b
 }
 
 func (b *ProducerBatcher) Flush(ctx context.Context) error {
+	if err := b.reserve(ctx); err != nil {
+		return err
+	}
 	barrier := make(chan error, 1)
-	select {
-	case b.queue <- batchCommand{barrier: barrier}:
-	case <-b.stop:
-		return ErrBatcherClosed
-	case <-ctx.Done():
-		return ctx.Err()
+	if err := b.enqueueReserved(batchCommand{barrier: barrier}); err != nil {
+		return err
 	}
 	select {
 	case err := <-barrier:
@@ -111,12 +113,49 @@ func (b *ProducerBatcher) Flush(ctx context.Context) error {
 	}
 }
 
+// Reserve before copying payloads so blocked callers cannot grow an owned queue
+// outside QueueDepth. Closing and submission share a short, nonblocking lock.
+func (b *ProducerBatcher) reserve(ctx context.Context) error {
+	select {
+	case <-b.stop:
+		return ErrBatcherClosed
+	default:
+	}
+	select {
+	case b.slots <- struct{}{}:
+		return nil
+	case <-b.stop:
+		return ErrBatcherClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (b *ProducerBatcher) enqueueReserved(cmd batchCommand) error {
+	b.enqueueMu.Lock()
+	defer b.enqueueMu.Unlock()
+	select {
+	case <-b.stop:
+		<-b.slots
+		return ErrBatcherClosed
+	default:
+		b.queue <- cmd
+		return nil
+	}
+}
+
 func (b *ProducerBatcher) Close(ctx context.Context) error {
-	var err error
-	b.once.Do(func() { err = b.Flush(ctx); close(b.stop) })
+	b.once.Do(func() {
+		go func() {
+			b.closeErr = b.Flush(ctx)
+			b.enqueueMu.Lock()
+			close(b.stop)
+			b.enqueueMu.Unlock()
+		}()
+	})
 	select {
 	case <-b.done:
-		return err
+		return b.closeErr
 	case <-ctx.Done():
 		b.cancel()
 		return ctx.Err()
@@ -125,9 +164,25 @@ func (b *ProducerBatcher) Close(ctx context.Context) error {
 
 func (b *ProducerBatcher) run() {
 	defer close(b.done)
+	defer b.cancel()
 	var pending []*batchPublish
+	pendingBytes := 0
 	var timer *time.Timer
 	var timerC <-chan time.Time
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	reset := func() {
+		clear(pending)
+		pending = pending[:0]
+		pendingBytes = 0
+		if timer != nil {
+			timer.Stop()
+		}
+		timerC = nil
+	}
 	flush := func() error {
 		if len(pending) == 0 {
 			return nil
@@ -143,7 +198,7 @@ func (b *ProducerBatcher) run() {
 			}
 		}
 		if len(entries) == 0 {
-			pending = pending[:0]
+			reset()
 			return nil
 		}
 		shared := pending[0].options
@@ -159,16 +214,7 @@ func (b *ProducerBatcher) run() {
 			}
 			item.done <- batchPublishResult{result: logical, err: err}
 		}
-		pending = pending[:0]
-		if timer != nil {
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			timerC = nil
-		}
+		reset()
 		return err
 	}
 	compatible := func(a, c *batchPublish) bool {
@@ -176,13 +222,7 @@ func (b *ProducerBatcher) run() {
 		ao.Key, co.Key = "", ""
 		return a.topic == c.topic && ao == co
 	}
-	bytes := func(items []*batchPublish) int {
-		n := 0
-		for _, item := range items {
-			n += 6 + len(item.options.Key) + len(item.payload)
-		}
-		return n
-	}
+
 	for {
 		select {
 		case <-b.stop:
@@ -190,6 +230,7 @@ func (b *ProducerBatcher) run() {
 			for {
 				select {
 				case cmd := <-b.queue:
+					<-b.slots
 					if cmd.publish != nil {
 						cmd.publish.done <- batchPublishResult{err: ErrBatcherClosed}
 					} else {
@@ -202,6 +243,7 @@ func (b *ProducerBatcher) run() {
 		case <-timerC:
 			_ = flush()
 		case cmd := <-b.queue:
+			<-b.slots
 			if cmd.barrier != nil {
 				cmd.barrier <- flush()
 				continue
@@ -211,15 +253,20 @@ func (b *ProducerBatcher) run() {
 				item.done <- batchPublishResult{err: item.ctx.Err()}
 				continue
 			}
-			if len(pending) > 0 && (!compatible(pending[0], item) || len(pending) >= b.opts.MaxMessages || bytes(pending)+batchEntrySize(item.payload, item.options.Key) > b.opts.MaxBytes) {
+			if len(pending) > 0 && (!compatible(pending[0], item) || len(pending) >= b.opts.MaxMessages || pendingBytes+batchEntrySize(item.payload, item.options.Key) > b.opts.MaxBytes) {
 				_ = flush()
 			}
 			pending = append(pending, item)
+			pendingBytes += batchEntrySize(item.payload, item.options.Key)
 			if len(pending) == 1 {
-				timer = time.NewTimer(b.opts.MaxDelay)
+				if timer == nil {
+					timer = time.NewTimer(b.opts.MaxDelay)
+				} else {
+					timer.Reset(b.opts.MaxDelay)
+				}
 				timerC = timer.C
 			}
-			if len(pending) >= b.opts.MaxMessages || bytes(pending) >= b.opts.MaxBytes {
+			if len(pending) >= b.opts.MaxMessages || pendingBytes >= b.opts.MaxBytes {
 				_ = flush()
 			}
 		}

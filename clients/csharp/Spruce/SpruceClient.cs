@@ -333,9 +333,11 @@ public sealed partial class SpruceClient : IDisposable
 
     private static byte[] EncodePayload(ReadOnlySpan<byte> payload, string? algorithm)
     {
-        if (payload.Length < 1024 || algorithm == "off") return payload.ToArray();
-        algorithm ??= "zstd";
-        if (algorithm is not ("gzip" or "zstd")) throw new ArgumentException($"Unsupported compression '{algorithm}'", nameof(algorithm));
+        if (string.IsNullOrEmpty(algorithm)) algorithm = "zstd";
+        if (algorithm is not ("off" or "gzip" or "zstd")) throw new ArgumentException($"Unsupported compression '{algorithm}'", nameof(algorithm));
+        var literalEnvelope = payload.Length >= CompressionMagic.Length + 5 && payload.StartsWith(CompressionMagic);
+        if (!literalEnvelope && (payload.Length < 1024 || algorithm == "off")) return payload.ToArray();
+        if (literalEnvelope && algorithm == "off") algorithm = "gzip";
         using var output = new MemoryStream();
         output.Write(CompressionMagic);
         output.WriteByte(algorithm == "gzip" ? (byte)1 : (byte)2);
@@ -352,6 +354,11 @@ public sealed partial class SpruceClient : IDisposable
             finally { ZstdCompressors.Add(compressor); }
         }
         var encoded = output.ToArray();
+        if (literalEnvelope)
+        {
+            if (encoded.Length > 1 << 20) throw new ArgumentException("Escaped payload exceeds 1 MiB wire limit", nameof(payload));
+            return encoded;
+        }
         var minimumSaving = Math.Max(128, payload.Length / 10);
         return encoded.Length <= payload.Length - minimumSaving ? encoded : payload.ToArray();
     }

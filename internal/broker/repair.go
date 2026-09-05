@@ -13,7 +13,10 @@ import (
 func (b *Broker) repairPeerStep(p *peer) bool {
 	version := p.repairVersion.Load()
 	if version == p.repairCompleted.Load() {
-		return false
+		if !b.checkPeerGap(p) {
+			return false
+		}
+		version = p.repairVersion.Load()
 	}
 	if p.repairStarted == 0 {
 		p.repairStarted = version
@@ -72,9 +75,45 @@ func (b *Broker) repairPeerStep(p *peer) bool {
 func (b *Broker) repairPendingPeers() int {
 	n := 0
 	for _, p := range b.peers {
-		if p.repairVersion.Load() != p.repairCompleted.Load() {
+		if p.repairVersion.Load() != p.repairCompleted.Load() || p.gapRepairVersion.Load() != p.gapRepairCompleted.Load() {
 			n++
 		}
 	}
 	return n
+}
+
+// A normal out-of-order RPC must not start a cache walk after its predecessor
+// arrives. Confirm that the receiver still has a stalled gap before repairing.
+func (b *Broker) checkPeerGap(p *peer) bool {
+	version := p.gapRepairVersion.Load()
+	if version == p.gapRepairCompleted.Load() || time.Now().UnixNano() < p.gapRepairAfter.Load() {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, p.url+"/internal/capabilities", nil)
+	req.Header.Set("Spruce-Peer-Token", b.cfg.PeerToken)
+	req.Header.Set("Spruce-Cluster-ID", b.cfg.ClusterID)
+	resp, err := b.client.Do(req)
+	if err != nil {
+		b.metrics.RepairErrors.Add(1)
+		return false
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		b.metrics.RepairErrors.Add(1)
+		return false
+	}
+	if resp.Header.Get("Spruce-Repair-Required") == "pending" {
+		p.gapRepairAfter.Store(time.Now().Add(time.Second).UnixNano())
+		return false
+	}
+	p.gapRepairCompleted.Store(version)
+	p.gapRepairAfter.Store(0)
+	if resp.Header.Get("Spruce-Repair-Required") == "false" {
+		return false
+	}
+	p.repairVersion.Add(1)
+	return true
 }

@@ -144,6 +144,9 @@ effects idempotent; completion gates do not establish exclusive ownership across
 ### Partition recovery and idle streams
 
 Dropped replication work schedules a retained-cache repair on the existing peer worker.
+A receiver also requests repair when a retained copy is blocked behind a missing
+predecessor; that predecessor may already have expired upstream. The sender first
+checks that the gap remains stalled, avoiding cache walks for normal transient reordering.
 Repair sends bounded pages through the authenticated internal API, reserves the existing
 replication queue budget, and retries while the peer remains incomplete. Healthy peers
 are not periodically sent full snapshots. Monitor `spruce_repair_pending_peers`,
@@ -181,3 +184,20 @@ Build `bin/spruce-lifecycle` first. `--resources` samples Linux cgroup CPU and m
 `--retention-seconds` permits expiry-cycle soaks. The driver fails missing or corrupt
 accepted deliveries and checks retained-cache digests after recovery. Partition cases
 report reordering separately from loss because cross-partition order is not guaranteed.
+
+### Long-running clients and retention
+
+Receive-origin metadata and consumer checkpoint history are reclaimed after expiry;
+refreshing an existing identity does not retain an unlimited update history. Payload
+expiry remains independent of the once-per-second metadata cleanup cadence.
+Long-lived streams discard cursor origins only when their completed history is known
+to have expired. Unknown history remains conservative; exhausting the bounded cursor
+produces an explicit cursor-expired recovery path rather than a silent reconnect loop.
+
+Producer batchers reserve queue admission before copying payloads. Queue depth bounds
+owned queued entries, while maximum batch bytes bounds the active batch; configure both
+for the application's payload sizes. Closing rejects further admission and unblocks
+waiting callers. Python cannot interrupt an arbitrary client implementation already
+inside a request: a close timeout reports that the worker is still draining, and a later
+close can wait again. A timed-out publish may already have reached the broker; use the
+unbatched idempotent retry API when acceptance certainty is required.

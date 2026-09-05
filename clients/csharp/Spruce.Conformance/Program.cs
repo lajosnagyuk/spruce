@@ -7,6 +7,7 @@ var failures = new List<string>();
 await Run("silent stream reconnect", SilentStreamReconnect, failures);
 await Run("invalid batch", RejectsInvalidBatch, failures);
 await Run("batch v2 per-entry keys", BatchV2PerEntryKeys, failures);
+await Run("literal compression envelope", LiteralCompressionEnvelope, failures);
 await Run("adaptive gzip wire", AdaptiveGzipWire, failures);
 await Run("adaptive zstd wire", AdaptiveZstdWire, failures);
 await Run("batcher coalesces keys and skips queued cancellation", BatcherKeysAndCancellation, failures);
@@ -64,6 +65,25 @@ static async Task BatchV2PerEntryKeys()
     await client.PublishBatchAsync("t", [new BatchEntry(new byte[] { 1 }, "a"), new BatchEntry(new byte[] { 2 }, "b")]);
     Assert(version == "2", "batch v2 header missing");
     Assert(wire is not null && wire.SequenceEqual(new byte[] { 0,1,(byte)'a',0,0,0,1,1, 0,1,(byte)'b',0,0,0,1,2 }), "unexpected batch v2 wire");
+}
+
+static async Task LiteralCompressionEnvelope()
+{
+    byte[]? wire = null;
+    var client = new SpruceClient("https://spruce.invalid", new HttpClient(new StubHandler(request =>
+    {
+        wire = request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+        return Accepted();
+    })));
+    byte[] literal = [0x89, (byte)'S', (byte)'P', (byte)'R', (byte)'U', (byte)'C', (byte)'E', 1, 1, 0, 0, 0, 0];
+    await client.PublishAsync("t", literal, new(Compression: "off"));
+    Assert(wire is not null && wire.Length > 13 && wire[8] == 1, "literal envelope was not escaped with a compatible codec");
+    using var input = new MemoryStream(wire!, 13, wire!.Length - 13);
+    using var gzip = new System.IO.Compression.GZipStream(input, System.IO.Compression.CompressionMode.Decompress);
+    using var decoded = new MemoryStream();
+    await gzip.CopyToAsync(decoded);
+    Assert(decoded.ToArray().SequenceEqual(literal), "literal envelope bytes changed");
+    await Expect<ArgumentException>(() => client.PublishAsync("t", new byte[] { 1 }, new(Compression: "invalid")));
 }
 
 static async Task AdaptiveGzipWire()

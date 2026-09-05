@@ -215,6 +215,8 @@ These deliberately compressible payloads represent an upper-bound benefit, not a
 portable claim for arbitrary events. Adaptive mode skips payloads below 1 KiB and keeps
 the original bytes unless compression saves at least 10% and 128 bytes. Incompressible
 payloads therefore preserve wire/cache size but still pay the attempted codec CPU cost.
+The exception is a literal compression-envelope prefix, which must be wrapped to avoid
+being mistaken for SDK encoding; this can add framing bytes even with compression off.
 
 A separate 15-second run NACKed every 50th first delivery. All planned retries completed
 without missing, duplicate, or invalid payloads. First-delivery p50/p95/p99 was

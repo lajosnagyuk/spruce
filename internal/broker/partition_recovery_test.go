@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -143,5 +144,74 @@ func TestRepairEndpointRequiresPeerAuthentication(t *testing.T) {
 	b.Handler().ServeHTTP(w, httptest.NewRequest("POST", "/internal/repair", nil))
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated repair: %d", w.Code)
+	}
+}
+
+func TestExpiredPredecessorDoesNotStrandConfirmedSuccessor(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PeerToken, cfg.ClusterID = "synthetic-peer", "synthetic-cluster"
+	target := New(cfg)
+	defer target.Close()
+	server := httptest.NewServer(target.Handler())
+	defer server.Close()
+	cfg.Peers = []string{server.URL}
+	source := New(cfg)
+	defer source.Close()
+	first := &Message{ID: "expired-predecessor", Topic: "t", ExpiresAt: time.Now().Add(time.Millisecond).UnixMilli()}
+	if _, err := source.accept(first); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	second := &Message{ID: "live-successor", Topic: "t", ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
+	if _, err := source.accept(second); err != nil {
+		t.Fatal(err)
+	}
+	if second.Sequence != 2 {
+		t.Fatalf("test requires sequence gap, got %d", second.Sequence)
+	}
+	source.enqueuePeers(second)
+	deadline := time.Now().Add(4 * time.Second)
+	for !target.cache.has(second.ID) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !target.cache.has(second.ID) {
+		t.Fatal("replica confirmed buffered successor but never made it deliverable")
+	}
+}
+
+func TestTransientSequenceGapDoesNotWalkRetainedCache(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PeerToken, cfg.ClusterID = "synthetic-peer", "synthetic-cluster"
+	target := New(cfg)
+	defer target.Close()
+	server := httptest.NewServer(target.Handler())
+	defer server.Close()
+	source := New(cfg)
+	defer source.Close()
+	p := &peer{url: server.URL}
+	p.v2.Store(true)
+	expiry := time.Now().Add(time.Minute).UnixMilli()
+	first := &Message{ID: "first", Topic: "t", ExpiresAt: expiry}
+	second := &Message{ID: "second", Topic: "t", ExpiresAt: expiry}
+	if err := source.acceptBatch([]*Message{first, second}); err != nil {
+		t.Fatal(err)
+	}
+	if !source.sendPeer(context.Background(), p, second) {
+		t.Fatal("buffered copy not retained")
+	}
+	if p.gapRepairVersion.Load() == 0 {
+		t.Fatal("gap notification missing")
+	}
+	p.gapRepairAfter.Store(0)
+	if source.repairPeerStep(p) || p.gapRepairCompleted.Load() != 0 {
+		t.Fatal("fresh gap caused immediate repair or was forgotten")
+	}
+	if !source.sendPeer(context.Background(), p, first) {
+		t.Fatal("predecessor failed")
+	}
+	p.gapRepairAfter.Store(0)
+	source.repairPeerStep(p)
+	if p.gapRepairCompleted.Load() != p.gapRepairVersion.Load() || source.metrics.RepairPages.Load() != 0 {
+		t.Fatal("resolved reorder caused full-cache repair")
 	}
 }

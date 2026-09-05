@@ -83,6 +83,12 @@ class Conformance(unittest.TestCase):
         self.assertEqual(self.client.status().messages,1)
         self.assertEqual(self.client.status().group_outstanding_messages,7)
         d=Deduper(2,1); self.assertFalse(d.seen("x")); self.assertTrue(d.seen("x"))
+    def test_literal_compression_envelope_round_trip(self):
+        literal = _compress_payload(b"opaque" * 1000, "gzip")
+        for algorithm in ("", "off", "gzip", "zstd"):
+            self.assertEqual(_decompress_payload(_compress_payload(literal, algorithm), 1 << 20), literal)
+        with self.assertRaises(ValueError): _compress_payload(b"x", "invalid")
+
     def test_batcher_coalesces_and_copies(self):
         Handler.requests=0
         with ProducerBatcher(self.client, BatcherOptions(max_messages=8,max_delay=.05)) as batcher:
