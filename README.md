@@ -6,14 +6,14 @@ It provides opaque binary messages over HTTPS, N producers and consumers, broadc
 
 ## Delivery contract
 
-- Delivery uses bounded ACK/NACK retries and replay. TTL expiry, cache eviction, exhausted retry budgets, or replica loss can prevent delivery.
+- Delivery uses memory-bounded ACK/NACK retries and replay. Group work retries until completion or original TTL expiry; broadcasts retain a retry-attempt limit. TTL expiry or loss of every retained copy can prevent delivery. Capacity pressure rejects new writes instead of evicting accepted events.
 - Messages are not persisted. Restarting every replica can lose all cached messages.
 - Group ACK checkpoints are propagated and bootstrapped between replicas on a best-effort basis; NACK retry remains best effort.
 - Consumer groups deliver to one healthy member. Keyed messages use rendezvous hashing so
-  the same key stays with the same member while group membership and owner capacity remain
-  stable; membership changes deterministically remap only part of the key space. A saturated
-  owner may fall back to another healthy member rather than block the group. Ungrouped
-  subscribers receive broadcasts.
+  the same key stays with the same member while membership remains stable. Each broker
+  gates the next keyed event on completion of its predecessor; a saturated member leaves
+  that key queued. These local gates do not fence duplicate attempts or independent live
+  partitions. Ungrouped subscribers receive broadcasts.
 - Reconnecting consumer groups skip acknowledged messages while their bounded in-memory checkpoints and messages remain cached.
 - Duplicate delivery is expected. First-party clients provide bounded client-side deduplication.
 - Payloads are opaque bytes. Spruce does not inspect schemas or formats.
@@ -255,7 +255,7 @@ Single-message producers may select `Ack: "available"` (HTTP `Spruce-Ack: availa
 to keep serving when only one broker remains. The response includes `confirmed_copies`
 and `degraded`. Healthy peers are attempted within a 100 ms confirmation window;
 unfinished copies use bounded background replication. `one-peer` retains its strict
-peer requirement. These receipts do not prevent TTL expiry, eviction or later loss of
+peer requirement. These receipts do not prevent TTL expiry or later loss of
 all copies. Complete-cluster restart survival is outside the product contract.
 See [ADR 0002](docs/adr/0002-memory-availability.md).
 

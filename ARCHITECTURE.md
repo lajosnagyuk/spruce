@@ -73,7 +73,7 @@ not consensus over conflicting concurrent publishes or protection after every co
 **Decision:** Cache, replication, ACK/NACK propagation, pending delivery, subscriber
 in-flight bytes, request concurrency, stream count, frame size, and idempotency state all
 have hard limits. Streams additionally share a byte-admission budget for fixed buffers
-and replay ID indexes. Replay and deferred queues retain IDs instead of pinning evicted
+and replay ID indexes. Replay and deferred queues retain IDs instead of pinning expired
 payloads; stalled replay writes have deadlines.
 
 **Why:** Predictable degradation is more valuable than preserving weak guarantees until
@@ -114,7 +114,7 @@ and never re-fans out copied messages.
 a special leader.
 
 **Consequence:** Bootstrap is anti-entropy, not durability. A simultaneous cluster loss,
-TTL expiry, eviction, or a full rolling replacement under traffic can still lose
+TTL expiry or a full rolling replacement under traffic can still lose
 messages. Operators that require zero-loss maintenance must pause publishers.
 
 ## ADR-010: First-party clients remain protocol conveniences
@@ -132,9 +132,9 @@ Each client has independent conformance tests and can be replaced by ordinary HT
 
 Group replay scans retained IDs regardless of an individual member's opaque cursor,
 then filters group completion checkpoints. The member cursor still detects expired
-history; it cannot prove other members completed earlier events. New live deliveries
-wait behind the group's replay owner. This reduces replay overtaking but does not
-fence another broker or serialize external side effects. SDK handler rejection sends
+history; it cannot prove other members completed earlier events. Retained and new
+group work share bounded per-key queues, and ACK releases each key's successor.
+This local completion gate does not fence another broker or serialize external side effects. SDK handler rejection sends
 a NACK and reconnects without advancing past the failed completion.
 
 Single-message `available` acknowledgement tries peer acceptance within a 100 ms
