@@ -32,16 +32,16 @@ func (b *Broker) repairPeerStep(p *peer) bool {
 		}
 	}
 	defer func() { p.queuedBytes.Add(-limit); b.signalReplicationFreed() }()
-	messages, next, valid := b.cache.page(p.repairCursor, limit)
+	messages, next, valid := b.cache.repairPage(p.repairOrdinal, limit)
 	if !valid {
-		p.repairCursor = ""
+		p.repairOrdinal = 0
 		b.metrics.RepairErrors.Add(1)
 		return false
 	}
 	if len(messages) == 0 {
 		p.repairCompleted.Store(p.repairStarted)
 		p.repairStarted = 0
-		p.repairCursor = ""
+		p.repairOrdinal = 0
 		return false
 	}
 	var body bytes.Buffer
@@ -68,7 +68,7 @@ func (b *Broker) repairPeerStep(p *peer) bool {
 	}
 	b.metrics.RepairPages.Add(1)
 	b.metrics.RepairMessages.Add(uint64(len(messages)))
-	p.repairCursor = next
+	p.repairOrdinal = next
 	return true
 }
 

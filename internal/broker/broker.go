@@ -98,6 +98,7 @@ type Message struct {
 	orderIndex    int
 	topicIndex    int
 	accountedSize int64
+	repairOrdinal uint64
 }
 
 type Delivery struct {
@@ -137,6 +138,7 @@ type cache struct {
 	reorderBytes       int64
 	reorderLimit       int
 	bytes              int64
+	nextRepairOrdinal  uint64
 	maxBytes           int64
 	rejectPressure     bool
 	evicted            atomic.Uint64
@@ -299,7 +301,7 @@ func messageSize(m *Message) int64 {
 	// CacheBytes is an RSS safety budget, not just a payload limit. Include a
 	// conservative allowance for map/list/interface and allocator-class overhead
 	// so a large population of tiny messages cannot outrun the cgroup boundary.
-	n := int64(256 + len(m.ID) + len(m.Topic) + len(m.Key) + len(m.Payload))
+	n := int64(264 + len(m.ID) + len(m.Topic) + len(m.Key) + len(m.Payload))
 	for k, v := range m.Headers {
 		n += int64(len(k) + len(v) + 8)
 	}
@@ -333,6 +335,8 @@ func (c *cache) insertLocked(m *Message) (bool, error) {
 		c.dropOldestLocked()
 	}
 	c.items[m.ID] = m
+	c.nextRepairOrdinal++
+	m.repairOrdinal = c.nextRepairOrdinal
 	m.orderIndex = len(c.order)
 	c.order = append(c.order, m)
 	m.topicIndex = len(c.topics[m.Topic])
@@ -646,6 +650,36 @@ func (c *cache) page(after string, maxBytes int64) ([]*Message, string, bool) {
 	return out, next, true
 }
 
+// repairPage walks the process-local insertion order. Unlike the public
+// snapshot cursor, its continuation survives expiry and order compaction.
+func (c *cache) repairPage(after uint64, maxBytes int64) ([]*Message, uint64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.expireLocked(time.Now().UnixMilli())
+	out := make([]*Message, 0, 256)
+	var bytes int64
+	var next uint64 = after
+	for _, m := range c.order {
+		if m == nil || m.repairOrdinal <= after {
+			continue
+		}
+		sz := messageSize(m)
+		if bytes+sz > maxBytes {
+			if len(out) == 0 {
+				return nil, after, false
+			}
+			break
+		}
+		out = append(out, m)
+		bytes += sz
+		next = m.repairOrdinal
+		if len(out) >= maxBatchMessages {
+			break
+		}
+	}
+	return out, next, true
+}
+
 func (c *cache) has(id string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -764,7 +798,8 @@ type peer struct {
 	unavailableUntil   atomic.Int64
 	repairVersion      atomic.Uint64
 	repairCompleted    atomic.Uint64
-	repairCursor       string
+	repairCursor       string // retained for snapshot compatibility with older tests
+	repairOrdinal      uint64
 	repairStarted      uint64
 	gapRepairVersion   atomic.Uint64
 	gapRepairCompleted atomic.Uint64
@@ -1837,6 +1872,55 @@ func (b *Broker) acceptBatch(messages []*Message) error {
 	return b.acceptBatchLocked(messages, false)
 }
 
+// drainContiguousLocked promotes buffered successors after a frontier moves.
+// Expired entries consume their sequence but never enter cache or group work;
+// a capacity failure leaves the live entry buffered and fully charged.
+func (b *Broker) drainContiguousLocked(origin string, now int64) error {
+	for {
+		through := b.cache.receivedThrough[origin]
+		gaps := b.cache.reorder[origin]
+		if gaps == nil {
+			return nil
+		}
+		m := gaps[through+1]
+		if m == nil {
+			return nil
+		}
+		if m.ExpiresAt <= now {
+			delete(gaps, m.Sequence)
+			b.cache.reorderBytes -= messageSize(m)
+			b.cache.receivedThrough[origin] = m.Sequence
+			if b.cache.receivedUntil[origin] < m.ExpiresAt {
+				b.cache.receivedUntil[origin] = m.ExpiresAt
+			}
+			continue
+		}
+		if err := b.prepareGroupWork([]*Message{m}); err != nil {
+			return err
+		}
+		delete(gaps, m.Sequence)
+		b.cache.reorderBytes -= messageSize(m)
+		inserted, err := b.cache.insertLocked(m)
+		if err != nil {
+			gaps[m.Sequence] = m
+			b.cache.reorderBytes += messageSize(m)
+			return err
+		}
+		b.cache.recordReceivedLocked(m)
+		if inserted {
+			b.deliver(m, "", 1)
+		} else {
+			b.metrics.Duplicate.Add(1)
+		}
+		if len(gaps) == 0 {
+			delete(b.cache.reorder, origin)
+			delete(b.cache.reorderSince, origin)
+			b.cache.clearUnsafeLocked(m.Topic, "gap:"+origin)
+			return nil
+		}
+	}
+}
+
 func (b *Broker) acceptBatchLocked(messages []*Message, repair bool) error {
 	b.cache.expireLocked(time.Now().UnixMilli())
 	// Admission must precede sequence assignment: rejected batches must not
@@ -1917,6 +2001,11 @@ func (b *Broker) acceptBatchLocked(messages []*Message, repair bool) error {
 			b.deliver(m, "", 1)
 		} else {
 			b.metrics.Duplicate.Add(1)
+		}
+	}
+	for origin := range b.cache.reorder {
+		if err := b.drainContiguousLocked(origin, time.Now().UnixMilli()); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -2005,6 +2094,20 @@ func (b *Broker) acceptReplicatedBatch(messages []*Message) error {
 			continue
 		}
 		for current := m; current != nil; {
+			if current.ExpiresAt <= now {
+				if !fromGap {
+					if gaps := b.cache.reorder[current.Origin]; gaps != nil {
+						if _, ok := gaps[current.Sequence]; ok {
+							delete(gaps, current.Sequence)
+							b.cache.reorderBytes -= messageSize(current)
+						}
+					}
+				}
+				b.cache.receivedThrough[current.Origin] = max(b.cache.receivedThrough[current.Origin], current.Sequence)
+				current = b.cache.reorder[current.Origin][current.Sequence+1]
+				fromGap = true
+				continue
+			}
 			if err := b.prepareGroupWork([]*Message{current}); err != nil {
 				if current != m || fromGap {
 					if b.cache.reorder[current.Origin] == nil {
