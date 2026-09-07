@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -479,5 +480,55 @@ func TestDefaultPublishRetryOutlastsTransientDrain(t *testing.T) {
 func TestCompletionAffinityUTF8Vector(t *testing.T) {
 	if got := completionAffinity("shared-topic", "group é/+"); got != "e55cbafe41fd93ae0d545bf3d420c3f191bc6b140698f12e2a4e7e9f2794b242" {
 		t.Fatal(got)
+	}
+}
+
+func TestStreamReadTimeoutClosesSilentConnection(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	c := New(server.URL)
+	c.StreamReadTimeout = 50 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	started := time.Now()
+	_, err := c.subscribeOnce(ctx, SubscribeOptions{Topic: "t"}, func(context.Context, Delivery) error { t.Error("unexpected delivery"); return nil })
+	if err == nil || time.Since(started) > 500*time.Millisecond {
+		t.Fatalf("silent connection was not interrupted promptly: %v", err)
+	}
+}
+
+func TestStreamHeartbeatsKeepReadDeadlineAlive(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		metadata := []byte(`{}`)
+		var sizes [8]byte
+		binary.BigEndian.PutUint32(sizes[:4], uint32(len(metadata)))
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		for range 30 {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				_, _ = w.Write(sizes[:])
+				_, _ = w.Write(metadata)
+				w.(http.Flusher).Flush()
+			}
+		}
+	}))
+	defer server.Close()
+	c := New(server.URL)
+	c.StreamReadTimeout = 200 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err := c.subscribeOnce(ctx, SubscribeOptions{Topic: "t"}, func(context.Context, Delivery) error {
+		t.Error("heartbeat dispatched as delivery")
+		return nil
+	})
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("healthy heartbeat stream interrupted: %v", err)
 	}
 }

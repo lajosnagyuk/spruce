@@ -7,7 +7,7 @@ public sealed record ProducerBatcherOptions(int MaxMessages = 256, int MaxBytes 
 public sealed class ProducerBatcher : IAsyncDisposable
 {
     private abstract record Command;
-    private sealed record Item(string Topic, byte[] Payload, PublishOptions Options, TaskCompletionSource<PublishResult> Completion, CancellationTokenRegistration Cancellation) : Command;
+    private sealed record Item(string Topic, byte[] Payload, PublishOptions Options, TaskCompletionSource<PublishResult> Completion, CancellationTokenRegistration Cancellation, int Bytes) : Command;
     private sealed record Barrier(TaskCompletionSource Completion) : Command;
 
     private readonly SpruceClient _client;
@@ -16,6 +16,9 @@ public sealed class ProducerBatcher : IAsyncDisposable
     private readonly Task _worker;
     private readonly CancellationTokenSource _shutdown = new();
     private int _closed;
+    private int _pendingBytes;
+    private readonly SemaphoreSlim _queueSlots;
+    private readonly CancellationTokenSource _closing = new();
 
     public ProducerBatcher(SpruceClient client, ProducerBatcherOptions? options = null)
     {
@@ -23,8 +26,10 @@ public sealed class ProducerBatcher : IAsyncDisposable
         options ??= new();
         if (options.MaxMessages is < 1 or > 4096) throw new ArgumentOutOfRangeException(nameof(options));
         if (options.MaxBytes is < 5 or > 16 << 20) throw new ArgumentOutOfRangeException(nameof(options));
-        if (options.QueueDepth < 1) throw new ArgumentOutOfRangeException(nameof(options));
+        if (options.QueueDepth is < 1 or > 65536) throw new ArgumentOutOfRangeException(nameof(options));
         _options = options with { MaxDelay = options.MaxDelay ?? TimeSpan.FromMicroseconds(250) };
+        if (_options.MaxDelay <= TimeSpan.Zero || _options.MaxDelay > TimeSpan.FromDays(1)) throw new ArgumentOutOfRangeException(nameof(options));
+        _queueSlots = new SemaphoreSlim(options.QueueDepth, options.QueueDepth);
         _queue = Channel.CreateBounded<Command>(new BoundedChannelOptions(options.QueueDepth) { FullMode = BoundedChannelFullMode.Wait, SingleReader = true });
         _worker = RunAsync();
     }
@@ -43,10 +48,12 @@ public sealed class ProducerBatcher : IAsyncDisposable
         var keyBytes = System.Text.Encoding.UTF8.GetByteCount(options.Key ?? "");
         if (keyBytes > 8 * 1024 || payload.Length + keyBytes + 6 > _options.MaxBytes) throw new ArgumentOutOfRangeException(nameof(options), "Key and payload exceed the configured batch size");
         if (Volatile.Read(ref _closed) != 0) throw new ObjectDisposedException(nameof(ProducerBatcher));
+        using var admission = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _closing.Token);
+        await _queueSlots.WaitAsync(admission.Token);
         var completion = new TaskCompletionSource<PublishResult>(TaskCreationOptions.RunContinuationsAsynchronously);
         var registration = cancellationToken.Register(() => completion.TrySetCanceled(cancellationToken));
-        try { await _queue.Writer.WriteAsync(new Item(topic, payload.ToArray(), options, completion, registration), cancellationToken); }
-        catch { registration.Dispose(); throw; }
+        try { await _queue.Writer.WriteAsync(new Item(topic, payload.ToArray(), options, completion, registration, payload.Length + keyBytes + 6), cancellationToken); }
+        catch { registration.Dispose(); _queueSlots.Release(); throw; }
         return await completion.Task.WaitAsync(cancellationToken);
     }
 
@@ -61,6 +68,7 @@ public sealed class ProducerBatcher : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _closed, 1) != 0) { await _worker; return; }
+        _closing.Cancel();
         _shutdown.CancelAfter(TimeSpan.FromSeconds(30));
         Exception? flushError = null;
         try
@@ -90,25 +98,29 @@ public sealed class ProducerBatcher : IAsyncDisposable
                 continue;
             }
             var item = (Item)command;
-            if (pending.Count > 0 && (!Compatible(pending[0], item) || pending.Count >= _options.MaxMessages || Bytes(pending) + item.Payload.Length + 4 > _options.MaxBytes)) await FlushPendingAsync(pending);
-            pending.Add(item);
-            var deadline = DateTime.UtcNow + _options.MaxDelay!.Value;
-            while (pending.Count < _options.MaxMessages && Bytes(pending) < _options.MaxBytes)
+            _queueSlots.Release();
+            if (pending.Count > 0 && (!Compatible(pending[0], item) || pending.Count >= _options.MaxMessages || _pendingBytes + EntryBytes(item) > _options.MaxBytes)) await FlushPendingAsync(pending);
+            pending.Add(item); _pendingBytes += EntryBytes(item);
+            var started = System.Diagnostics.Stopwatch.GetTimestamp();
+            while (pending.Count < _options.MaxMessages && _pendingBytes < _options.MaxBytes)
             {
                 while (_queue.Reader.TryRead(out var next))
                 {
                     if (next is Barrier nextBarrier) { var error = await FlushPendingAsync(pending); if (error is null) nextBarrier.Completion.TrySetResult(); else nextBarrier.Completion.TrySetException(error); goto flushed; }
                     var candidate = (Item)next;
-                    if (!Compatible(pending[0], candidate) || Bytes(pending) + EntryBytes(candidate) > _options.MaxBytes) { await FlushPendingAsync(pending); pending.Add(candidate); deadline = DateTime.UtcNow + _options.MaxDelay.Value; }
-                    else pending.Add(candidate);
+                    _queueSlots.Release();
+                    if (!Compatible(pending[0], candidate) || _pendingBytes + EntryBytes(candidate) > _options.MaxBytes) { await FlushPendingAsync(pending); pending.Add(candidate); _pendingBytes += EntryBytes(candidate); started = System.Diagnostics.Stopwatch.GetTimestamp(); }
+                    else { pending.Add(candidate); _pendingBytes += EntryBytes(candidate); }
                     if (pending.Count >= _options.MaxMessages) break;
                 }
                 if (pending.Count >= _options.MaxMessages) break;
-                var remaining = deadline - DateTime.UtcNow;
+                var remaining = _options.MaxDelay!.Value - System.Diagnostics.Stopwatch.GetElapsedTime(started);
                 if (remaining <= TimeSpan.Zero) break;
-                var available = _queue.Reader.WaitToReadAsync().AsTask();
-                if (await Task.WhenAny(available, Task.Delay(remaining)) != available) break;
-                if (!await available) break;
+                using (var wait = new CancellationTokenSource(remaining))
+                {
+                    try { if (!await _queue.Reader.WaitToReadAsync(wait.Token)) break; }
+                    catch (OperationCanceledException) when (wait.IsCancellationRequested) { break; }
+                }
             }
             await FlushPendingAsync(pending);
         flushed:;
@@ -121,6 +133,7 @@ public sealed class ProducerBatcher : IAsyncDisposable
         if (pending.Count == 0) return null;
         var batch = pending.ToArray();
         pending.Clear();
+        _pendingBytes = 0;
         foreach (var cancelled in batch.Where(item => item.Completion.Task.IsCanceled)) cancelled.Cancellation.Dispose();
         batch = batch.Where(item => !item.Completion.Task.IsCanceled).ToArray();
         if (batch.Length == 0) return null;
@@ -136,6 +149,5 @@ public sealed class ProducerBatcher : IAsyncDisposable
     }
 
     private static bool Compatible(Item left, Item right) => left.Topic == right.Topic && (left.Options with { Key = null }) == (right.Options with { Key = null });
-    private static int Bytes(List<Item> items) => items.Sum(x => x.Payload.Length + 6 + System.Text.Encoding.UTF8.GetByteCount(x.Options.Key ?? ""));
-    private static int EntryBytes(Item item) => item.Payload.Length + 6 + System.Text.Encoding.UTF8.GetByteCount(item.Options.Key ?? "");
+    private static int EntryBytes(Item item) => item.Bytes;
 }

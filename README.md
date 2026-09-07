@@ -17,7 +17,7 @@ It provides opaque binary messages over HTTPS, N producers and consumers, broadc
 - Reconnecting consumer groups skip acknowledged messages while their bounded in-memory checkpoints and messages remain cached.
 - Duplicate delivery is expected. First-party clients provide bounded client-side deduplication.
 - Payloads are opaque bytes. Spruce does not inspect schemas or formats.
-- First-party Go, C#, and Python SDKs adaptively Zstandard-compress payloads of at least 1 KiB by default. Compression is retained through caching, replication, replay, and delivery, and is used only when it saves at least 10% and 128 bytes. Select `gzip` for ecosystem compatibility or `off` to disable compression explicitly.
+- First-party Go, C#, and Python SDKs adaptively Zstandard-compress payloads of at least 1 KiB by default. Compression is retained through caching, replication, replay, and delivery, and is used only when it saves at least 10% and 128 bytes. Select `gzip` for ecosystem compatibility or `off` to disable adaptive compression. Literal compression-envelope bytes are escaped to preserve payload identity.
 
 These are deliberate constraints, not missing features. They remove disks, consensus, leaders, partition management, and database operations from the hot path. See [ARCHITECTURE.md](ARCHITECTURE.md) for the decisions and consequences.
 
@@ -111,7 +111,10 @@ The stream uses length-delimited binary frames. ACK and NACK endpoints accept ba
 
 All three clients default to adaptive `zstd` and also support `gzip` and explicit `off`. Compression
 is retained only when it materially reduces the payload, remains opaque to brokers, and
-is transparently decoded under the subscriber's message-size limit.
+is transparently decoded under the subscriber's message-size limit. A payload that already
+starts with a valid envelope prefix is wrapped with an existing codec to preserve its
+literal bytes, including with `off`; readers decode only one layer. If escaping would
+exceed the 1 MiB wire limit, publishing fails explicitly.
 
 ## Kubernetes
 

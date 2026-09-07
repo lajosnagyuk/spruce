@@ -45,6 +45,10 @@ func (b *Broker) registerGroupLocked(topic, group string) bool {
 	scope = checkpointScope{topic: strings.Clone(topic), group: strings.Clone(group)}
 	b.groupMemoryBytes += charge
 	b.groupWork[scope] = &groupWorkState{scope: scope, lanes: make(map[string]*groupLane), work: make(map[string]*groupWork), charge: charge}
+	if b.groupWorkByTopic[scope.topic] == nil {
+		b.groupWorkByTopic[scope.topic] = make(map[string]*groupWorkState)
+	}
+	b.groupWorkByTopic[scope.topic][scope.group] = b.groupWork[scope]
 	return true
 }
 
@@ -55,12 +59,12 @@ func (b *Broker) prepareGroupWork(messages []*Message, onlyGroup ...string) erro
 	defer b.mu.Unlock()
 	now := time.Now().UnixMilli()
 	var charge int64
-	for _, g := range b.groupWork {
-		if len(onlyGroup) > 0 && onlyGroup[0] != "" && g.scope.group != onlyGroup[0] {
+	for _, m := range messages {
+		if m == nil {
 			continue
 		}
-		for _, m := range messages {
-			if m == nil {
+		for _, g := range b.groupWorkByTopic[m.Topic] {
+			if len(onlyGroup) > 0 && onlyGroup[0] != "" && g.scope.group != onlyGroup[0] {
 				continue
 			}
 			if m.Topic == g.scope.topic && g.work[m.ID] == nil && !b.checkpointActiveLocked(m.Topic, g.scope.group, m.ID, now) {
@@ -72,12 +76,12 @@ func (b *Broker) prepareGroupWork(messages []*Message, onlyGroup ...string) erro
 		return errRetentionCapacity
 	}
 	var used int64
-	for _, g := range b.groupWork {
-		if len(onlyGroup) > 0 && onlyGroup[0] != "" && g.scope.group != onlyGroup[0] {
+	for _, m := range messages {
+		if m == nil {
 			continue
 		}
-		for _, m := range messages {
-			if m == nil {
+		for _, g := range b.groupWorkByTopic[m.Topic] {
+			if len(onlyGroup) > 0 && onlyGroup[0] != "" && g.scope.group != onlyGroup[0] {
 				continue
 			}
 			if m.Topic != g.scope.topic || g.work[m.ID] != nil || b.checkpointActiveLocked(m.Topic, g.scope.group, m.ID, now) {
@@ -149,7 +153,7 @@ func (b *Broker) dispatchGroupLocked(g *groupWorkState, lane *groupLane, m *Mess
 func (b *Broker) dispatchGroupMessage(m *Message, onlyGroup string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for _, g := range b.groupWork {
+	for _, g := range b.groupWorkByTopic[m.Topic] {
 		if g.scope.topic == m.Topic && (onlyGroup == "" || g.scope.group == onlyGroup) {
 			if lane := g.lanes[deliveryAffinity(m)]; lane != nil {
 				b.dispatchGroupLocked(g, lane, m)
@@ -246,6 +250,10 @@ func (b *Broker) groupLoop() {
 			}
 			if len(g.work) == 0 && len(b.topicGroups[scope.topic][scope.group]) == 0 {
 				delete(b.groupWork, scope)
+				delete(b.groupWorkByTopic[scope.topic], scope.group)
+				if len(b.groupWorkByTopic[scope.topic]) == 0 {
+					delete(b.groupWorkByTopic, scope.topic)
+				}
 				b.streamMemoryBytes.Add(-g.charge)
 				b.groupMemoryBytes -= g.charge
 			}
@@ -292,7 +300,7 @@ func (b *Broker) sendDeliveryLocked(s *subscriber, m *Message, attempt int, canc
 	b.pendingBytes += bytes
 	s.inflightBytes += bytes
 	heap.Push(&b.pendingDeadlines, &p.deadline)
-	s.ch <- Delivery{DeliveryID: id, MessageID: m.ID, Topic: m.Topic, Key: m.Key, Headers: m.Headers, CreatedAt: m.CreatedAt, Attempt: attempt, Payload: m.Payload, origin: m.Origin, sequence: m.Sequence}
+	s.ch <- Delivery{DeliveryID: id, MessageID: m.ID, Topic: m.Topic, Key: m.Key, Headers: m.Headers, CreatedAt: m.CreatedAt, Attempt: attempt, Payload: m.Payload, origin: m.Origin, sequence: m.Sequence, expiresAt: m.ExpiresAt}
 	b.metrics.Delivered.Add(1)
 	return id
 }

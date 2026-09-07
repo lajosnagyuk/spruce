@@ -35,15 +35,22 @@ func compressPayload(payload []byte, algorithm string) ([]byte, error) {
 	if len(payload) > 1<<20 {
 		return nil, errors.New("payload exceeds 1 MiB")
 	}
-	if len(payload) < compressionThreshold {
-		return payload, nil
-	}
 	if algorithm == "" {
 		algorithm = CompressionZstd
 	}
-	if algorithm == CompressionOff {
+	if algorithm != CompressionOff && algorithm != CompressionGzip && algorithm != CompressionZstd {
+		return nil, fmt.Errorf("unsupported compression %q", algorithm)
+	}
+	literalEnvelope := len(payload) >= len(compressionMagic)+5 && bytes.HasPrefix(payload, []byte(compressionMagic))
+	if !literalEnvelope && (len(payload) < compressionThreshold || algorithm == CompressionOff) {
 		return payload, nil
 	}
+	// Existing readers decode one envelope. Wrap a literal envelope using the
+	// existing gzip codec even when adaptive compression is disabled.
+	if literalEnvelope && algorithm == CompressionOff {
+		algorithm = CompressionGzip
+	}
+
 	header := make([]byte, len(compressionMagic)+5)
 	copy(header, compressionMagic)
 	var size [4]byte
@@ -78,6 +85,12 @@ func compressPayload(payload []byte, algorithm string) ([]byte, error) {
 		zstdEncoders.Put(writer)
 	default:
 		return nil, fmt.Errorf("unsupported compression %q", algorithm)
+	}
+	if literalEnvelope {
+		if len(encoded) > 1<<20 {
+			return nil, errors.New("escaped payload exceeds 1 MiB wire limit")
+		}
+		return encoded, nil
 	}
 	minimumSaving := max(128, len(payload)/10)
 	if len(encoded) > len(payload)-minimumSaving {

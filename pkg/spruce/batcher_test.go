@@ -179,3 +179,45 @@ func (t contextTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	<-r.Context().Done()
 	return nil, r.Context().Err()
 }
+
+func TestProducerBatcherAfterCloseNeverWaitsForAbsentWorker(t *testing.T) {
+	b := NewProducerBatcher(New("http://spruce.invalid"), BatcherOptions{})
+	if err := b.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for range 20 {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		_, err := b.Publish(ctx, "t", []byte("x"), PublishOptions{})
+		cancel()
+		if !errors.Is(err, ErrBatcherClosed) {
+			t.Fatalf("closed publish waited: %v", err)
+		}
+		ctx, cancel = context.WithTimeout(context.Background(), 20*time.Millisecond)
+		err = b.Flush(ctx)
+		cancel()
+		if !errors.Is(err, ErrBatcherClosed) {
+			t.Fatalf("closed flush waited: %v", err)
+		}
+	}
+}
+
+func TestConcurrentBatcherCloseHonoursEachDeadline(t *testing.T) {
+	started := make(chan struct{})
+	client := New("http://spruce.invalid")
+	client.HTTP = &http.Client{Transport: contextTransport{started: started}}
+	b := NewProducerBatcher(client, BatcherOptions{MaxMessages: 1})
+	go b.Publish(context.Background(), "t", []byte("x"), PublishOptions{})
+	<-started
+	first := make(chan error, 1)
+	go func() { first <- b.Close(context.Background()) }()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := b.Close(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("close deadline: %v", err)
+	}
+	select {
+	case <-first:
+	case <-time.After(time.Second):
+		t.Fatal("concurrent close stranded")
+	}
+}

@@ -13,6 +13,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/status": self.reply(200, {"messages": 1, "cache_accounted_bytes": 2, "cache_limit_bytes": 3, "peers": 1, "consumers": 0, "pending_deliveries": 0, "group_outstanding_messages": 7, "future_status_field": 99})
         elif self.path.startswith("/v1/subscriptions/stream"):
             Handler.stream_paths.append(self.path)
+            if "topic=silent" in self.path:
+                self.send_response(200); self.end_headers(); self.wfile.flush(); time.sleep(.4); return
             body=b""
             for index in range(Handler.stream_count):
                 metadata=json.dumps({"delivery_id":f"delivery-{index}","message_id":f"message-{index}","topic":"stream","created_at":index+1,"attempt":1,"cursor":f"cursor-{index}"}).encode(); payload=b"opaque"
@@ -43,6 +45,20 @@ class Conformance(unittest.TestCase):
         cls.server=ThreadingHTTPServer(("127.0.0.1",0),Handler); threading.Thread(target=cls.server.serve_forever,daemon=True).start()
         cls.client=Client(f"http://127.0.0.1:{cls.server.server_port}")
 
+    def test_silent_stream_reconnects(self):
+        from spruce import SubscribeOptions
+        stop = threading.Event()
+        connected = []
+        def observe(event):
+            if event.operation == "subscription_connected":
+                connected.append(1)
+                if len(connected) >= 2: stop.set()
+        client = Client(f"http://127.0.0.1:{self.server.server_port}", stream_read_timeout=.05, on_event=observe)
+        timer = threading.Timer(2, stop.set); timer.start()
+        try: client.subscribe(SubscribeOptions("silent"), lambda _: self.fail("unexpected delivery"), stop)
+        finally: timer.cancel()
+        self.assertGreaterEqual(len(connected), 2)
+
     def test_completion_affinity_utf8_vector(self):
         from spruce import _completion_affinity
         self.assertEqual(_completion_affinity("shared-topic", "group é/+"), "e55cbafe41fd93ae0d545bf3d420c3f191bc6b140698f12e2a4e7e9f2794b242")
@@ -67,6 +83,12 @@ class Conformance(unittest.TestCase):
         self.assertEqual(self.client.status().messages,1)
         self.assertEqual(self.client.status().group_outstanding_messages,7)
         d=Deduper(2,1); self.assertFalse(d.seen("x")); self.assertTrue(d.seen("x"))
+    def test_literal_compression_envelope_round_trip(self):
+        literal = _compress_payload(b"opaque" * 1000, "gzip")
+        for algorithm in ("", "off", "gzip", "zstd"):
+            self.assertEqual(_decompress_payload(_compress_payload(literal, algorithm), 1 << 20), literal)
+        with self.assertRaises(ValueError): _compress_payload(b"x", "invalid")
+
     def test_batcher_coalesces_and_copies(self):
         Handler.requests=0
         with ProducerBatcher(self.client, BatcherOptions(max_messages=8,max_delay=.05)) as batcher:
