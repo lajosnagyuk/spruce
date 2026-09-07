@@ -555,21 +555,23 @@ class ProducerBatcher:
     def __init__(self, client: Client, options: BatcherOptions = BatcherOptions()) -> None:
         if not 1 <= options.max_messages <= 4096 or not 5 <= options.max_bytes <= MAX_BATCH_BYTES or not 0 < options.max_delay <= 86400 or not 1 <= options.queue_depth <= 65536: raise ValueError("invalid batcher options")
         self.client, self.options, self._queue, self._closed = client, options, queue.Queue(options.queue_depth), False
-        self._admission = threading.Condition()
-        self._close_error: BaseException | None = None
+        self._lock = threading.Lock()
+        self._producers = threading.Condition(self._lock)
+        self._worker_wait = threading.Condition(self._lock)
+        self._close_error: tuple | None = None
         self._thread = threading.Thread(target=self._run, daemon=True); self._thread.start()
 
     def _submit(self, create, timeout: float | None) -> None:
         deadline = None if timeout is None else time.monotonic() + timeout
-        with self._admission:
+        with self._producers:
             while self._queue.full() and not self._closed:
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0: raise queue.Full
-                self._admission.wait(remaining)
+                self._producers.wait(remaining)
             if self._closed: raise RuntimeError("producer batcher is closed")
             # Copy only after admission; blocked callers retain no owned payload.
             self._queue.put_nowait(create())
-            self._admission.notify_all()
+            self._worker_wait.notify()
 
     def publish(self, topic: str, payload: bytes, options: PublishOptions = PublishOptions(), timeout: float | None = None) -> PublishResult:
         key_bytes = len(options.key.encode())
@@ -588,16 +590,29 @@ class ProducerBatcher:
         if value: raise value
 
     def close(self, timeout: float | None = 30.0) -> None:
-        with self._admission:
+        with self._lock:
             self._closed = True
-            self._admission.notify_all()
+            self._producers.notify_all()
+            self._worker_wait.notify_all()
         # The worker drains accepted commands and exits. No sentinel needs a
         # potentially full queue slot, and repeated close can wait for completion.
         self._thread.join(timeout)
         if self._thread.is_alive(): raise TimeoutError("producer batcher did not stop")
-        if self._close_error: raise self._close_error
+        if self._close_error: raise self._restore_close_error(self._close_error)
     def __enter__(self): return self
     def __exit__(self, exc_type, exc, tb): self.close()
+    @staticmethod
+    def _save_close_error(exc: BaseException) -> tuple:
+        if isinstance(exc, SpruceError):
+            return ("spruce", exc.status_code, exc.status, exc.code, exc.body, exc.retry_after)
+        if isinstance(exc, (TimeoutError, OSError, ValueError, RuntimeError)):
+            return (type(exc).__name__, str(exc))
+        return ("RuntimeError", f"batch publish failed: {type(exc).__name__}")
+    @staticmethod
+    def _restore_close_error(data: tuple) -> BaseException:
+        if data[0] == "spruce": return SpruceError(*data[1:])
+        kinds = {"TimeoutError": TimeoutError, "OSError": OSError, "ValueError": ValueError, "RuntimeError": RuntimeError}
+        return kinds.get(data[0], RuntimeError)(data[1])
     def _run(self) -> None:
         pending, pending_bytes, deadline = [], 0, None
         def flush():
@@ -610,23 +625,26 @@ class ProducerBatcher:
                 for item, value in zip(batch, values): item[3].put(value)
                 return None
             except BaseException as exc:
-                self._close_error = exc
+                self._close_error = self._save_close_error(exc)
                 for item in batch: item[3].put(exc)
                 return exc
         while True:
-            with self._admission:
+            with self._worker_wait:
                 while self._queue.empty() and not self._closed:
                     remaining = None if deadline is None else deadline - time.monotonic()
                     if remaining is not None and remaining <= 0: break
-                    self._admission.wait(remaining)
+                    self._worker_wait.wait(remaining)
                 stopping = self._closed and self._queue.empty()
                 item = None if self._queue.empty() else self._queue.get_nowait()
-                self._admission.notify_all()
+                if item is not None: self._producers.notify()
             if item is None:
                 flush()
                 if stopping: return
                 continue
-            if item[0] is None: item[3].put(flush()); continue
+            if item[0] is None:
+                item[3].put(flush())
+                item = None
+                continue
             item_bytes = 6 + len(item[2].key.encode()) + len(item[1])
             compatible = not pending or (pending[0][0] == item[0] and replace(pending[0][2], key="") == replace(item[2], key=""))
             if pending and (not compatible or len(pending) >= self.options.max_messages or pending_bytes + item_bytes > self.options.max_bytes): flush()
@@ -634,6 +652,7 @@ class ProducerBatcher:
             pending_bytes += item_bytes
             if len(pending) == 1: deadline = time.monotonic() + self.options.max_delay
             if len(pending) >= self.options.max_messages or pending_bytes >= self.options.max_bytes: flush()
+            item = None
 
 
 __all__ = ["BatchEntry", "BatcherOptions", "BrokerStatus", "Client", "ClientEvent", "ConsumableDelivery", "Deduper", "Delivery", "HandlerDrainTimeoutError", "HandlerPanicError", "ProducerBatcher", "PublishOptions", "PublishResult", "RetryOptions", "SpruceError", "SubscribeOptions", "__version__"]
