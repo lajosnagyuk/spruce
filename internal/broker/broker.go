@@ -1893,6 +1893,12 @@ func (b *Broker) drainContiguousLocked(origin string, now int64) error {
 			if b.cache.receivedUntil[origin] < m.ExpiresAt {
 				b.cache.receivedUntil[origin] = m.ExpiresAt
 			}
+			if len(gaps) == 0 {
+				delete(b.cache.reorder, origin)
+				delete(b.cache.reorderSince, origin)
+				b.cache.clearUnsafeLocked(m.Topic, "gap:"+origin)
+				return nil
+			}
 			continue
 		}
 		if err := b.prepareGroupWork([]*Message{m}); err != nil {
@@ -2004,7 +2010,7 @@ func (b *Broker) acceptBatchLocked(messages []*Message, repair bool) error {
 		}
 	}
 	for origin := range b.cache.reorder {
-		if err := b.drainContiguousLocked(origin, time.Now().UnixMilli()); err != nil {
+		if err := b.drainContiguousLocked(origin, time.Now().UnixMilli()); err != nil && !errors.Is(err, errRetentionCapacity) {
 			return err
 		}
 	}
@@ -2094,13 +2100,19 @@ func (b *Broker) acceptReplicatedBatch(messages []*Message) error {
 			continue
 		}
 		for current := m; current != nil; {
+			if fromGap {
+				if gaps := b.cache.reorder[current.Origin]; gaps != nil {
+					if _, ok := gaps[current.Sequence]; ok {
+						delete(gaps, current.Sequence)
+						b.cache.reorderBytes -= messageSize(current)
+					}
+				}
+			}
 			if current.ExpiresAt <= now {
-				if !fromGap {
-					if gaps := b.cache.reorder[current.Origin]; gaps != nil {
-						if _, ok := gaps[current.Sequence]; ok {
-							delete(gaps, current.Sequence)
-							b.cache.reorderBytes -= messageSize(current)
-						}
+				if gaps := b.cache.reorder[current.Origin]; gaps != nil {
+					if _, ok := gaps[current.Sequence]; ok {
+						delete(gaps, current.Sequence)
+						b.cache.reorderBytes -= messageSize(current)
 					}
 				}
 				b.cache.receivedThrough[current.Origin] = max(b.cache.receivedThrough[current.Origin], current.Sequence)
