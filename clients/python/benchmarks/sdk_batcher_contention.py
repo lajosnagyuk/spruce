@@ -46,15 +46,23 @@ def _trial(module, workers: int, per_worker: int, options) -> dict:
     start = threading.Event()
     failures = []
     failure_lock = threading.Lock()
+    completed = 0
+    completed_lock = threading.Lock()
 
     def run():
         start.wait()
-        try:
-            for _ in range(per_worker):
-                batcher.publish("benchmark", b"x")
-        except BaseException as exc:
-            with failure_lock:
-                failures.append(f"{type(exc).__name__}: {exc}")
+        nonlocal completed
+        for _ in range(per_worker):
+            try:
+                result = batcher.publish("benchmark", b"x")
+                if not isinstance(result, module.PublishResult):
+                    raise TypeError(f"unexpected publish result {type(result).__name__}")
+            except BaseException as exc:
+                with failure_lock:
+                    failures.append(f"{type(exc).__name__}: {exc}")
+            else:
+                with completed_lock:
+                    completed += 1
 
     threads = [threading.Thread(target=run) for _ in range(workers)]
     for thread in threads:
@@ -69,7 +77,6 @@ def _trial(module, workers: int, per_worker: int, options) -> dict:
     except BaseException as exc:
         with failure_lock:
             failures.append(f"close {type(exc).__name__}: {exc}")
-    completed = workers * per_worker - len(failures)
     return {"elapsed_seconds": elapsed, "completed_messages": completed, "errors": failures, "messages_per_second": completed / elapsed if elapsed else 0.0}
 
 
@@ -83,28 +90,29 @@ def main() -> int:
     parser.add_argument("--per-worker", type=int, default=100)
     parser.add_argument("--repeats", type=int, default=3)
     args = parser.parse_args()
-    options_by_module = []
     loaded = []
     for index, revision in enumerate(args.revisions):
         label, module = _module(args.repo, revision, index)
         loaded.append((label, module))
-        options_by_module.append(module.BatcherOptions(max_messages=args.max_messages, queue_depth=args.queue_depth, max_delay=.00025))
 
     print(json.dumps({"python": platform.python_version(), "platform": platform.platform(), "settings": vars(args), "payload_bytes": 1, "max_delay_seconds": .00025}), flush=True)
-    for workers in args.workers:
-        rows = []
-        schedule = [(repeat, index) for repeat in range(args.repeats) for index in range(len(loaded))]
-        for repeat, index in schedule:
-            label, module = loaded[index]
-            result = _trial(module, workers, args.per_worker, options_by_module[index])
-            row = {"revision": label, "workers": workers, "repeat": repeat, **result}
-            rows.append(row)
-            print(json.dumps(row), flush=True)
-            if result["errors"]:
-                return 1
-        for index, (label, _) in enumerate(loaded):
-            rates = [row["messages_per_second"] for row in rows if row["revision"] == label]
-            print(json.dumps({"revision": label, "workers": workers, "median_messages_per_second": statistics.median(rates), "raw_messages_per_second": rates}), flush=True)
+    profiles = [("primary", args.queue_depth, args.max_messages, args.workers), ("tiny", 1, 1, args.workers), ("uncontended", args.queue_depth, args.max_messages, [1])]
+    for profile, queue_depth, max_messages, worker_counts in profiles:
+        for workers in worker_counts:
+            rows = []
+            schedule = [(repeat, index) for repeat in range(args.repeats) for index in range(len(loaded))]
+            for repeat, index in schedule:
+                label, module = loaded[index]
+                options = module.BatcherOptions(max_messages=max_messages, queue_depth=queue_depth, max_delay=.00025)
+                result = _trial(module, workers, args.per_worker, options)
+                row = {"profile": profile, "revision": label, "workers": workers, "queue_depth": queue_depth, "max_messages": max_messages, "repeat": repeat, **result}
+                rows.append(row)
+                print(json.dumps(row), flush=True)
+                if result["errors"] or result["completed_messages"] != workers * args.per_worker:
+                    return 1
+            for label, _ in loaded:
+                rates = [row["messages_per_second"] for row in rows if row["revision"] == label]
+                print(json.dumps({"profile": profile, "revision": label, "workers": workers, "queue_depth": queue_depth, "max_messages": max_messages, "median_messages_per_second": statistics.median(rates), "raw_messages_per_second": rates}), flush=True)
     gc.collect()
     return 0
 

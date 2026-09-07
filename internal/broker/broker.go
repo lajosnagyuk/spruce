@@ -2109,13 +2109,20 @@ func (b *Broker) acceptReplicatedBatch(messages []*Message) error {
 				}
 			}
 			if current.ExpiresAt <= now {
+				b.cache.receivedThrough[current.Origin] = max(b.cache.receivedThrough[current.Origin], current.Sequence)
 				if gaps := b.cache.reorder[current.Origin]; gaps != nil {
 					if _, ok := gaps[current.Sequence]; ok {
 						delete(gaps, current.Sequence)
 						b.cache.reorderBytes -= messageSize(current)
 					}
+					if len(gaps) == 0 {
+						delete(b.cache.reorder, current.Origin)
+						delete(b.cache.reorderSince, current.Origin)
+						b.cache.clearUnsafeLocked(current.Topic, "gap:"+current.Origin)
+						current = nil
+						continue
+					}
 				}
-				b.cache.receivedThrough[current.Origin] = max(b.cache.receivedThrough[current.Origin], current.Sequence)
 				current = b.cache.reorder[current.Origin][current.Sequence+1]
 				fromGap = true
 				continue

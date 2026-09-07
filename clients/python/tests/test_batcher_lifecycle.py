@@ -48,6 +48,45 @@ class BatcherLifecycle(unittest.TestCase):
         for delay in (float("nan"), float("inf"), -1):
             with self.assertRaises(ValueError): ProducerBatcher(None, BatcherOptions(max_delay=delay))
 
+    def test_close_rejects_waiting_admissions_and_drains_accepted(self):
+        entered, release = threading.Event(), threading.Event()
+        class Client:
+            calls = 0
+            def publish_batch_entries(self, topic, entries, options):
+                self.calls += 1
+                if self.calls == 1:
+                    entered.set()
+                    release.wait(2)
+                return [PublishResult("id") for _ in entries]
+        batcher = ProducerBatcher(Client(), BatcherOptions(max_messages=1, queue_depth=1))
+        values = queue.Queue()
+        def publish(timeout=None):
+            try: values.put(batcher.publish("t", b"x", timeout=timeout))
+            except BaseException as exc: values.put(exc)
+        accepted = threading.Thread(target=publish)
+        accepted.start()
+        self.assertTrue(entered.wait(1))
+        queued = threading.Thread(target=publish)
+        queued.start()
+        deadline = time.monotonic() + 1
+        while not batcher._queue.full() and time.monotonic() < deadline:
+            time.sleep(.001)
+        self.assertTrue(batcher._queue.full())
+        blocked = [threading.Thread(target=publish) for _ in range(3)]
+        for thread in blocked: thread.start()
+        try:
+            with self.assertRaises(TimeoutError): batcher.close(timeout=.02)
+            for thread in blocked: thread.join(1)
+            self.assertTrue(all(not thread.is_alive() for thread in blocked))
+            blocked_values = [values.get(timeout=1) for _ in blocked]
+            self.assertTrue(all(isinstance(value, RuntimeError) for value in blocked_values))
+        finally:
+            release.set()
+            accepted.join(1); queued.join(1)
+            batcher.close(timeout=1)
+        self.assertIsInstance(values.get(timeout=1), PublishResult)
+        self.assertIsInstance(values.get(timeout=1), PublishResult)
+
     def test_failed_publish_does_not_retain_caller_frame_after_progress(self):
         class Marker:
             pass
@@ -79,26 +118,39 @@ class BatcherLifecycle(unittest.TestCase):
                 time.sleep(.01)
             self.assertIsNone(reference())
         finally:
-            try: batcher.close()
-            except RuntimeError: pass
+            with self.assertRaises(RuntimeError) as raised:
+                batcher.close()
+            self.assertEqual(str(raised.exception), "temporary network failure")
 
     def test_close_reconstructs_bounded_fresh_failures(self):
         class Client:
             def publish_batch_entries(self, topic, entries, options):
                 raise SpruceError(503, "busy", "overloaded", "retry later", 1.25)
         batcher = ProducerBatcher(Client(), BatcherOptions(max_messages=1))
-        with self.assertRaises(SpruceError) as first:
+        try:
             batcher.publish("t", b"x")
+        except SpruceError as first:
+            original = first
+            original_depth = sum(1 for _ in _traceback_frames(first))
+        else:
+            self.fail("failed batch unexpectedly succeeded")
+        self.assertGreater(original_depth, 0)
+        self.assertLessEqual(original_depth, 8)
         try:
             failures = []
+            depths = []
             for _ in range(100):
-                with self.assertRaises(SpruceError) as raised:
+                try:
                     batcher.close()
-                failures.append(raised.exception)
+                except SpruceError as raised:
+                    failures.append(raised)
+                    depths.append(sum(1 for _ in _traceback_frames(raised)))
+                else:
+                    self.fail("close unexpectedly succeeded")
             self.assertEqual(len({id(exc) for exc in failures}), 100)
             self.assertTrue(all(exc.status_code == 503 and exc.code == "overloaded" and exc.retry_after == 1.25 for exc in failures))
-            self.assertTrue(all(sum(1 for _ in _traceback_frames(exc)) <= 4 for exc in failures))
-            self.assertEqual(str(failures[-1]), str(first.exception))
+            self.assertTrue(all(depth <= 4 for depth in depths))
+            self.assertEqual(str(failures[-1]), str(original))
         finally:
             if batcher._thread.is_alive():
                 try: batcher.close()
@@ -122,6 +174,73 @@ class BatcherLifecycle(unittest.TestCase):
             if batcher._thread.is_alive():
                 try: batcher.close(timeout=1)
                 except RuntimeError: pass
+
+    def test_close_reconstructs_ordinary_error_categories(self):
+        for expected in (TimeoutError("late"), ValueError("bad result"), RuntimeError("temporary")):
+            with self.subTest(error=type(expected).__name__):
+                class Client:
+                    def publish_batch_entries(self, topic, entries, options):
+                        raise expected
+                batcher = ProducerBatcher(Client(), BatcherOptions(max_messages=1))
+                try:
+                    try: batcher.publish("t", b"x")
+                    except type(expected): pass
+                    with self.assertRaises(type(expected)) as raised: batcher.close()
+                    self.assertEqual(str(raised.exception), str(expected))
+                finally:
+                    if batcher._thread.is_alive():
+                        try: batcher.close(timeout=1)
+                        except BaseException: pass
+
+    def test_failed_worker_and_timed_out_handoff_release_exception_graphs(self):
+        class Marker:
+            pass
+        class Failure(Exception):
+            def __init__(self, marker):
+                self.marker = marker
+                super().__init__("failure")
+        class Client:
+            def __init__(self):
+                self.marker = Marker()
+                self.reference = weakref.ref(self.marker)
+                self.block = threading.Event()
+                self.failed = True
+            def publish_batch_entries(self, topic, entries, options):
+                if self.block.is_set():
+                    self.block.clear()
+                    time.sleep(.05)
+                if self.failed:
+                    self.failed = False
+                    failure = Failure(self.marker)
+                    self.marker = None
+                    raise failure
+                return [PublishResult("ok") for _ in entries]
+
+        client = Client()
+        batcher = ProducerBatcher(client, BatcherOptions(max_messages=1))
+        try:
+            try: batcher.publish("t", b"failed")
+            except Failure: pass
+            first_reference = client.reference
+            batcher.publish("t", b"healthy")
+            batcher.flush()
+            client.marker = Marker()
+            timed_out_reference = weakref.ref(client.marker)
+            client.failed = True
+            client.block.set()
+            with self.assertRaises(queue.Empty):
+                batcher.publish("t", b"timed", timeout=.005)
+            client.marker = None
+            for _ in range(10):
+                gc.collect()
+                if first_reference() is None and timed_out_reference() is None:
+                    break
+                time.sleep(.01)
+            self.assertIsNone(first_reference())
+            self.assertIsNone(timed_out_reference())
+        finally:
+            try: batcher.close(timeout=1)
+            except BaseException: pass
 
     def test_many_publishers_progress_and_close_wakes_waiters(self):
         entered, release = threading.Event(), threading.Event()
@@ -147,6 +266,8 @@ class BatcherLifecycle(unittest.TestCase):
             for thread in threads: thread.join(1)
             self.assertTrue(all(not thread.is_alive() for thread in threads))
             self.assertEqual(results.qsize(), len(threads))
+            values = [results.get() for _ in threads]
+            self.assertTrue(all(isinstance(value, PublishResult) for value in values))
         finally:
             release.set()
             try: batcher.close(timeout=1)
@@ -179,6 +300,7 @@ class BatcherLifecycle(unittest.TestCase):
             with self.assertRaises(queue.Full):
                 batcher.publish("t", Payload(), timeout=.02)
             self.assertFalse(copied.is_set())
+            self.assertEqual(batcher._queue.qsize(), 1)
         finally:
             release.set()
             first.join(1)
@@ -187,6 +309,12 @@ class BatcherLifecycle(unittest.TestCase):
 
     def test_fifo_flush_barrier_is_preserved(self):
         calls = []
+        admitted = threading.Event()
+        class Payload:
+            def __len__(self): return 1
+            def __bytes__(self):
+                admitted.set()
+                return b"a"
         class Client:
             def publish_batch_entries(self, topic, entries, options):
                 calls.append(len(entries))
@@ -194,9 +322,11 @@ class BatcherLifecycle(unittest.TestCase):
         batcher = ProducerBatcher(Client(), BatcherOptions(max_messages=8, max_delay=1, queue_depth=8))
         try:
             result = {}
-            first = threading.Thread(target=lambda: result.setdefault("publish", batcher.publish("t", b"a")))
+            first = threading.Thread(target=lambda: result.setdefault("publish", batcher.publish("t", Payload())))
+            first.start()
+            self.assertTrue(admitted.wait(1))
             second = threading.Thread(target=lambda: (batcher.flush(), result.setdefault("flush", True)))
-            first.start(); second.start(); first.join(1); second.join(1)
+            second.start(); first.join(1); second.join(1)
             self.assertFalse(first.is_alive() or second.is_alive())
             self.assertEqual(result.get("flush"), True)
             self.assertEqual(calls, [1])
