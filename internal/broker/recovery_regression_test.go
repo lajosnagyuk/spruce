@@ -1,7 +1,9 @@
 package broker
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -9,8 +11,12 @@ import (
 )
 
 func TestRepairPromotesEntireBufferedChainOnce(t *testing.T) {
-	b := New(DefaultConfig())
+	cfg := DefaultConfig()
+	cfg.PeerToken, cfg.ClusterID = "synthetic-repair", "synthetic-cluster"
+	b := New(cfg)
 	defer b.Close()
+	server := httptest.NewServer(b.Handler())
+	defer server.Close()
 	s := workSubscriber(b, "repair-chain")
 	expires := time.Now().Add(time.Minute).UnixMilli()
 	for sequence := uint64(2); sequence <= 4; sequence++ {
@@ -20,8 +26,22 @@ func TestRepairPromotesEntireBufferedChainOnce(t *testing.T) {
 		}
 	}
 	first := &Message{ID: "chain-1", Topic: "t", Key: "k", Origin: "origin", Sequence: 1, Payload: []byte{1, 0}, ExpiresAt: expires}
+	var body bytes.Buffer
+	if err := writePeerBatch(&body, []*Message{first}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, server.URL+"/internal/repair", &body)
+	req.Header.Set("Spruce-Peer-Token", cfg.PeerToken)
+	req.Header.Set("Spruce-Cluster-ID", cfg.ClusterID)
+	req.Header.Set("Spruce-Peer-Version", "2")
+	req.Header.Set("Content-Type", "application/vnd.spruce.peer.v2")
+	resp := httptest.NewRecorder()
+	b.Handler().ServeHTTP(resp, req)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("predecessor-only repair status: %d", resp.Code)
+	}
 	b.cache.mu.Lock()
-	err := b.acceptBatchLocked([]*Message{first}, true)
 	through := b.cache.receivedThrough["origin"]
 	reorderBytes := b.cache.reorderBytes
 	gap := len(b.cache.reorder)
@@ -33,13 +53,13 @@ func TestRepairPromotesEntireBufferedChainOnce(t *testing.T) {
 	for sequence := uint64(1); sequence <= 4; sequence++ {
 		expectedBytes += messageSize(&Message{ID: fmt.Sprintf("chain-%d", sequence), Topic: "t", Key: "k", Origin: "origin", Sequence: sequence, Payload: []byte{byte(sequence), 0}, ExpiresAt: expires})
 	}
-	if err != nil || through != 4 || reorderBytes != 0 || gap != 0 || reorderSince != 0 || unsafe || cacheBytes != expectedBytes {
-		t.Fatalf("repair chain: err=%v through=%d cache_bytes=%d want=%d reorder_bytes=%d gaps=%d since=%d unsafe=%t", err, through, cacheBytes, expectedBytes, reorderBytes, gap, reorderSince, unsafe)
+	if through != 4 || reorderBytes != 0 || gap != 0 || reorderSince != 0 || unsafe || cacheBytes != expectedBytes {
+		t.Fatalf("repair chain: through=%d cache_bytes=%d want=%d reorder_bytes=%d gaps=%d since=%d unsafe=%t", through, cacheBytes, expectedBytes, reorderBytes, gap, reorderSince, unsafe)
 	}
 	for sequence := uint64(1); sequence <= 4; sequence++ {
 		id := fmt.Sprintf("chain-%d", sequence)
 		m := b.cache.get(id)
-		if m == nil || string(m.Payload) != string([]byte{byte(sequence), 0}) {
+		if m == nil || m.ExpiresAt != expires || string(m.Payload) != string([]byte{byte(sequence), 0}) {
 			t.Fatalf("missing or modified cached message %s", id)
 		}
 	}
@@ -94,9 +114,15 @@ func TestRepairRetainsSuccessorWhenGroupAdmissionIsFull(t *testing.T) {
 	b.cache.mu.Lock()
 	retained := b.cache.reorder[second.Origin][second.Sequence]
 	retainedBytes := b.cache.reorderBytes
+	combinedBytes := b.cache.bytes + b.cache.reorderBytes
 	b.cache.mu.Unlock()
-	if retained != second || retainedBytes != messageSize(second) {
-		t.Fatalf("successor retention: retained=%v bytes=%d want=%d", retained != nil, retainedBytes, messageSize(second))
+	if retained != second || retainedBytes != messageSize(second) || combinedBytes != messageSize(first)+messageSize(second) {
+		t.Fatalf("successor retention: retained=%v bytes=%d combined=%d want=%d", retained != nil, retainedBytes, combinedBytes, messageSize(first)+messageSize(second))
+	}
+	select {
+	case d := <-s.ch:
+		t.Fatalf("successor delivered before capacity release: %+v", d)
+	default:
 	}
 	b.streamMemoryBytes.Add(-remaining)
 	remaining = 0
@@ -148,10 +174,10 @@ func TestExpiredBufferedSuccessorIsConsumedWithoutCharge(t *testing.T) {
 				b.addSubscriberLocked(broadcast)
 				b.mu.Unlock()
 				group := workSubscriber(b, "expiry-group")
-				expired := &Message{ID: "expiry-2", Topic: "t", Key: "k2", Origin: origin, Sequence: 2, Payload: []byte("expired"), ExpiresAt: now - 1}
+				expired := &Message{ID: "expiry-2", Topic: "t", Key: "k2", Origin: origin, Sequence: 2, Payload: []byte("expired"), ExpiresAt: now + time.Minute.Milliseconds()}
 				liveExpiry := now + time.Minute.Milliseconds()
 				if allExpired {
-					liveExpiry = now - 1
+					liveExpiry = now + time.Minute.Milliseconds()
 				}
 				live := &Message{ID: "expiry-3", Topic: "t", Key: "k3", Origin: origin, Sequence: 3, Payload: []byte("live"), ExpiresAt: liveExpiry}
 				for _, m := range []*Message{expired, live} {
@@ -159,6 +185,15 @@ func TestExpiredBufferedSuccessorIsConsumedWithoutCharge(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
+				// Keep the buffered payloads live during admission, then expire them
+				// under the cache lock while maintenance remains deliberately deferred.
+				b.cache.mu.Lock()
+				b.cache.reorder[origin][2].ExpiresAt = now - 1
+				if allExpired {
+					b.cache.reorder[origin][3].ExpiresAt = now - 1
+				}
+				b.cache.nextMetadataExpiry = now + time.Hour.Milliseconds()
+				b.cache.mu.Unlock()
 				first := &Message{ID: "expiry-1", Topic: "t", Origin: origin, Sequence: 1, Payload: []byte("first"), ExpiresAt: now + time.Minute.Milliseconds()}
 				b.cache.mu.Lock()
 				b.cache.nextMetadataExpiry = now + time.Hour.Milliseconds()
@@ -175,6 +210,8 @@ func TestExpiredBufferedSuccessorIsConsumedWithoutCharge(t *testing.T) {
 				through := b.cache.receivedThrough[origin]
 				queued := b.cache.reorderBytes
 				cacheBytes := b.cache.bytes
+				_, reorderOrigin := b.cache.reorder[origin]
+				_, reorderSinceOrigin := b.cache.reorderSince[origin]
 				gapCount := len(b.cache.reorder[origin])
 				gapSince := b.cache.reorderSince[origin]
 				unsafe := b.cache.topicUnsafeLocked("t", now)
@@ -186,8 +223,8 @@ func TestExpiredBufferedSuccessorIsConsumedWithoutCharge(t *testing.T) {
 				if wantLive {
 					wantBytes += messageSize(live)
 				}
-				if err != nil || through != 3 || queued != 0 || cacheBytes != wantBytes || expiredRetained || expiredGap || gapCount != 0 || gapSince != 0 || unsafe || b.cache.has("expiry-2") || b.cache.has("expiry-3") != wantLive {
-					t.Fatalf("expiry transition: err=%v through=%d bytes=%d want=%d queued=%d gaps=%d since=%d expired_cache=%t expired_gap=%t live=%t unsafe=%t", err, through, cacheBytes, wantBytes, queued, gapCount, gapSince, expiredRetained, expiredGap, b.cache.has("expiry-3"), unsafe)
+				if err != nil || through != 3 || queued != 0 || cacheBytes != wantBytes || expiredRetained || expiredGap || reorderOrigin || reorderSinceOrigin || gapCount != 0 || gapSince != 0 || unsafe || b.cache.has("expiry-2") || b.cache.has("expiry-3") != wantLive {
+					t.Fatalf("expiry transition: err=%v through=%d bytes=%d want=%d queued=%d gaps=%d since=%d expired_cache=%t expired_gap=%t reorder_origin=%t reorder_since=%t live=%t unsafe=%t", err, through, cacheBytes, wantBytes, queued, gapCount, gapSince, expiredRetained, expiredGap, reorderOrigin, reorderSinceOrigin, b.cache.has("expiry-3"), unsafe)
 				}
 				wantDeliveries := 1
 				if wantLive {
@@ -206,20 +243,32 @@ func TestExpiredBufferedSuccessorIsConsumedWithoutCharge(t *testing.T) {
 					t.Fatalf("broadcast deliveries: %#v", gotBroadcast)
 				}
 				gotGroup := make(map[string]bool)
+				var groupAcks []string
 				for i := 0; i < wantDeliveries; i++ {
 					d := readWork(t, group)
 					gotGroup[d.MessageID] = true
-					b.removeAcks([]string{d.DeliveryID})
+					groupAcks = append(groupAcks, d.DeliveryID)
 				}
 				if gotGroup[expired.ID] || gotGroup[first.ID] != true || gotGroup[live.ID] != wantLive || len(gotGroup) != wantDeliveries {
 					t.Fatalf("group deliveries: %#v", gotGroup)
 				}
 				b.mu.RLock()
 				g := b.groupWork[checkpointScope{topic: "t", group: "g"}]
-				groupHasExpired := g != nil && g.work[expired.ID] != nil
+				groupHasExpired := g != nil && (g.work[expired.ID] != nil || g.work[live.ID] != nil && allExpired)
 				b.mu.RUnlock()
 				if groupHasExpired {
 					t.Fatal("expired message created group work")
+				}
+				b.removeAcks(groupAcks)
+				select {
+				case d := <-broadcast.ch:
+					t.Fatalf("unexpected extra broadcast delivery: %+v", d)
+				default:
+				}
+				select {
+				case d := <-group.ch:
+					t.Fatalf("unexpected extra group delivery: %+v", d)
+				default:
 				}
 			})
 		}
@@ -281,12 +330,93 @@ func TestRepairOrdinalSurvivesCompactionAndDuplicate(t *testing.T) {
 		t.Fatal("repair page did not compact the insertion order")
 	}
 	duplicate := &Message{ID: "ordinal-2", Topic: "t", Payload: []byte{2}, ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
+	b.cache.mu.Lock()
+	beforeDuplicateOrdinal := b.cache.nextRepairOrdinal
+	beforeStoredOrdinal := b.cache.items[duplicate.ID].repairOrdinal
+	b.cache.mu.Unlock()
 	if _, err := b.accept(duplicate); err != nil {
 		t.Fatal(err)
+	}
+	b.cache.mu.Lock()
+	afterDuplicateOrdinal := b.cache.nextRepairOrdinal
+	afterStoredOrdinal := b.cache.items[duplicate.ID].repairOrdinal
+	b.cache.mu.Unlock()
+	if afterDuplicateOrdinal != beforeDuplicateOrdinal || afterStoredOrdinal != beforeStoredOrdinal {
+		t.Fatalf("duplicate changed repair ordinal: counter %d->%d stored %d->%d", beforeDuplicateOrdinal, afterDuplicateOrdinal, beforeStoredOrdinal, afterStoredOrdinal)
 	}
 	_, afterDuplicate, _ := b.cache.repairPage(after, messageSize(duplicate)*2)
 	if afterDuplicate != after {
 		t.Fatalf("duplicate consumed repair ordinal: before=%d after=%d", after, afterDuplicate)
+	}
+}
+
+func TestRepairPageContinuesAfterPressureEvictsReturnedCursor(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	expires := time.Now().Add(time.Minute).UnixMilli()
+	first := &Message{ID: "pressure-0001", Topic: "pressure", Payload: []byte("first"), ExpiresAt: expires}
+	second := &Message{ID: "pressure-0002", Topic: "pressure", Payload: []byte("second"), ExpiresAt: expires}
+	third := &Message{ID: "pressure-0003", Topic: "pressure", Payload: []byte("third"), ExpiresAt: expires}
+	b.cache.maxBytes = messageSize(second) + messageSize(third)
+	b.cache.rejectPressure = false
+	for _, m := range []*Message{first, second} {
+		if _, err := b.accept(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, cursor, valid := b.cache.repairPage(0, messageSize(first))
+	if !valid || len(page) != 1 || page[0].ID != first.ID {
+		t.Fatalf("pressure first page: valid=%t page=%v", valid, page)
+	}
+	if _, err := b.cache.put(third, time.Now().UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	if b.cache.has(first.ID) {
+		t.Fatal("normal cache admission did not pressure-evict returned cursor")
+	}
+	page, next, valid := b.cache.repairPage(cursor, messageSize(second)+messageSize(third))
+	if !valid || len(page) != 2 || page[0].ID != second.ID || page[1].ID != third.ID || next != third.repairOrdinal {
+		t.Fatalf("pressure continuation: valid=%t page=%v next=%d want=%d", valid, page, next, third.repairOrdinal)
+	}
+}
+
+func TestRepairPageContinuesAfterReturnedCursorExpires(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	first := &Message{ID: "expiry-cursor", Topic: "expiry-page", Payload: []byte("first"), ExpiresAt: time.Now().Add(20 * time.Millisecond).UnixMilli()}
+	second := &Message{ID: "expiry-next", Topic: "expiry-page", Payload: []byte("second"), ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
+	for _, m := range []*Message{first, second} {
+		if _, err := b.accept(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, cursor, valid := b.cache.repairPage(0, messageSize(first))
+	if !valid || len(page) != 1 || page[0].ID != first.ID {
+		t.Fatalf("expiry first page: valid=%t page=%v", valid, page)
+	}
+	time.Sleep(40 * time.Millisecond)
+	page, next, valid := b.cache.repairPage(cursor, messageSize(second))
+	if !valid || len(page) != 1 || page[0].ID != second.ID || next != second.repairOrdinal || b.cache.has(first.ID) {
+		t.Fatalf("expiry continuation: valid=%t page=%v next=%d want=%d first_cached=%t", valid, page, next, second.repairOrdinal, b.cache.has(first.ID))
+	}
+}
+
+func TestRepairPageHonorsCountLimitAndContinuation(t *testing.T) {
+	b := New(DefaultConfig())
+	defer b.Close()
+	for i := 0; i < maxBatchMessages+1; i++ {
+		m := &Message{ID: fmt.Sprintf("count-%04d", i), Topic: "count", Payload: []byte{byte(i), byte(i >> 8)}, ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
+		if _, err := b.cache.put(m, time.Now().UnixMilli()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, cursor, valid := b.cache.repairPage(0, 64<<20)
+	if !valid || len(page) != maxBatchMessages || cursor != page[len(page)-1].repairOrdinal {
+		t.Fatalf("count-limited page: valid=%t len=%d cursor=%d", valid, len(page), cursor)
+	}
+	page, next, valid := b.cache.repairPage(cursor, 64<<20)
+	if !valid || len(page) != 1 || page[0].ID != fmt.Sprintf("count-%04d", maxBatchMessages) || next != page[0].repairOrdinal {
+		t.Fatalf("count continuation: valid=%t page=%v next=%d", valid, page, next)
 	}
 }
 
@@ -445,25 +575,30 @@ func TestRepairHTTPRecoversLiveTailWithExpiringPages(t *testing.T) {
 		messages = append(messages, m)
 	}
 	for i := 0; i < 3; i++ {
-		m := &Message{ID: fmt.Sprintf("expiring-page-%d", i), Topic: "mixed-ttl", Payload: make([]byte, 600<<10), ExpiresAt: started.Add(time.Duration(20+20*i) * time.Millisecond).UnixMilli()}
+		m := &Message{ID: fmt.Sprintf("expiring-page-%d", i), Topic: "mixed-ttl", Payload: make([]byte, 600<<10), ExpiresAt: started.Add(time.Duration(500+2000*i) * time.Millisecond).UnixMilli()}
 		if _, err := source.accept(m); err != nil {
 			t.Fatal(err)
 		}
 		messages = append(messages, m)
 	}
-	tail := &Message{ID: "live-tail", Topic: "mixed-ttl", Payload: make([]byte, 600<<10), ExpiresAt: started.Add(500 * time.Millisecond).UnixMilli()}
+	tail := &Message{ID: "live-tail", Topic: "mixed-ttl", Payload: make([]byte, 600<<10), ExpiresAt: started.Add(5500 * time.Millisecond).UnixMilli()}
 	if _, err := source.accept(tail); err != nil {
 		t.Fatal(err)
 	}
 	messages = append(messages, tail)
-	for step := 0; step < 3; step++ {
+	for step := 0; step < 4; step++ {
 		if !source.repairPeerStep(p) {
 			t.Fatalf("repair step %d failed before live tail", step)
 		}
 	}
-	time.Sleep(80 * time.Millisecond)
-	if !source.repairPeerStep(p) {
-		t.Fatalf("repair did not skip expired pages and send live tail")
+	if p.repairOrdinal != messages[3].repairOrdinal {
+		t.Fatalf("repair cursor after four initial pages: got=%d want=%d", p.repairOrdinal, messages[3].repairOrdinal)
+	}
+	time.Sleep(600 * time.Millisecond)
+	for step := 0; step < 3; step++ {
+		if !source.repairPeerStep(p) {
+			t.Fatalf("repair did not skip expired pages and send live tail at step %d", step)
+		}
 	}
 	for i := 0; i < 3; i++ {
 		if !target.cache.has(messages[i].ID) {

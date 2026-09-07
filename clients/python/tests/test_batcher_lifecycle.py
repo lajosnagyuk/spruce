@@ -73,8 +73,18 @@ class BatcherLifecycle(unittest.TestCase):
             time.sleep(.001)
         self.assertTrue(batcher._queue.full())
         blocked = [threading.Thread(target=publish) for _ in range(3)]
+        waiting = set()
+        all_waiting = threading.Event()
+        original_wait = batcher._producers.wait
+        def producer_wait(*args, **kwargs):
+            waiting.add(threading.get_ident())
+            if len(waiting) == len(blocked):
+                all_waiting.set()
+            return original_wait(*args, **kwargs)
+        batcher._producers.wait = producer_wait
         for thread in blocked: thread.start()
         try:
+            self.assertTrue(all_waiting.wait(1))
             with self.assertRaises(TimeoutError): batcher.close(timeout=.02)
             for thread in blocked: thread.join(1)
             self.assertTrue(all(not thread.is_alive() for thread in blocked))
@@ -148,7 +158,7 @@ class BatcherLifecycle(unittest.TestCase):
                 else:
                     self.fail("close unexpectedly succeeded")
             self.assertEqual(len({id(exc) for exc in failures}), 100)
-            self.assertTrue(all(exc.status_code == 503 and exc.code == "overloaded" and exc.retry_after == 1.25 for exc in failures))
+            self.assertTrue(all(exc.status_code == 503 and exc.status == "busy" and exc.code == "overloaded" and exc.body == "retry later" and exc.retry_after == 1.25 for exc in failures))
             self.assertTrue(all(depth <= 4 for depth in depths))
             self.assertEqual(str(failures[-1]), str(original))
         finally:
@@ -199,48 +209,51 @@ class BatcherLifecycle(unittest.TestCase):
             def __init__(self, marker):
                 self.marker = marker
                 super().__init__("failure")
+        entered, release = threading.Event(), threading.Event()
         class Client:
-            def __init__(self):
-                self.marker = Marker()
-                self.reference = weakref.ref(self.marker)
-                self.block = threading.Event()
-                self.failed = True
+            first = True
+            reference = None
             def publish_batch_entries(self, topic, entries, options):
-                if self.block.is_set():
-                    self.block.clear()
-                    time.sleep(.05)
-                if self.failed:
-                    self.failed = False
-                    failure = Failure(self.marker)
-                    self.marker = None
-                    raise failure
+                if self.first:
+                    self.first = False
+                    marker = Marker()
+                    self.reference = weakref.ref(marker)
+                    entered.set()
+                    if not release.wait(2):
+                        raise RuntimeError("timed handoff did not release")
+                    raise Failure(marker)
                 return [PublishResult("ok") for _ in entries]
 
         client = Client()
         batcher = ProducerBatcher(client, BatcherOptions(max_messages=1))
+        timed_out = queue.Queue()
+        def timed_publish():
+            try:
+                batcher.publish("t", b"timed", timeout=.02)
+            except queue.Empty:
+                timed_out.put(True)
         try:
-            try: batcher.publish("t", b"failed")
-            except Failure: pass
-            first_reference = client.reference
-            batcher.publish("t", b"healthy")
+            caller = threading.Thread(target=timed_publish)
+            caller.start()
+            self.assertTrue(entered.wait(1))
+            caller.join(1)
+            self.assertFalse(caller.is_alive())
+            self.assertTrue(timed_out.get(timeout=1))
+            self.assertIsNotNone(client.reference())
+            release.set()
+            self.assertEqual(batcher.publish("t", b"healthy").id, "ok")
             batcher.flush()
-            client.marker = Marker()
-            timed_out_reference = weakref.ref(client.marker)
-            client.failed = True
-            client.block.set()
-            with self.assertRaises(queue.Empty):
-                batcher.publish("t", b"timed", timeout=.005)
-            client.marker = None
-            for _ in range(10):
+            for _ in range(20):
                 gc.collect()
-                if first_reference() is None and timed_out_reference() is None:
+                if client.reference() is None:
                     break
                 time.sleep(.01)
-            self.assertIsNone(first_reference())
-            self.assertIsNone(timed_out_reference())
+            self.assertIsNone(client.reference())
         finally:
             try: batcher.close(timeout=1)
             except BaseException: pass
+        gc.collect()
+        self.assertIsNone(client.reference())
 
     def test_many_publishers_progress_and_close_wakes_waiters(self):
         entered, release = threading.Event(), threading.Event()
@@ -258,10 +271,19 @@ class BatcherLifecycle(unittest.TestCase):
             try: results.put(batcher.publish("t", b"x", timeout=1))
             except BaseException as exc: results.put(exc)
         threads = [threading.Thread(target=publish) for _ in range(12)]
+        waiting = set()
+        all_waiting = threading.Event()
+        original_wait = batcher._producers.wait
+        def producer_wait(*args, **kwargs):
+            waiting.add(threading.get_ident())
+            if len(waiting) >= len(threads) - 2:
+                all_waiting.set()
+            return original_wait(*args, **kwargs)
+        batcher._producers.wait = producer_wait
         try:
             for thread in threads: thread.start()
             self.assertTrue(entered.wait(1))
-            time.sleep(.03)
+            self.assertTrue(all_waiting.wait(1))
             release.set()
             for thread in threads: thread.join(1)
             self.assertTrue(all(not thread.is_alive() for thread in threads))
@@ -297,10 +319,14 @@ class BatcherLifecycle(unittest.TestCase):
             time.sleep(.001)
         self.assertTrue(batcher._queue.full())
         try:
+            with batcher._queue.mutex:
+                before = list(batcher._queue.queue)
             with self.assertRaises(queue.Full):
                 batcher.publish("t", Payload(), timeout=.02)
             self.assertFalse(copied.is_set())
-            self.assertEqual(batcher._queue.qsize(), 1)
+            with batcher._queue.mutex:
+                after = list(batcher._queue.queue)
+            self.assertEqual(after, before)
         finally:
             release.set()
             first.join(1)
