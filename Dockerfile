@@ -18,7 +18,7 @@ COPY --from=build /out/spruce-bench /spruce-bench
 COPY --from=build /out/spruce-binary-soak /spruce-binary-soak
 USER 65532:65532
 
-FROM python:3.14-alpine@sha256:c6ead215bfd31f1e433d968853b7a769989117115b728874824e6c0a27cb96fc AS python-probe
+FROM python:3.15-alpine@sha256:0f9552bb28711333da16915ec146f5e6bb44a7fdac9ced15dc17c2e0206346dd AS python-probe
 WORKDIR /app
 COPY clients/python /src
 RUN pip install --no-cache-dir /src && \
